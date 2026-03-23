@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget
 
-from keysight_scope_app.instrument import WaveformData, WaveformStats
+from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats
 from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
 
 

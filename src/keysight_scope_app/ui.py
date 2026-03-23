@@ -38,11 +38,10 @@ from keysight_scope_app.instrument import (
     SUPPORTED_CHANNELS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
     KeysightOscilloscope,
-    WaveformData,
-    WaveformStats,
     list_visa_resources,
 )
 from keysight_scope_app.startup_brake_dialog import StartupBrakeTestDialog
+from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats
 from keysight_scope_app.waveform_dialog import WaveformDetailDialog
 from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
 

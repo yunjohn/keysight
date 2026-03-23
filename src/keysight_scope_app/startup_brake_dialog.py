@@ -25,13 +25,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.instrument import (
-    SUPPORTED_CHANNELS,
+from keysight_scope_app.instrument import SUPPORTED_CHANNELS
+from keysight_scope_app.startup_brake_analysis import (
     StartupBrakeTestConfig,
     StartupBrakeTestResult,
-    WaveformData,
     analyze_startup_brake_test,
 )
+from keysight_scope_app.waveform_analysis import WaveformData
 
 if TYPE_CHECKING:
     from keysight_scope_app.ui import ScopeMainWindow

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.instrument import WaveformData, WaveformStats, compare_waveform_edges
+from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats, compare_waveform_edges
 
 
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
