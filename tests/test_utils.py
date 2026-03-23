@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from keysight_scope_app.instrument import KeysightOscilloscope, WaveformData, WaveformPreamble, compare_waveform_edges
+from keysight_scope_app.instrument import (
+    KeysightOscilloscope,
+    StartupBrakeTestConfig,
+    WaveformData,
+    WaveformPreamble,
+    analyze_startup_brake_test,
+    compare_waveform_edges,
+)
 from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
 
 
@@ -253,3 +260,153 @@ def test_compare_waveform_edges_returns_delay_and_phase() -> None:
     assert comparison is not None
     assert abs(comparison.delta_t_s - 0.1) < 1e-9
     assert abs(comparison.phase_deg - 36.0) < 1e-9
+
+
+def test_analyze_startup_brake_test_current_zero_mode() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            encoder_a_channel="CHANnel4",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert abs(result.startup_start_point[0] - 0.0191) < 1e-9
+    assert abs(result.speed_reached_point[0] - 0.0395) < 1e-9
+    assert abs(result.startup_delay_s - 0.0204) < 1e-9
+    assert result.startup_peak_current is not None
+    assert result.startup_peak_current.value == 2.0
+    assert result.startup_peak_current.time_s == 0.02
+    assert abs(result.brake_start_point[0] - 0.0791) < 1e-9
+    assert abs(result.current_zero_window.start_time_s - 0.086) < 1e-9
+    assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
+    assert abs(result.brake_end_point[0] - 0.089) < 1e-9
+    assert abs(result.brake_delay_s - 0.0099) < 1e-9
+
+
+def test_analyze_startup_brake_test_encoder_backtrack_mode() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            encoder_a_channel="CHANnel4",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            brake_mode="encoder_backtrack",
+            brake_backtrack_pulses=8,
+        ),
+    )
+
+    assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
+    assert abs(result.brake_end_point[0] - 0.0799) < 1e-9
+    assert abs(result.brake_delay_s - 0.0008) < 1e-9
+
+
+def _build_startup_brake_waveforms() -> list[WaveformData]:
+    control_x = [index * 0.001 for index in range(101)]
+    control_y = []
+    for time_value in control_x:
+        if time_value < 0.02:
+            control_y.append(0.0)
+        elif time_value < 0.08:
+            control_y.append(10.0)
+        else:
+            control_y.append(0.0)
+
+    speed_x = [index * 0.001 for index in range(101)]
+    speed_y = []
+    for time_value in speed_x:
+        high = any(start <= time_value < (start + 0.004) for start in (0.02, 0.03, 0.04, 0.05, 0.06))
+        speed_y.append(5.0 if high else 0.0)
+
+    current_x = [index * 0.001 for index in range(101)]
+    current_y = []
+    for time_value in current_x:
+        if time_value < 0.012:
+            current_y.append(0.0)
+        elif time_value == 0.012:
+            current_y.append(0.4)
+        elif time_value == 0.013:
+            current_y.append(0.9)
+        elif time_value == 0.014:
+            current_y.append(1.4)
+        elif time_value == 0.015:
+            current_y.append(1.8)
+        elif time_value == 0.016:
+            current_y.append(1.9)
+        elif time_value == 0.017:
+            current_y.append(1.7)
+        elif time_value == 0.018:
+            current_y.append(1.5)
+        elif time_value == 0.019:
+            current_y.append(1.8)
+        elif time_value == 0.02:
+            current_y.append(2.0)
+        elif time_value < 0.072:
+            current_y.append(0.8)
+        elif time_value == 0.08:
+            current_y.append(0.3)
+        elif time_value == 0.081:
+            current_y.append(0.2)
+        elif time_value == 0.082:
+            current_y.append(0.12)
+        elif time_value == 0.083:
+            current_y.append(0.07)
+        elif time_value == 0.084:
+            current_y.append(0.06)
+        elif time_value == 0.085:
+            current_y.append(0.051)
+        elif time_value == 0.086:
+            current_y.append(0.03)
+        elif time_value == 0.087:
+            current_y.append(0.01)
+        else:
+            current_y.append(0.0)
+
+    encoder_x = [index * 0.0002 for index in range(451)]
+    encoder_y = []
+    for time_value in encoder_x:
+        high = any(start <= time_value < (start + 0.0004) for start in (0.08, 0.081, 0.082, 0.083, 0.084, 0.085, 0.086, 0.087))
+        encoder_y.append(5.0 if high else 0.0)
+
+    return [
+        WaveformData(
+            channel="CHANnel1",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(control_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=control_x,
+            y_values=control_y,
+        ),
+        WaveformData(
+            channel="CHANnel2",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(speed_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=speed_x,
+            y_values=speed_y,
+        ),
+        WaveformData(
+            channel="CHANnel3",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(current_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=current_x,
+            y_values=current_y,
+        ),
+        WaveformData(
+            channel="CHANnel4",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(encoder_x), 1, 0.0002, 0.0, 0, 1.0, 0.0, 0),
+            x_values=encoder_x,
+            y_values=encoder_y,
+        ),
+    ]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
@@ -8,7 +9,7 @@ import threading
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 from PySide6.QtCore import QPointF, QTimer, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,8 +44,11 @@ from keysight_scope_app.instrument import (
     SUPPORTED_CHANNELS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
     KeysightOscilloscope,
+    StartupBrakeTestConfig,
+    StartupBrakeTestResult,
     WaveformData,
     WaveformStats,
+    analyze_startup_brake_test,
     compare_waveform_edges,
     list_visa_resources,
 )
@@ -53,6 +57,7 @@ from keysight_scope_app.instrument import (
 CAPTURE_DIR = Path("captures")
 WAVEFORM_DIR = Path("captures") / "waveforms"
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
+STARTUP_BRAKE_DIR = Path("captures") / "startup_brake_tests"
 MAX_LOG_LINES = 300
 DEFAULT_MEASUREMENT_SET = {"频率", "峰峰值", "均方根"}
 WAVEFORM_SERIES_COLORS = ("#2d9cdb", "#eb5757", "#27ae60", "#f2994a")
@@ -62,6 +67,19 @@ MEASUREMENT_TEMPLATES = {
     "纹波模板": {"峰峰值", "均方根", "最大值", "最小值"},
     "边沿模板": {"最大值", "最小值", "高电平估计", "低电平估计", "上升时间", "下降时间"},
 }
+
+
+def _display_channel_name(channel: str) -> str:
+    if channel.startswith("CHANnel"):
+        return channel.replace("CHANnel", "CH", 1)
+    return channel
+
+
+def _normalize_channel_name(channel: str) -> str:
+    normalized = channel.strip()
+    if normalized.upper().startswith("CH") and normalized[2:].isdigit():
+        return f"CHANnel{normalized[2:]}"
+    return normalized
 
 
 class InteractiveChartView(QChartView):
@@ -301,11 +319,10 @@ class WaveformAnalysisPanel(QWidget):
             )
         help_card = QFrame()
         help_card.setFrameShape(QFrame.StyledPanel)
-        help_card.setStyleSheet("QFrame { background: #f7fafc; border: 1px solid #d9e3ec; border-radius: 6px; }")
         help_layout = QVBoxLayout(help_card)
         help_layout.setContentsMargins(10, 8, 10, 8)
         help_title = QLabel("操作提示")
-        help_title.setStyleSheet("font-weight: 600; color: #44566c;")
+        help_title.setFont(QFont(help_title.font().family(), help_title.font().pointSize(), QFont.Bold))
         help_layout.addWidget(help_title)
         help_layout.addWidget(self.help_label)
         chart_toolbar.addWidget(help_card, 1)
@@ -370,18 +387,17 @@ class WaveformAnalysisPanel(QWidget):
             )
         hint_card = QFrame()
         hint_card.setFrameShape(QFrame.StyledPanel)
-        hint_card.setStyleSheet("QFrame { background: #f7fafc; border: 1px solid #d9e3ec; border-radius: 6px; }")
         hint_layout = QVBoxLayout(hint_card)
         hint_layout.setContentsMargins(10, 8, 10, 8)
         hint_title = QLabel("当前状态")
-        hint_title.setStyleSheet("font-weight: 600; color: #44566c;")
+        hint_title.setFont(QFont(hint_title.font().family(), hint_title.font().pointSize(), QFont.Bold))
         hint_layout.addWidget(hint_title)
         hint_layout.addWidget(self.cursor_hint_label)
         cursor_toolbar.addWidget(hint_card, 1)
         layout.addLayout(cursor_toolbar)
 
         kpi_title = QLabel("当前视图关键指标")
-        kpi_title.setStyleSheet("font-weight: 600;")
+        kpi_title.setFont(QFont(kpi_title.font().family(), kpi_title.font().pointSize(), QFont.Bold))
         layout.addWidget(kpi_title)
 
         kpi_grid = QGridLayout()
@@ -397,14 +413,17 @@ class WaveformAnalysisPanel(QWidget):
         for index, (title, key) in enumerate(kpi_items):
             card = QFrame()
             card.setFrameShape(QFrame.StyledPanel)
-            card.setStyleSheet("QFrame { background: #f7fafc; border: 1px solid #d9e3ec; border-radius: 6px; }")
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(10, 8, 10, 8)
             title_label = QLabel(title)
-            title_label.setStyleSheet("font-size: 12px; color: #546172;")
+            title_label.setAlignment(Qt.AlignCenter)
             value_label = QLabel("-")
             value_label.setWordWrap(True)
-            value_label.setStyleSheet("font-size: 18px; font-weight: 700; color: #16324f;")
+            value_font = value_label.font()
+            value_font.setBold(True)
+            value_font.setPointSize(max(value_font.pointSize(), 12))
+            value_label.setFont(value_font)
+            value_label.setAlignment(Qt.AlignCenter)
             self.view_kpi_labels[key] = value_label
             card_layout.addWidget(title_label)
             card_layout.addWidget(value_label)
@@ -612,12 +631,12 @@ class WaveformAnalysisPanel(QWidget):
     def _build_control_group(self, title: str, widgets: list[QWidget], columns: int = 3) -> QFrame:
         group = QFrame()
         group.setFrameShape(QFrame.StyledPanel)
-        group.setStyleSheet("QFrame { background: #f7fafc; border: 1px solid #d9e3ec; border-radius: 6px; }")
         outer = QVBoxLayout(group)
         outer.setContentsMargins(10, 8, 10, 8)
         outer.setSpacing(6)
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-weight: 600; color: #44566c;")
+        title_label.setFont(QFont(title_label.font().family(), title_label.font().pointSize(), QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
         outer.addWidget(title_label)
 
         grid = QGridLayout()
@@ -646,7 +665,11 @@ class WaveformAnalysisPanel(QWidget):
         for index, (item_title, key) in enumerate(items):
             value_label = labels[key]
             value_label.setWordWrap(True)
-            value_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #16324f;")
+            value_font = value_label.font()
+            value_font.setBold(True)
+            value_font.setPointSize(max(value_font.pointSize(), 11))
+            value_label.setFont(value_font)
+            value_label.setAlignment(Qt.AlignCenter)
 
             block = QWidget()
             card_layout = QVBoxLayout(block)
@@ -654,7 +677,7 @@ class WaveformAnalysisPanel(QWidget):
             card_layout.setSpacing(2)
 
             title_label = QLabel(item_title)
-            title_label.setStyleSheet("font-size: 12px; color: #546172;")
+            title_label.setAlignment(Qt.AlignCenter)
             card_layout.addWidget(title_label)
             card_layout.addWidget(value_label)
             card_layout.addStretch(1)
@@ -698,7 +721,7 @@ class WaveformAnalysisPanel(QWidget):
         all_y_values: list[float] = []
         for index, waveform in enumerate(waveforms):
             series = QLineSeries()
-            series.setName(waveform.channel.replace("CHANnel", "CH"))
+            series.setName(_display_channel_name(waveform.channel))
             series.setPen(self._waveform_series_pen(waveform.channel))
 
             x_values, y_values = _decimate_xy(waveform.x_values, waveform.y_values, max_points=2500)
@@ -715,7 +738,7 @@ class WaveformAnalysisPanel(QWidget):
         self._render_all_waveform_series()
 
         self.chart.legend().setVisible(len(waveforms) > 1)
-        self.chart.setTitle(" / ".join(waveform.channel.replace("CHANnel", "CH") for waveform in waveforms) + " 波形")
+        self.chart.setTitle(" / ".join(_display_channel_name(waveform.channel) for waveform in waveforms) + " 波形")
 
         if all_x_values:
             axis_x.setRange(min(all_x_values), max(all_x_values))
@@ -764,6 +787,24 @@ class WaveformAnalysisPanel(QWidget):
             label.setText("-")
         self.chart_view.reset_view()
         self._clear_cursors()
+
+    def set_cursor_points(
+        self,
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        *,
+        annotation_text: str | None = None,
+    ) -> None:
+        if self.current_waveform is None:
+            return
+        self.pending_cursor_target = None
+        self.dragging_cursor_target = None
+        self.hover_cursor_target = None
+        self.cursor_points["a"] = self._clamp_value_to_axes(point_a)
+        self.cursor_points["b"] = self._clamp_value_to_axes(point_b)
+        self.lock_annotation_text = annotation_text
+        self._update_cursor_readouts()
+        self._refresh_cursor_graphics()
 
     def _update_stats(self, stats: WaveformStats) -> None:
         self.stats_labels["point_count"].setText(str(stats.point_count))
@@ -829,7 +870,7 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_channel_combo.clear()
         secondary_channels = [waveform.channel for waveform in self.current_waveforms[1:]]
         for channel in secondary_channels:
-            self.compare_channel_combo.addItem(channel.replace("CHANnel", "CH"), channel)
+            self.compare_channel_combo.addItem(_display_channel_name(channel), channel)
         self.compare_channel_combo.blockSignals(False)
         self.compare_channel_combo.setEnabled(bool(secondary_channels))
         self._update_channel_comparison()
@@ -865,13 +906,13 @@ class WaveformAnalysisPanel(QWidget):
         if comparison is None:
             for label in self.compare_labels.values():
                 label.setText("无法估算")
-            self.compare_labels["primary_channel"].setText(self.current_waveform.channel.replace("CHANnel", "CH"))
-            self.compare_labels["secondary_channel"].setText(secondary_waveform.channel.replace("CHANnel", "CH"))
+            self.compare_labels["primary_channel"].setText(_display_channel_name(self.current_waveform.channel))
+            self.compare_labels["secondary_channel"].setText(_display_channel_name(secondary_waveform.channel))
             self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
             return
 
-        self.compare_labels["primary_channel"].setText(self.current_waveform.channel.replace("CHANnel", "CH"))
-        self.compare_labels["secondary_channel"].setText(secondary_waveform.channel.replace("CHANnel", "CH"))
+        self.compare_labels["primary_channel"].setText(_display_channel_name(self.current_waveform.channel))
+        self.compare_labels["secondary_channel"].setText(_display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
         self.compare_labels["secondary_edge"].setText(f"{comparison.secondary_time_s:.6e} s")
         self.compare_labels["delta_t"].setText(f"{comparison.delta_t_s:.6e} s")
@@ -967,7 +1008,7 @@ class WaveformAnalysisPanel(QWidget):
         self.dragging_waveform_channel = waveform_channel
         self.waveform_drag_anchor_y = y_value
         self.waveform_drag_initial_offset = self.waveform_offsets.get(waveform_channel, 0.0)
-        self.cursor_hint_label.setText(f"正在拖动 {waveform_channel.replace('CHANnel', 'CH')}，可上下分离显示。")
+        self.cursor_hint_label.setText(f"正在拖动 {_display_channel_name(waveform_channel)}，可上下分离显示。")
         self._refresh_cursor_graphics()
         return True
 
@@ -979,7 +1020,7 @@ class WaveformAnalysisPanel(QWidget):
             self.waveform_offsets[channel] = self.waveform_drag_initial_offset + (y_value - self.waveform_drag_anchor_y)
             self._render_waveform_series(channel)
             self.cursor_hint_label.setText(
-                f"正在拖动 {channel.replace('CHANnel', 'CH')}，显示偏移 {self.waveform_offsets[channel]:+.4f} V。"
+                f"正在拖动 {_display_channel_name(channel)}，显示偏移 {self.waveform_offsets[channel]:+.4f} V。"
             )
             return True
 
@@ -1010,7 +1051,7 @@ class WaveformAnalysisPanel(QWidget):
             channel = self.dragging_waveform_channel
             self.dragging_waveform_channel = None
             self.cursor_hint_label.setText(
-                f"{channel.replace('CHANnel', 'CH')} 已完成分离显示。{self._default_cursor_hint()}"
+                f"{_display_channel_name(channel)} 已完成分离显示。{self._default_cursor_hint()}"
             )
             self._refresh_cursor_graphics()
 
@@ -1330,7 +1371,7 @@ class WaveformAnalysisPanel(QWidget):
                     if waveform_channel is None:
                         self.cursor_hint_label.setText(self._default_cursor_hint())
                     else:
-                        self.cursor_hint_label.setText(f"当前命中 {waveform_channel.replace('CHANnel', 'CH')}，可上下拖动分离显示。")
+                        self.cursor_hint_label.setText(f"当前命中 {_display_channel_name(waveform_channel)}，可上下拖动分离显示。")
                 self._refresh_cursor_graphics()
             if waveform_channel is not None:
                 return Qt.SizeVerCursor
@@ -1435,6 +1476,15 @@ class WaveformDetailDialog(QDialog):
     def clear(self) -> None:
         self.analysis_panel.clear()
 
+    def set_cursor_points(
+        self,
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        *,
+        annotation_text: str | None = None,
+    ) -> None:
+        self.analysis_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
+
 
 class ScopeMainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -1449,6 +1499,11 @@ class ScopeMainWindow(QMainWindow):
         self.last_waveform_bundle: list[WaveformData] = []
         self.last_waveform_data: WaveformData | None = None
         self.last_waveform_stats: WaveformStats | None = None
+        self.last_startup_brake_result: StartupBrakeTestResult | None = None
+        self.startup_brake_history: list[StartupBrakeTestResult] = []
+        self.startup_brake_history_timestamps: list[str] = []
+        self.startup_brake_history_configs: list[StartupBrakeTestConfig] = []
+        self.startup_brake_channel_previous: dict[int, str] = {}
         self.waveform_detail_dialog = WaveformDetailDialog(self)
 
         self.setWindowTitle("Keysight 示波器助手")
@@ -1516,13 +1571,14 @@ class ScopeMainWindow(QMainWindow):
         top_row = QHBoxLayout()
 
         self.channel_combo = QComboBox()
-        self.channel_combo.addItems(SUPPORTED_CHANNELS)
+        for channel in SUPPORTED_CHANNELS:
+            self.channel_combo.addItem(_display_channel_name(channel), channel)
         self.interval_input = QDoubleSpinBox()
         self.interval_input.setRange(0.2, 10.0)
         self.interval_input.setSingleStep(0.2)
         self.interval_input.setValue(1.0)
         self.measurement_status = QLabel("自动测量：未启动")
-        self.measurement_status.setStyleSheet("font-weight: 600;")
+        self.measurement_status.setFont(QFont(self.measurement_status.font().family(), self.measurement_status.font().pointSize(), QFont.Bold))
         self.last_update_value = QLabel("最近更新：-")
 
         top_row.addWidget(QLabel("测量通道"))
@@ -1616,7 +1672,7 @@ class ScopeMainWindow(QMainWindow):
         overlay_row = QHBoxLayout()
         overlay_row.addWidget(QLabel("叠加通道"))
         for channel in SUPPORTED_CHANNELS:
-            checkbox = QCheckBox(channel.replace("CHANnel", "CH"))
+            checkbox = QCheckBox(_display_channel_name(channel))
             self.overlay_channel_checks[channel] = checkbox
             overlay_row.addWidget(checkbox)
         overlay_row.addStretch(1)
@@ -1673,14 +1729,22 @@ class ScopeMainWindow(QMainWindow):
         waveform_toolbar = QHBoxLayout()
         self.detach_waveform_button = QPushButton("独立显示")
         self.sync_waveform_button = QPushButton("同步到独立窗")
+        self.open_startup_brake_button = QPushButton("启动刹车测试")
         waveform_toolbar.addWidget(self.detach_waveform_button)
         waveform_toolbar.addWidget(self.sync_waveform_button)
+        waveform_toolbar.addWidget(self.open_startup_brake_button)
         waveform_toolbar.addStretch(1)
         waveform_layout.addLayout(waveform_toolbar)
 
         self.waveform_panel = WaveformAnalysisPanel(self, compact_mode=True)
         waveform_layout.addWidget(self.waveform_panel)
         right_panel.addWidget(waveform_box, 1)
+
+        self.startup_brake_dialog = QDialog(self)
+        self.startup_brake_dialog.setWindowTitle("启动刹车性能测试")
+        self.startup_brake_dialog.resize(1180, 760)
+        startup_brake_dialog_layout = QVBoxLayout(self.startup_brake_dialog)
+        startup_brake_dialog_layout.addWidget(self._build_startup_brake_test_box())
 
         self.refresh_button.clicked.connect(self.refresh_resources)
         self.connect_button.clicked.connect(self.connect_scope)
@@ -1694,7 +1758,7 @@ class ScopeMainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_scope)
         self.capture_button.clicked.connect(self.capture_screenshot)
         self.resource_combo.activated.connect(self._resource_selected)
-        self.channel_combo.currentTextChanged.connect(self._refresh_overlay_channel_checks)
+        self.channel_combo.currentTextChanged.connect(lambda _: self._refresh_overlay_channel_checks())
         self.select_default_button.clicked.connect(self._select_default_measurements)
         self.select_all_button.clicked.connect(self._select_all_measurements)
         self.clear_selection_button.clicked.connect(self._clear_measurements)
@@ -1703,10 +1767,32 @@ class ScopeMainWindow(QMainWindow):
         self.export_waveform_button.clicked.connect(self.export_waveform_csv)
         self.detach_waveform_button.clicked.connect(self.show_waveform_detail_dialog)
         self.sync_waveform_button.clicked.connect(self.sync_waveform_detail_dialog)
+        self.open_startup_brake_button.clicked.connect(self.show_startup_brake_dialog)
+        for combo in self.startup_brake_channel_combos:
+            combo.currentIndexChanged.connect(
+                lambda _, changed_combo=combo: self._refresh_startup_brake_channel_options(changed_combo)
+            )
+        self.test_target_mode_combo.currentIndexChanged.connect(lambda _: self._refresh_startup_brake_target_fields())
+        self.test_target_value_input.valueChanged.connect(lambda _: self._refresh_startup_brake_target_fields())
+        self.test_ppr_input.valueChanged.connect(lambda _: self._refresh_startup_brake_target_fields())
+        self.test_brake_mode_combo.currentIndexChanged.connect(lambda _: self._refresh_startup_brake_mode_fields())
+        self.run_startup_brake_button.clicked.connect(self.run_startup_brake_test)
+        self.apply_startup_cursor_button.clicked.connect(self._apply_startup_cursors)
+        self.apply_brake_cursor_button.clicked.connect(self._apply_brake_cursors)
+        self.export_startup_stats_button.clicked.connect(self._export_startup_brake_history_csv)
+        self.clear_startup_stats_button.clicked.connect(self._clear_startup_brake_history)
         self._refresh_overlay_channel_checks()
         self._stabilize_push_buttons(self)
+        self._stabilize_push_buttons(self.startup_brake_dialog)
+        self._normalize_label_alignment(self)
+        self._normalize_label_alignment(self.startup_brake_dialog)
         self._update_measurement_count()
         self._refresh_auto_measure_button()
+        self._clear_startup_brake_results()
+        self._refresh_startup_brake_history()
+        self._refresh_startup_brake_channel_options()
+        self._refresh_startup_brake_target_fields()
+        self._refresh_startup_brake_mode_fields()
 
     def _build_timer(self) -> None:
         self.ui_timer = QTimer(self)
@@ -1722,16 +1808,411 @@ class ScopeMainWindow(QMainWindow):
         card.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(card)
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-weight: 600;")
+        title_label.setFont(QFont(title_label.font().family(), title_label.font().pointSize(), QFont.Bold))
         value_label.setWordWrap(True)
         layout.addWidget(title_label)
         layout.addWidget(value_label)
         return card
 
+    def _build_startup_brake_test_box(self) -> QGroupBox:
+        box = self._group_box("启动刹车性能测试")
+        layout = QVBoxLayout(box)
+        layout.setSpacing(10)
+
+        channel_title = QLabel("通道配置")
+        channel_title.setFont(QFont(channel_title.font().family(), channel_title.font().pointSize(), QFont.Bold))
+        layout.addWidget(channel_title)
+
+        self.test_control_channel_combo = self._create_channel_combo("CHANnel1")
+        self.test_speed_channel_combo = self._create_channel_combo("CHANnel2")
+        self.test_current_channel_combo = self._create_channel_combo("CHANnel3")
+        self.test_encoder_channel_combo = self._create_channel_combo("CHANnel4")
+        self.startup_brake_channel_combos = [
+            self.test_control_channel_combo,
+            self.test_speed_channel_combo,
+            self.test_current_channel_combo,
+            self.test_encoder_channel_combo,
+        ]
+        self.startup_brake_channel_previous = {
+            id(combo): self._selected_channel_from_combo(combo) for combo in self.startup_brake_channel_combos
+        }
+        self._set_compact_field_width(
+            self.test_control_channel_combo,
+            self.test_speed_channel_combo,
+            self.test_current_channel_combo,
+            self.test_encoder_channel_combo,
+        )
+        channel_grid = QGridLayout()
+        channel_grid.setHorizontalSpacing(12)
+        channel_grid.setVerticalSpacing(6)
+        channel_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        channel_grid.addWidget(self._inline_form_field("控制输入", self.test_control_channel_combo), 0, 0)
+        channel_grid.addWidget(self._inline_form_field("转速反馈", self.test_speed_channel_combo), 0, 1)
+        channel_grid.addWidget(self._inline_form_field("电流通道", self.test_current_channel_combo), 1, 0)
+        self.test_encoder_field = self._inline_form_field("编码器 A 相", self.test_encoder_channel_combo)
+        channel_grid.addWidget(self.test_encoder_field, 1, 1)
+        layout.addLayout(channel_grid)
+
+        speed_title = QLabel("达速判定")
+        speed_title.setFont(QFont(speed_title.font().family(), speed_title.font().pointSize(), QFont.Bold))
+        layout.addWidget(speed_title)
+
+        self.test_target_mode_combo = QComboBox()
+        self.test_target_mode_combo.addItem("频率(Hz)", "frequency_hz")
+        self.test_target_mode_combo.addItem("周期(ms)", "period_ms")
+        self.test_target_mode_combo.addItem("转速(RPM)", "rpm")
+        self.test_target_value_input = QDoubleSpinBox()
+        self.test_target_value_input.setDecimals(3)
+        self.test_target_value_input.setRange(0.001, 1_000_000.0)
+        self.test_target_value_input.setValue(100.0)
+        self.test_tolerance_input = QDoubleSpinBox()
+        self.test_tolerance_input.setDecimals(2)
+        self.test_tolerance_input.setSuffix(" %")
+        self.test_tolerance_input.setRange(0.0, 100.0)
+        self.test_tolerance_input.setValue(5.0)
+        self.test_consecutive_input = QDoubleSpinBox()
+        self.test_consecutive_input.setDecimals(0)
+        self.test_consecutive_input.setRange(1, 20)
+        self.test_consecutive_input.setValue(3)
+        self.test_ppr_input = QDoubleSpinBox()
+        self.test_ppr_input.setDecimals(0)
+        self.test_ppr_input.setRange(1, 100000)
+        self.test_ppr_input.setValue(1)
+        self._set_compact_field_width(
+            self.test_target_mode_combo,
+            self.test_target_value_input,
+            self.test_tolerance_input,
+            self.test_consecutive_input,
+            self.test_ppr_input,
+        )
+        speed_grid = QGridLayout()
+        speed_grid.setHorizontalSpacing(12)
+        speed_grid.setVerticalSpacing(6)
+        speed_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        speed_grid.addWidget(self._inline_form_field("目标类型", self.test_target_mode_combo), 0, 0)
+        speed_grid.addWidget(self._inline_form_field("目标值", self.test_target_value_input), 0, 1)
+        speed_grid.addWidget(self._inline_form_field("容差", self.test_tolerance_input), 0, 2)
+        speed_grid.addWidget(self._inline_form_field("连续周期", self.test_consecutive_input), 1, 0)
+        self.test_ppr_field = self._inline_form_field("每转脉冲数", self.test_ppr_input)
+        speed_grid.addWidget(self.test_ppr_field, 1, 1)
+        layout.addLayout(speed_grid)
+
+        self.test_target_hint_label = QLabel("")
+        self.test_target_hint_label.setWordWrap(True)
+        layout.addWidget(self.test_target_hint_label)
+
+        brake_title = QLabel("刹车判定")
+        brake_title.setFont(QFont(brake_title.font().family(), brake_title.font().pointSize(), QFont.Bold))
+        layout.addWidget(brake_title)
+
+        self.test_brake_mode_combo = QComboBox()
+        self.test_brake_mode_combo.addItem("电流归零", "current_zero")
+        self.test_brake_mode_combo.addItem("A相回溯", "encoder_backtrack")
+        self.test_zero_threshold_input = QDoubleSpinBox()
+        self.test_zero_threshold_input.setDecimals(3)
+        self.test_zero_threshold_input.setRange(0.0, 1000.0)
+        self.test_zero_threshold_input.setValue(0.05)
+        self.test_flat_threshold_input = QDoubleSpinBox()
+        self.test_flat_threshold_input.setDecimals(3)
+        self.test_flat_threshold_input.setRange(0.0, 1000.0)
+        self.test_flat_threshold_input.setValue(0.03)
+        self.test_hold_ms_input = QDoubleSpinBox()
+        self.test_hold_ms_input.setDecimals(3)
+        self.test_hold_ms_input.setSuffix(" ms")
+        self.test_hold_ms_input.setRange(0.0, 1000.0)
+        self.test_hold_ms_input.setValue(2.0)
+        self.test_backtrack_pulses_input = QDoubleSpinBox()
+        self.test_backtrack_pulses_input.setDecimals(0)
+        self.test_backtrack_pulses_input.setRange(1, 1000)
+        self.test_backtrack_pulses_input.setValue(8)
+        self._set_compact_field_width(
+            self.test_brake_mode_combo,
+            self.test_zero_threshold_input,
+            self.test_flat_threshold_input,
+            self.test_hold_ms_input,
+            self.test_backtrack_pulses_input,
+        )
+        brake_grid = QGridLayout()
+        brake_grid.setHorizontalSpacing(12)
+        brake_grid.setVerticalSpacing(6)
+        brake_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        brake_grid.addWidget(self._inline_form_field("刹车模式", self.test_brake_mode_combo), 0, 0)
+        brake_grid.addWidget(self._inline_form_field("零电流阈值", self.test_zero_threshold_input), 0, 1)
+        brake_grid.addWidget(self._inline_form_field("水平线波动", self.test_flat_threshold_input), 0, 2)
+        brake_grid.addWidget(self._inline_form_field("保持时间", self.test_hold_ms_input), 1, 0)
+        self.test_backtrack_field = self._inline_form_field("回溯脉冲数", self.test_backtrack_pulses_input)
+        brake_grid.addWidget(self.test_backtrack_field, 1, 1)
+        layout.addLayout(brake_grid)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        self.run_startup_brake_button = QPushButton("执行测试")
+        self.apply_startup_cursor_button = QPushButton("定位启动游标")
+        self.apply_brake_cursor_button = QPushButton("定位刹车游标")
+        self.export_startup_stats_button = QPushButton("导出统计 CSV")
+        self.clear_startup_stats_button = QPushButton("清空统计")
+        self.apply_startup_cursor_button.setEnabled(False)
+        self.apply_brake_cursor_button.setEnabled(False)
+        button_row.addWidget(self.run_startup_brake_button)
+        button_row.addSpacing(12)
+        button_row.addWidget(self.apply_startup_cursor_button)
+        button_row.addWidget(self.apply_brake_cursor_button)
+        button_row.addSpacing(12)
+        button_row.addWidget(self.export_startup_stats_button)
+        button_row.addWidget(self.clear_startup_stats_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        result_stats_row = QHBoxLayout()
+        result_stats_row.setSpacing(12)
+
+        single_result_box = self._group_box("单次结果")
+        single_result_layout = QVBoxLayout(single_result_box)
+        single_result_layout.setContentsMargins(10, 10, 10, 10)
+        single_result_layout.setSpacing(8)
+        self.startup_brake_result_labels: dict[str, QLabel] = {}
+        self.startup_brake_result_cards: dict[str, QWidget] = {}
+        result_items = [
+            ("启动起点", "startup_start"),
+            ("达速时刻", "startup_reach"),
+            ("启动时长", "startup_delay"),
+            ("启动峰值电流", "startup_peak"),
+            ("峰值时刻", "startup_peak_time"),
+            ("刹车起点", "brake_start"),
+            ("电流归零确认", "current_zero"),
+            ("刹车终点", "brake_end"),
+            ("刹车时长", "brake_delay"),
+            ("刹车峰值电流", "brake_peak"),
+            ("命中频率", "speed_frequency"),
+            ("命中周期", "speed_period"),
+        ]
+        results_grid = QGridLayout()
+        results_grid.setHorizontalSpacing(10)
+        results_grid.setVerticalSpacing(10)
+        for index, (title, key) in enumerate(result_items):
+            value_label = self._metric_value_label()
+            self.startup_brake_result_labels[key] = value_label
+            card = self._metric_card(title, value_label)
+            self.startup_brake_result_cards[key] = card
+            results_grid.addWidget(card, index // 4, index % 4)
+        single_result_layout.addLayout(results_grid)
+        result_stats_row.addWidget(single_result_box, 2)
+
+        stats_box = self._group_box("统计范围")
+        stats_box_layout = QVBoxLayout(stats_box)
+        stats_box_layout.setContentsMargins(10, 10, 10, 10)
+        stats_box_layout.setSpacing(8)
+        self.startup_brake_stats_labels: dict[str, QLabel] = {}
+        stats_items = [
+            ("样本数", "sample_count"),
+            ("启动时长范围", "startup_delay_range"),
+            ("刹车时长范围", "brake_delay_range"),
+            ("启动峰值电流范围", "startup_peak_range"),
+            ("刹车峰值电流范围", "brake_peak_range"),
+            ("命中频率范围", "speed_frequency_range"),
+        ]
+        stats_grid = QGridLayout()
+        stats_grid.setHorizontalSpacing(10)
+        stats_grid.setVerticalSpacing(10)
+        stats_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        for index, (title, key) in enumerate(stats_items):
+            value_label = self._metric_value_label()
+            self.startup_brake_stats_labels[key] = value_label
+            stats_grid.addWidget(self._metric_card(title, value_label), index // 2, index % 2)
+        stats_box_layout.addLayout(stats_grid)
+        result_stats_row.addWidget(stats_box, 1)
+        layout.addLayout(result_stats_row)
+
+        history_title = QLabel("测试记录")
+        history_title.setFont(QFont(history_title.font().family(), history_title.font().pointSize(), QFont.Bold))
+        layout.addWidget(history_title)
+
+        self.startup_brake_history_table = QTableWidget(0, 7)
+        self.startup_brake_history_table.setHorizontalHeaderLabels(
+            ["#", "时间", "启动(ms)", "刹车(ms)", "启动峰值(A)", "刹车峰值(A)", "命中频率(Hz)"]
+        )
+        self.startup_brake_history_table.setMinimumHeight(220)
+        self.startup_brake_history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.startup_brake_history_table.setSelectionMode(QTableWidget.NoSelection)
+        self.startup_brake_history_table.verticalHeader().setVisible(False)
+        self.startup_brake_history_table.setAlternatingRowColors(True)
+        self.startup_brake_history_table.setShowGrid(False)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.startup_brake_history_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.startup_brake_history_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        self.startup_brake_history_table.verticalHeader().setDefaultSectionSize(28)
+        layout.addWidget(self.startup_brake_history_table, 1)
+
+        self.startup_brake_summary_label = QLabel("提示：执行测试时会优先复用当前波形；缺少通道时会按当前波形采样参数补抓。")
+        self.startup_brake_summary_label.setWordWrap(True)
+        layout.addWidget(self.startup_brake_summary_label)
+        return box
+
+    def _inline_form_field(self, text: str, widget: QWidget) -> QWidget:
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(self._form_label(text))
+        row.addWidget(widget)
+        row.addStretch(1)
+        return container
+
+    def _metric_card(self, title: str, value_label: QLabel) -> QWidget:
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 8, 10, 8)
+        card_layout.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignCenter)
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
+        return card
+
+    def _metric_value_label(self) -> QLabel:
+        label = QLabel("-")
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        value_font = label.font()
+        value_font.setBold(True)
+        label.setFont(value_font)
+        return label
+
+    def _form_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        label.setFixedWidth(84)
+        return label
+
+    def _set_compact_field_width(self, *widgets: QWidget) -> None:
+        for widget in widgets:
+            widget.setMinimumWidth(128)
+            widget.setMaximumWidth(156)
+
+    def _create_channel_combo(self, default_channel: str) -> QComboBox:
+        combo = QComboBox()
+        for channel in SUPPORTED_CHANNELS:
+            combo.addItem(_display_channel_name(channel), channel)
+        index = combo.findData(default_channel)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        return combo
+
+    def _selected_channel_from_combo(self, combo: QComboBox) -> str:
+        current = combo.currentData()
+        if isinstance(current, str) and current:
+            return current
+        return _normalize_channel_name(combo.currentText())
+
+    def _refresh_startup_brake_channel_options(self, changed_combo: QComboBox | None = None) -> None:
+        combos = getattr(self, "startup_brake_channel_combos", [])
+        if not combos:
+            return
+
+        if changed_combo is None:
+            self.startup_brake_channel_previous = {
+                id(combo): self._selected_channel_from_combo(combo) for combo in combos
+            }
+            return
+
+        current_channel = self._selected_channel_from_combo(changed_combo)
+        previous_channel = self.startup_brake_channel_previous.get(id(changed_combo), current_channel)
+        conflict_combo = next(
+            (
+                combo
+                for combo in combos
+                if combo is not changed_combo and self._selected_channel_from_combo(combo) == current_channel
+            ),
+            None,
+        )
+        if conflict_combo is not None and previous_channel != current_channel:
+            target_index = conflict_combo.findData(previous_channel)
+            if target_index >= 0:
+                conflict_combo.blockSignals(True)
+                conflict_combo.setCurrentIndex(target_index)
+                conflict_combo.blockSignals(False)
+
+        self.startup_brake_channel_previous = {
+            id(combo): self._selected_channel_from_combo(combo) for combo in combos
+        }
+
+    def _refresh_startup_brake_mode_fields(self) -> None:
+        brake_mode = str(self.test_brake_mode_combo.currentData())
+        encoder_enabled = brake_mode == "encoder_backtrack"
+        if hasattr(self, "test_encoder_field"):
+            self.test_encoder_field.setEnabled(encoder_enabled)
+        if hasattr(self, "test_backtrack_field"):
+            self.test_backtrack_field.setEnabled(encoder_enabled)
+        self._refresh_startup_brake_result_emphasis(brake_mode)
+
+    def _refresh_startup_brake_target_fields(self) -> None:
+        target_mode = str(self.test_target_mode_combo.currentData())
+        target_value = float(self.test_target_value_input.value())
+        pulses_per_revolution = max(int(self.test_ppr_input.value()), 1)
+
+        ppr_enabled = target_mode == "rpm"
+        if hasattr(self, "test_ppr_field"):
+            self.test_ppr_field.setEnabled(ppr_enabled)
+
+        if not hasattr(self, "test_target_hint_label"):
+            return
+        if target_mode == "rpm":
+            frequency_hz = (target_value * pulses_per_revolution) / 60.0
+            period_ms = (1000.0 / frequency_hz) if frequency_hz > 0 else 0.0
+            self.test_target_hint_label.setText(
+                f"当前按转速判定：{target_value:.3f} RPM -> {frequency_hz:.6f} Hz -> {period_ms:.6f} ms"
+            )
+        elif target_mode == "frequency_hz":
+            period_ms = (1000.0 / target_value) if target_value > 0 else 0.0
+            self.test_target_hint_label.setText(
+                f"当前按频率判定：{target_value:.6f} Hz -> {period_ms:.6f} ms"
+            )
+        elif target_mode == "period_ms":
+            frequency_hz = (1000.0 / target_value) if target_value > 0 else 0.0
+            self.test_target_hint_label.setText(
+                f"当前按周期判定：{target_value:.6f} ms -> {frequency_hz:.6f} Hz"
+            )
+        else:
+            self.test_target_hint_label.setText("")
+
+    def _centered_table_item(self, text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(int(Qt.AlignCenter))
+        return item
+
+    def _refresh_startup_brake_result_emphasis(self, brake_mode: str | None = None) -> None:
+        if not hasattr(self, "startup_brake_result_cards"):
+            return
+        if brake_mode is None:
+            brake_mode = str(self.test_brake_mode_combo.currentData())
+
+        muted_keys: set[str]
+        if brake_mode == "current_zero":
+            muted_keys = {"brake_end"}
+        elif brake_mode == "encoder_backtrack":
+            muted_keys = {"current_zero"}
+        else:
+            muted_keys = set()
+
+        for key, card in self.startup_brake_result_cards.items():
+            card.setEnabled(key not in muted_keys)
+
     def _stabilize_push_buttons(self, container: QWidget) -> None:
         for button in container.findChildren(QPushButton):
             button.setAutoDefault(False)
             button.setDefault(False)
+            button.setMinimumHeight(max(button.minimumHeight(), 30))
+
+    def _normalize_label_alignment(self, container: QWidget) -> None:
+        for label in container.findChildren(QLabel):
+            label.setAlignment(label.alignment() | Qt.AlignVCenter)
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1809,12 +2290,15 @@ class ScopeMainWindow(QMainWindow):
         self.last_waveform_data = None
         self.last_waveform_bundle = []
         self.last_waveform_stats = None
+        self.last_startup_brake_result = None
         self.export_waveform_button.setEnabled(False)
         self.status_value.setText("未连接")
         self.idn_value.setText("-")
         self.measurement_status.setText("自动测量：未启动")
         self._refresh_auto_measure_button()
         self.waveform_summary.setText("波形状态：尚未抓取")
+        self._clear_startup_brake_results()
+        self._clear_startup_brake_history()
         self._reset_waveform_visuals()
         self.log("正在断开设备连接。")
         self._run_task(scope.disconnect, success_message="设备已断开。")
@@ -1859,7 +2343,7 @@ class ScopeMainWindow(QMainWindow):
             self._show_warning("请至少勾选一个测量项。")
             return
 
-        channel = self.channel_combo.currentText()
+        channel = self._selected_channel()
         self.log(f"执行单次测量: {channel} / {', '.join(measurement_names)}")
         self._run_task(
             lambda: scope.fetch_measurements(channel, measurement_names),
@@ -1880,7 +2364,7 @@ class ScopeMainWindow(QMainWindow):
         self.stop_auto_measurement(log_message=False)
         stop_event = threading.Event()
         self.auto_measure_stop = stop_event
-        channel = self.channel_combo.currentText()
+        channel = self._selected_channel()
         interval = max(self.interval_input.value(), 0.2)
         self.log(f"自动测量已启动，间隔 {interval:.1f}s。")
         self.measurement_status.setText(f"自动测量：运行中 ({interval:.1f}s)")
@@ -1943,7 +2427,7 @@ class ScopeMainWindow(QMainWindow):
         channels = self._selected_waveform_channels()
         points_mode = self.waveform_mode_combo.currentText()
         points = int(self.waveform_points_input.value())
-        self.log(f"开始抓取波形: {', '.join(channel.replace('CHANnel', 'CH') for channel in channels)}, {points_mode}, {points} 点。")
+        self.log(f"开始抓取波形: {', '.join(_display_channel_name(channel) for channel in channels)}, {points_mode}, {points} 点。")
         self._run_task(
             lambda: [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels],
             on_success=self._on_waveforms_fetched,
@@ -1959,7 +2443,7 @@ class ScopeMainWindow(QMainWindow):
         waveforms = list(self.last_waveform_bundle)
         if len(waveforms) == 1:
             waveform = waveforms[0]
-            channel = waveform.channel.replace("CHANnel", "CH")
+            channel = _display_channel_name(waveform.channel)
             target = WAVEFORM_DIR / f"{channel}_{waveform.points_mode}_{timestamp}.csv"
             self._run_task(
                 lambda: waveform.export_csv(target),
@@ -2012,15 +2496,17 @@ class ScopeMainWindow(QMainWindow):
         if not waveforms:
             return
         primary_waveform = waveforms[0]
+        self.last_startup_brake_result = None
         self.last_waveform_bundle = list(waveforms)
         self.last_waveform_data = primary_waveform
         self.last_waveform_stats = primary_waveform.analyze()
+        self._clear_startup_brake_results()
         self._sync_waveform_channel_selection(waveforms)
         self.export_waveform_button.setEnabled(True)
         self.waveform_summary.setText(
             "波形状态："
-            f"{' + '.join(waveform.channel.replace('CHANnel', 'CH') for waveform in waveforms)} / {primary_waveform.points_mode} / "
-            f"主通道 {primary_waveform.channel.replace('CHANnel', 'CH')} / {len(primary_waveform.x_values)} 点 / "
+            f"{' + '.join(_display_channel_name(waveform.channel) for waveform in waveforms)} / {primary_waveform.points_mode} / "
+            f"主通道 {_display_channel_name(primary_waveform.channel)} / {len(primary_waveform.x_values)} 点 / "
             f"时间跨度 {self.last_waveform_stats.duration_s:.6e}s / "
             f"电压范围 {self.last_waveform_stats.voltage_min:.4f}V ~ {self.last_waveform_stats.voltage_max:.4f}V"
         )
@@ -2041,6 +2527,11 @@ class ScopeMainWindow(QMainWindow):
         self.waveform_detail_dialog.raise_()
         self.waveform_detail_dialog.activateWindow()
         self.sync_waveform_detail_dialog()
+
+    def show_startup_brake_dialog(self) -> None:
+        self.startup_brake_dialog.show()
+        self.startup_brake_dialog.raise_()
+        self.startup_brake_dialog.activateWindow()
 
     def sync_waveform_detail_dialog(self) -> None:
         if not self.last_waveform_bundle or self.last_waveform_stats is None:
@@ -2098,7 +2589,7 @@ class ScopeMainWindow(QMainWindow):
         return [name for name, checkbox in self.measurement_checks.items() if checkbox.isChecked()]
 
     def _selected_waveform_channels(self) -> list[str]:
-        primary_channel = self.channel_combo.currentText()
+        primary_channel = self._selected_channel()
         channels = [primary_channel]
         for channel, checkbox in self.overlay_channel_checks.items():
             if channel == primary_channel:
@@ -2108,7 +2599,7 @@ class ScopeMainWindow(QMainWindow):
         return channels
 
     def _refresh_overlay_channel_checks(self, selected_channels: set[str] | None = None) -> None:
-        primary_channel = self.channel_combo.currentText()
+        primary_channel = self._selected_channel()
         for channel, checkbox in self.overlay_channel_checks.items():
             is_primary = channel == primary_channel
             checkbox.blockSignals(True)
@@ -2126,9 +2617,328 @@ class ScopeMainWindow(QMainWindow):
 
         primary_channel = supported_channels[0]
         self.channel_combo.blockSignals(True)
-        self.channel_combo.setCurrentText(primary_channel)
+        self._set_selected_channel(primary_channel)
         self.channel_combo.blockSignals(False)
         self._refresh_overlay_channel_checks(set(supported_channels[1:]))
+
+    def _selected_channel(self) -> str:
+        current = self.channel_combo.currentData()
+        if isinstance(current, str) and current:
+            return current
+        return _normalize_channel_name(self.channel_combo.currentText())
+
+    def _set_selected_channel(self, channel: str) -> None:
+        index = self.channel_combo.findData(_normalize_channel_name(channel))
+        if index >= 0:
+            self.channel_combo.setCurrentIndex(index)
+
+    def _startup_brake_config_from_ui(self) -> StartupBrakeTestConfig:
+        return StartupBrakeTestConfig(
+            control_channel=self._selected_channel_from_combo(self.test_control_channel_combo),
+            speed_channel=self._selected_channel_from_combo(self.test_speed_channel_combo),
+            current_channel=self._selected_channel_from_combo(self.test_current_channel_combo),
+            encoder_a_channel=self._selected_channel_from_combo(self.test_encoder_channel_combo),
+            speed_target_mode=str(self.test_target_mode_combo.currentData()),
+            speed_target_value=float(self.test_target_value_input.value()),
+            speed_tolerance_ratio=float(self.test_tolerance_input.value()) / 100.0,
+            speed_consecutive_periods=int(self.test_consecutive_input.value()),
+            pulses_per_revolution=int(self.test_ppr_input.value()),
+            control_threshold_ratio=0.1,
+            zero_current_threshold_a=float(self.test_zero_threshold_input.value()),
+            zero_current_flat_threshold_a=float(self.test_flat_threshold_input.value()),
+            zero_current_hold_s=float(self.test_hold_ms_input.value()) / 1000.0,
+            brake_mode=str(self.test_brake_mode_combo.currentData()),
+            brake_backtrack_pulses=int(self.test_backtrack_pulses_input.value()),
+        )
+
+    def _required_startup_brake_channels(self, config: StartupBrakeTestConfig) -> list[str]:
+        channels: list[str] = []
+        for channel in (
+            config.control_channel,
+            config.speed_channel,
+            config.current_channel,
+            config.encoder_a_channel if config.brake_mode == "encoder_backtrack" else None,
+        ):
+            if channel and channel not in channels:
+                channels.append(channel)
+        return channels
+
+    def run_startup_brake_test(self) -> None:
+        config = self._startup_brake_config_from_ui()
+        required_channels = self._required_startup_brake_channels(config)
+        available_channels = {waveform.channel for waveform in self.last_waveform_bundle}
+        if required_channels and set(required_channels).issubset(available_channels):
+            self._execute_startup_brake_test(self.last_waveform_bundle, config)
+            return
+
+        scope = self.scope
+        if scope is None or not scope.is_connected:
+            self._show_warning("当前波形缺少测试所需通道，请先连接示波器或加载包含这些通道的波形文件。")
+            return
+
+        points_mode = self.waveform_mode_combo.currentText()
+        points = int(self.waveform_points_input.value())
+        self.startup_brake_summary_label.setText("正在抓取启动刹车测试所需波形...")
+        self.log(f"启动刹车测试补抓波形: {', '.join(_display_channel_name(channel) for channel in required_channels)}")
+        self._run_task(
+            lambda: [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in required_channels],
+            on_success=lambda waveforms, captured_config=config: self._on_startup_brake_waveforms_ready(waveforms, captured_config),
+            success_message="启动刹车测试波形抓取完成。",
+        )
+
+    def _on_startup_brake_waveforms_ready(
+        self,
+        waveforms: list[WaveformData],
+        config: StartupBrakeTestConfig,
+    ) -> None:
+        self._on_waveforms_fetched(waveforms)
+        self._execute_startup_brake_test(waveforms, config)
+
+    def _execute_startup_brake_test(
+        self,
+        waveforms: list[WaveformData],
+        config: StartupBrakeTestConfig,
+    ) -> None:
+        try:
+            result = analyze_startup_brake_test(waveforms, config)
+        except Exception as exc:
+            self.last_startup_brake_result = None
+            self._clear_startup_brake_results(reset_summary=False)
+            self.startup_brake_summary_label.setText(f"测试失败：{exc}")
+            self.log(f"启动刹车性能测试失败: {exc}")
+            self._show_warning(str(exc))
+            return
+
+        self.last_startup_brake_result = result
+        self.startup_brake_history.append(result)
+        self.startup_brake_history_timestamps.append(datetime.now().strftime("%H:%M:%S"))
+        self.startup_brake_history_configs.append(config)
+        self._update_startup_brake_results(result)
+        self._refresh_startup_brake_history()
+        self.log(
+            "启动刹车性能测试完成: "
+            f"启动 {result.startup_delay_s:.6e}s, 刹车 {result.brake_delay_s:.6e}s, "
+            f"命中频率 {result.speed_match.frequency_hz:.3f}Hz"
+        )
+
+    def _update_startup_brake_results(self, result: StartupBrakeTestResult) -> None:
+        labels = self.startup_brake_result_labels
+        labels["startup_start"].setText(f"{result.startup_start_point[0]:.6e} s")
+        labels["startup_reach"].setText(f"{result.speed_reached_point[0]:.6e} s")
+        labels["startup_delay"].setText(f"{result.startup_delay_s:.6e} s")
+        labels["startup_peak"].setText(_format_peak_current(result.startup_peak_current))
+        labels["startup_peak_time"].setText(_format_peak_time(result.startup_peak_current))
+        labels["brake_start"].setText(f"{result.brake_start_point[0]:.6e} s")
+        labels["current_zero"].setText(f"{result.current_zero_window.confirmed_time_s:.6e} s")
+        labels["brake_end"].setText(f"{result.brake_end_point[0]:.6e} s")
+        labels["brake_delay"].setText(f"{result.brake_delay_s:.6e} s")
+        labels["brake_peak"].setText(_format_peak_current(result.brake_peak_current))
+        labels["speed_frequency"].setText(f"{result.speed_match.frequency_hz:.6f} Hz")
+        labels["speed_period"].setText(f"{result.speed_match.period_s * 1000.0:.6f} ms")
+        self.apply_startup_cursor_button.setEnabled(True)
+        self.apply_brake_cursor_button.setEnabled(True)
+        brake_mode_label = "电流归零" if result.brake_mode == "current_zero" else "A相回溯"
+        self.startup_brake_summary_label.setText(
+            "启动刹车性能测试完成："
+            f"第 {len(self.startup_brake_history)} 次样本，"
+            f"启动 {result.startup_delay_s:.6e}s，"
+            f"刹车 {result.brake_delay_s:.6e}s，"
+            f"模式 {brake_mode_label}。"
+        )
+
+    def _clear_startup_brake_results(self, *, reset_summary: bool = True) -> None:
+        if hasattr(self, "startup_brake_result_labels"):
+            for label in self.startup_brake_result_labels.values():
+                label.setText("-")
+        self._refresh_startup_brake_result_emphasis()
+        if hasattr(self, "apply_startup_cursor_button"):
+            self.apply_startup_cursor_button.setEnabled(False)
+        if hasattr(self, "apply_brake_cursor_button"):
+            self.apply_brake_cursor_button.setEnabled(False)
+        if reset_summary and hasattr(self, "startup_brake_summary_label"):
+            self.startup_brake_summary_label.setText("提示：执行测试时会优先复用当前波形；缺少通道时会按当前波形采样参数补抓。")
+
+    def _clear_startup_brake_history(self) -> None:
+        self.startup_brake_history = []
+        self.startup_brake_history_timestamps = []
+        self.startup_brake_history_configs = []
+        self._refresh_startup_brake_history()
+        self.startup_brake_summary_label.setText("统计已清空。可继续执行测试重新累计范围。")
+
+    def _export_startup_brake_history_csv(self) -> None:
+        if not self.startup_brake_history:
+            self._show_warning("当前没有可导出的启动刹车测试统计。")
+            return
+
+        STARTUP_BRAKE_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = STARTUP_BRAKE_DIR / f"startup_brake_stats_{timestamp}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self.startup_brake_dialog,
+            "导出启动刹车统计 CSV",
+            str(default_path),
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path)
+        with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["section", "key", "value"])
+            writer.writerow(["config", "control_channel", self._history_config_summary(lambda config: _display_channel_name(config.control_channel))])
+            writer.writerow(["config", "speed_channel", self._history_config_summary(lambda config: _display_channel_name(config.speed_channel))])
+            writer.writerow(["config", "current_channel", self._history_config_summary(lambda config: _display_channel_name(config.current_channel))])
+            writer.writerow(["config", "encoder_a_channel", self._history_config_summary(lambda config: _display_channel_name(config.encoder_a_channel or "-"))])
+            writer.writerow(["config", "speed_target_mode", self._history_config_summary(lambda config: self._target_mode_display_text(config.speed_target_mode))])
+            writer.writerow(["config", "speed_target_value", self._history_config_summary(lambda config: f"{config.speed_target_value:.6f}")])
+            writer.writerow(["config", "speed_tolerance_percent", self._history_config_summary(lambda config: f"{config.speed_tolerance_ratio * 100.0:.2f}")])
+            writer.writerow(["config", "speed_consecutive_periods", self._history_config_summary(lambda config: str(config.speed_consecutive_periods))])
+            writer.writerow(["config", "pulses_per_revolution", self._history_config_summary(lambda config: str(config.pulses_per_revolution))])
+            writer.writerow(["config", "brake_mode", self._history_config_summary(lambda config: self._brake_mode_display_text(config.brake_mode))])
+            writer.writerow(["config", "zero_current_threshold_a", self._history_config_summary(lambda config: f"{config.zero_current_threshold_a:.6f}")])
+            writer.writerow(["config", "zero_current_flat_threshold_a", self._history_config_summary(lambda config: f"{config.zero_current_flat_threshold_a:.6f}")])
+            writer.writerow(["config", "zero_current_hold_ms", self._history_config_summary(lambda config: f"{config.zero_current_hold_s * 1000.0:.6f}")])
+            writer.writerow(["config", "brake_backtrack_pulses", self._history_config_summary(lambda config: str(config.brake_backtrack_pulses))])
+            writer.writerow([])
+
+            writer.writerow(["summary", "sample_count", str(len(self.startup_brake_history))])
+            writer.writerow(["summary", "startup_delay_range_ms", _format_range_ms([result.startup_delay_s * 1000.0 for result in self.startup_brake_history])])
+            writer.writerow(["summary", "brake_delay_range_ms", _format_range_ms([result.brake_delay_s * 1000.0 for result in self.startup_brake_history])])
+            writer.writerow(["summary", "startup_peak_range_a", _format_range_amp([result.startup_peak_current.value for result in self.startup_brake_history if result.startup_peak_current is not None])])
+            writer.writerow(["summary", "brake_peak_range_a", _format_range_amp([result.brake_peak_current.value for result in self.startup_brake_history if result.brake_peak_current is not None])])
+            writer.writerow(["summary", "speed_frequency_range_hz", _format_range_hz([result.speed_match.frequency_hz for result in self.startup_brake_history])])
+            writer.writerow([])
+
+            writer.writerow(
+                [
+                    "sample_index",
+                    "timestamp",
+                    "startup_delay_ms",
+                    "brake_delay_ms",
+                    "startup_peak_current_a",
+                    "brake_peak_current_a",
+                    "speed_frequency_hz",
+                    "speed_period_ms",
+                    "target_mode",
+                    "target_value",
+                    "pulses_per_revolution",
+                    "brake_mode",
+                ]
+            )
+            for index, result in enumerate(self.startup_brake_history, start=1):
+                config = self.startup_brake_history_configs[index - 1] if index - 1 < len(self.startup_brake_history_configs) else None
+                writer.writerow(
+                    [
+                        index,
+                        self.startup_brake_history_timestamps[index - 1] if index - 1 < len(self.startup_brake_history_timestamps) else "-",
+                        f"{result.startup_delay_s * 1000.0:.6f}",
+                        f"{result.brake_delay_s * 1000.0:.6f}",
+                        f"{result.startup_peak_current.value:.6f}" if result.startup_peak_current is not None else "",
+                        f"{result.brake_peak_current.value:.6f}" if result.brake_peak_current is not None else "",
+                        f"{result.speed_match.frequency_hz:.6f}",
+                        f"{result.speed_match.period_s * 1000.0:.6f}",
+                        self._target_mode_display_text(config.speed_target_mode) if config is not None else "",
+                        f"{config.speed_target_value:.6f}" if config is not None else "",
+                        str(config.pulses_per_revolution) if config is not None else "",
+                        self._brake_mode_display_text(result.brake_mode),
+                    ]
+                )
+
+        self.startup_brake_summary_label.setText(f"统计 CSV 已导出：{output_path}")
+        self.log(f"启动刹车统计已导出: {output_path}")
+
+    def _apply_startup_cursors(self) -> None:
+        result = self.last_startup_brake_result
+        if result is None:
+            self._show_warning("请先执行一次启动刹车性能测试。")
+            return
+        self.waveform_panel.set_cursor_points(
+            result.startup_start_point,
+            result.speed_reached_point,
+            annotation_text="Startup Window",
+        )
+        if self.waveform_detail_dialog.isVisible():
+            self.waveform_detail_dialog.set_cursor_points(
+                result.startup_start_point,
+                result.speed_reached_point,
+                annotation_text="Startup Window",
+            )
+
+    def _apply_brake_cursors(self) -> None:
+        result = self.last_startup_brake_result
+        if result is None:
+            self._show_warning("请先执行一次启动刹车性能测试。")
+            return
+        self.waveform_panel.set_cursor_points(
+            result.brake_start_point,
+            result.brake_end_point,
+            annotation_text="Brake Window",
+        )
+        if self.waveform_detail_dialog.isVisible():
+            self.waveform_detail_dialog.set_cursor_points(
+                result.brake_start_point,
+                result.brake_end_point,
+                annotation_text="Brake Window",
+            )
+
+    def _refresh_startup_brake_history(self) -> None:
+        if hasattr(self, "startup_brake_history_table"):
+            self.startup_brake_history_table.setRowCount(len(self.startup_brake_history))
+            for row, result in enumerate(self.startup_brake_history):
+                self.startup_brake_history_table.setItem(row, 0, self._centered_table_item(str(row + 1)))
+                timestamp = self.startup_brake_history_timestamps[row] if row < len(self.startup_brake_history_timestamps) else "-"
+                self.startup_brake_history_table.setItem(row, 1, self._centered_table_item(timestamp))
+                self.startup_brake_history_table.setItem(row, 2, self._centered_table_item(f"{result.startup_delay_s * 1000.0:.3f} ms"))
+                self.startup_brake_history_table.setItem(row, 3, self._centered_table_item(f"{result.brake_delay_s * 1000.0:.3f} ms"))
+                self.startup_brake_history_table.setItem(row, 4, self._centered_table_item(_format_peak_current(result.startup_peak_current)))
+                self.startup_brake_history_table.setItem(row, 5, self._centered_table_item(_format_peak_current(result.brake_peak_current)))
+                self.startup_brake_history_table.setItem(row, 6, self._centered_table_item(f"{result.speed_match.frequency_hz:.6f} Hz"))
+
+        if not hasattr(self, "startup_brake_stats_labels"):
+            return
+        if not self.startup_brake_history:
+            for label in self.startup_brake_stats_labels.values():
+                label.setText("-")
+            return
+
+        startup_delays_ms = [result.startup_delay_s * 1000.0 for result in self.startup_brake_history]
+        brake_delays_ms = [result.brake_delay_s * 1000.0 for result in self.startup_brake_history]
+        startup_peaks = [result.startup_peak_current.value for result in self.startup_brake_history if result.startup_peak_current is not None]
+        brake_peaks = [result.brake_peak_current.value for result in self.startup_brake_history if result.brake_peak_current is not None]
+        speed_frequencies = [result.speed_match.frequency_hz for result in self.startup_brake_history]
+
+        self.startup_brake_stats_labels["sample_count"].setText(str(len(self.startup_brake_history)))
+        self.startup_brake_stats_labels["startup_delay_range"].setText(_format_range_ms(startup_delays_ms))
+        self.startup_brake_stats_labels["brake_delay_range"].setText(_format_range_ms(brake_delays_ms))
+        self.startup_brake_stats_labels["startup_peak_range"].setText(_format_range_amp(startup_peaks))
+        self.startup_brake_stats_labels["brake_peak_range"].setText(_format_range_amp(brake_peaks))
+        self.startup_brake_stats_labels["speed_frequency_range"].setText(_format_range_hz(speed_frequencies))
+
+    def _history_config_summary(self, getter) -> str:
+        if not self.startup_brake_history_configs:
+            return "-"
+        values = [getter(config) for config in self.startup_brake_history_configs]
+        first_value = values[0]
+        if all(value == first_value for value in values[1:]):
+            return first_value
+        return "mixed"
+
+    def _target_mode_display_text(self, target_mode: str) -> str:
+        if target_mode == "frequency_hz":
+            return "频率(Hz)"
+        if target_mode == "period_ms":
+            return "周期(ms)"
+        if target_mode == "rpm":
+            return "转速(RPM)"
+        return target_mode
+
+    def _brake_mode_display_text(self, brake_mode: str) -> str:
+        if brake_mode == "current_zero":
+            return "电流归零"
+        if brake_mode == "encoder_backtrack":
+            return "A相回溯"
+        return brake_mode
 
     def _get_scope_or_warn(self) -> KeysightOscilloscope | None:
         if self.scope is None or not self.scope.is_connected:
@@ -2198,6 +3008,7 @@ class ScopeMainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setFont(QFont("Microsoft YaHei UI", 10))
     window = ScopeMainWindow()
     window.show()
     app.exec()
@@ -2277,3 +3088,33 @@ def _format_optional_phase(value: float | None) -> str:
     if value is None:
         return "无法估算"
     return f"{value:.3f} deg"
+
+
+def _format_peak_current(peak) -> str:
+    if peak is None:
+        return "-"
+    return f"{peak.value:.6f} A"
+
+
+def _format_peak_time(peak) -> str:
+    if peak is None:
+        return "-"
+    return f"{peak.time_s:.6e} s"
+
+
+def _format_range_ms(values: list[float]) -> str:
+    if not values:
+        return "-"
+    return f"{min(values):.3f} ~ {max(values):.3f} ms"
+
+
+def _format_range_amp(values: list[float]) -> str:
+    if not values:
+        return "-"
+    return f"{min(values):.6f} ~ {max(values):.6f} A"
+
+
+def _format_range_hz(values: list[float]) -> str:
+    if not values:
+        return "-"
+    return f"{min(values):.6f} ~ {max(values):.6f} Hz"

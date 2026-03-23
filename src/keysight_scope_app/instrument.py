@@ -289,6 +289,25 @@ class WaveformData:
             return None
         return sliced.analyze()
 
+    def find_first_edge(
+        self,
+        edge_type: str,
+        *,
+        threshold_ratio: float = 0.5,
+        start_time: float | None = None,
+    ) -> tuple[float, float] | None:
+        if not self.x_values or not self.y_values:
+            return None
+        if edge_type not in {"rising", "falling"}:
+            raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+        threshold = _edge_threshold(self.y_values, edge_type=edge_type, threshold_ratio=threshold_ratio)
+        crossings = _find_crossings(self.x_values, self.y_values, threshold, edge_type)
+        for crossing in crossings:
+            if start_time is None or crossing >= start_time:
+                return crossing, threshold
+        return None
+
     def snap_to_edge(self, x_hint: float, edge_type: str) -> tuple[float, float] | None:
         if not self.x_values or not self.y_values:
             return None
@@ -379,6 +398,162 @@ class WaveformData:
             key=lambda candidate: abs(((candidate.start_edge[0] + candidate.end_edge[0]) / 2) - x_hint),
         )
 
+    def find_target_cycle(
+        self,
+        *,
+        target_mode: str,
+        target_value: float,
+        tolerance_ratio: float = 0.05,
+        consecutive_periods: int = 3,
+        start_time: float = 0.0,
+        pulses_per_revolution: int = 1,
+        edge_type: str = "rising",
+    ) -> "SpeedTargetMatch" | None:
+        if not self.x_values or not self.y_values:
+            return None
+        if target_value <= 0:
+            raise ValueError("目标值必须大于 0。")
+        if tolerance_ratio < 0:
+            raise ValueError("容差比例不能为负数。")
+        if consecutive_periods <= 0:
+            raise ValueError("连续周期数必须大于 0。")
+        if pulses_per_revolution <= 0:
+            raise ValueError("每转脉冲数必须大于 0。")
+        if edge_type not in {"rising", "falling"}:
+            raise ValueError(f"不支持的周期边沿类型: {edge_type}")
+
+        threshold = _edge_threshold(self.y_values, edge_type=edge_type, threshold_ratio=0.5)
+        crossings = _find_crossings(self.x_values, self.y_values, threshold, edge_type)
+        streak = 0
+        for crossing_index in range(1, len(crossings)):
+            previous_edge = crossings[crossing_index - 1]
+            current_edge = crossings[crossing_index]
+            if current_edge <= previous_edge:
+                continue
+            if current_edge < start_time:
+                streak = 0
+                continue
+
+            period_s = current_edge - previous_edge
+            frequency_hz = 1.0 / period_s if period_s > 0 else 0.0
+            rpm = (frequency_hz * 60.0) / pulses_per_revolution
+            if _matches_target_cycle(
+                target_mode=target_mode,
+                target_value=target_value,
+                period_s=period_s,
+                frequency_hz=frequency_hz,
+                rpm=rpm,
+                tolerance_ratio=tolerance_ratio,
+            ):
+                streak += 1
+                if streak < consecutive_periods:
+                    continue
+
+                first_period_index = crossing_index - consecutive_periods + 1
+                period_values = [
+                    crossings[index] - crossings[index - 1]
+                    for index in range(first_period_index, crossing_index + 1)
+                ]
+                average_period_s = sum(period_values) / len(period_values)
+                average_frequency_hz = 1.0 / average_period_s if average_period_s > 0 else 0.0
+                average_rpm = (average_frequency_hz * 60.0) / pulses_per_revolution
+                return SpeedTargetMatch(
+                    edge_type=edge_type,
+                    start_time_s=crossings[first_period_index - 1],
+                    reached_time_s=current_edge,
+                    period_s=average_period_s,
+                    frequency_hz=average_frequency_hz,
+                    rpm=average_rpm,
+                    threshold=threshold,
+                    matched_cycles=consecutive_periods,
+                )
+            streak = 0
+        return None
+
+    def find_zero_stable_window(
+        self,
+        *,
+        start_time: float = 0.0,
+        zero_threshold: float = 0.05,
+        flat_threshold: float = 0.03,
+        hold_time_s: float = 0.002,
+    ) -> "ZeroStableWindow" | None:
+        if not self.x_values or not self.y_values:
+            return None
+        if zero_threshold < 0:
+            raise ValueError("零电流阈值不能为负数。")
+        if flat_threshold < 0:
+            raise ValueError("水平线波动阈值不能为负数。")
+        if hold_time_s < 0:
+            raise ValueError("保持时间不能为负数。")
+
+        point_count = min(len(self.x_values), len(self.y_values))
+        start_index = 0
+        while start_index < point_count and self.x_values[start_index] < start_time:
+            start_index += 1
+
+        for left in range(start_index, point_count):
+            left_value = self.y_values[left]
+            if abs(left_value) > zero_threshold:
+                continue
+
+            min_value = left_value
+            max_value = left_value
+            max_abs_value = abs(left_value)
+            for right in range(left, point_count):
+                value = self.y_values[right]
+                min_value = min(min_value, value)
+                max_value = max(max_value, value)
+                max_abs_value = max(max_abs_value, abs(value))
+                if max_abs_value > zero_threshold or (max_value - min_value) > flat_threshold:
+                    break
+                duration_s = self.x_values[right] - self.x_values[left]
+                if duration_s >= hold_time_s:
+                    return ZeroStableWindow(
+                        start_time_s=self.x_values[left],
+                        confirmed_time_s=self.x_values[right],
+                        max_abs_value=max_abs_value,
+                        span_value=max_value - min_value,
+                    )
+        return None
+
+    def find_previous_edge(
+        self,
+        reference_time: float,
+        *,
+        count: int = 1,
+        edge_type: str = "rising",
+    ) -> tuple[float, float] | None:
+        if not self.x_values or not self.y_values:
+            return None
+        if count <= 0:
+            raise ValueError("回溯脉冲数必须大于 0。")
+        if edge_type not in {"rising", "falling"}:
+            raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+        threshold = _edge_threshold(self.y_values, edge_type=edge_type, threshold_ratio=0.5)
+        crossings = [crossing for crossing in _find_crossings(self.x_values, self.y_values, threshold, edge_type) if crossing < reference_time]
+        if len(crossings) < count:
+            return None
+        return crossings[-count], threshold
+
+    def peak_absolute_between(self, start_x: float, end_x: float) -> "SignalPeak" | None:
+        if not self.x_values or not self.y_values:
+            return None
+
+        left = min(start_x, end_x)
+        right = max(start_x, end_x)
+        candidates = [
+            (time_value, signal_value)
+            for time_value, signal_value in zip(self.x_values, self.y_values)
+            if left <= time_value <= right
+        ]
+        if not candidates:
+            return None
+
+        peak_time, peak_value = max(candidates, key=lambda item: (abs(item[1]), -item[0]))
+        return SignalPeak(time_s=peak_time, value=peak_value, absolute_value=abs(peak_value))
+
 
 @dataclass(frozen=True)
 class WaveformStats:
@@ -429,6 +604,67 @@ class EdgeComparison:
     delta_t_s: float
     frequency_hz: float | None
     phase_deg: float | None
+
+
+@dataclass(frozen=True)
+class SpeedTargetMatch:
+    edge_type: str
+    start_time_s: float
+    reached_time_s: float
+    period_s: float
+    frequency_hz: float
+    rpm: float
+    threshold: float
+    matched_cycles: int
+
+
+@dataclass(frozen=True)
+class ZeroStableWindow:
+    start_time_s: float
+    confirmed_time_s: float
+    max_abs_value: float
+    span_value: float
+
+
+@dataclass(frozen=True)
+class SignalPeak:
+    time_s: float
+    value: float
+    absolute_value: float
+
+
+@dataclass(frozen=True)
+class StartupBrakeTestConfig:
+    control_channel: str
+    speed_channel: str
+    current_channel: str
+    encoder_a_channel: str | None = None
+    speed_target_mode: str = "frequency_hz"
+    speed_target_value: float = 0.0
+    speed_tolerance_ratio: float = 0.05
+    speed_consecutive_periods: int = 3
+    pulses_per_revolution: int = 1
+    control_threshold_ratio: float = 0.1
+    zero_current_threshold_a: float = 0.05
+    zero_current_flat_threshold_a: float = 0.03
+    zero_current_hold_s: float = 0.002
+    brake_mode: str = "current_zero"
+    brake_backtrack_pulses: int = 8
+
+
+@dataclass(frozen=True)
+class StartupBrakeTestResult:
+    startup_start_point: tuple[float, float]
+    speed_reached_point: tuple[float, float]
+    startup_delay_s: float
+    startup_peak_current: SignalPeak | None
+    speed_match: SpeedTargetMatch
+    brake_start_point: tuple[float, float]
+    current_zero_window: ZeroStableWindow
+    brake_end_point: tuple[float, float]
+    brake_delay_s: float
+    brake_peak_current: SignalPeak | None
+    brake_mode: str
 
 
 MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
@@ -829,6 +1065,47 @@ def _estimate_transition_time(start_crossings: list[float], end_crossings: list[
     return sum(durations) / len(durations)
 
 
+def _edge_threshold(y_values: list[float], *, edge_type: str, threshold_ratio: float) -> float:
+    if not y_values:
+        raise ValueError("波形数据为空。")
+    if not 0 <= threshold_ratio <= 1:
+        raise ValueError("阈值比例必须位于 0 到 1 之间。")
+
+    voltage_min = min(y_values)
+    voltage_max = max(y_values)
+    amplitude = voltage_max - voltage_min
+    if edge_type == "rising":
+        return voltage_min + amplitude * threshold_ratio
+    if edge_type == "falling":
+        return voltage_max - amplitude * threshold_ratio
+    raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+
+def _matches_target_cycle(
+    *,
+    target_mode: str,
+    target_value: float,
+    period_s: float,
+    frequency_hz: float,
+    rpm: float,
+    tolerance_ratio: float,
+) -> bool:
+    if target_mode == "frequency_hz":
+        target_measure = target_value
+        actual_measure = frequency_hz
+    elif target_mode == "period_s":
+        target_measure = target_value
+        actual_measure = period_s
+    elif target_mode == "rpm":
+        target_measure = target_value
+        actual_measure = rpm
+    else:
+        raise ValueError(f"不支持的目标类型: {target_mode}")
+
+    tolerance = abs(target_measure) * tolerance_ratio
+    return abs(actual_measure - target_measure) <= tolerance
+
+
 def compare_waveform_edges(
     primary: WaveformData,
     secondary: WaveformData,
@@ -853,6 +1130,112 @@ def compare_waveform_edges(
         delta_t_s=delta_t_s,
         frequency_hz=frequency_hz,
         phase_deg=phase_deg,
+    )
+
+
+def analyze_startup_brake_test(
+    waveforms: list[WaveformData],
+    config: StartupBrakeTestConfig,
+) -> StartupBrakeTestResult:
+    waveform_map = {waveform.channel: waveform for waveform in waveforms}
+    missing_channels = [
+        channel
+        for channel in (
+            config.control_channel,
+            config.speed_channel,
+            config.current_channel,
+            config.encoder_a_channel,
+        )
+        if channel and channel not in waveform_map
+    ]
+    if missing_channels:
+        raise ValueError(f"缺少测试所需通道波形: {', '.join(missing_channels)}")
+
+    if config.speed_target_value <= 0:
+        raise ValueError("目标转速/频率/周期必须大于 0。")
+    if config.brake_mode not in {"current_zero", "encoder_backtrack"}:
+        raise ValueError(f"不支持的刹车模式: {config.brake_mode}")
+
+    control_waveform = waveform_map[config.control_channel]
+    speed_waveform = waveform_map[config.speed_channel]
+    current_waveform = waveform_map[config.current_channel]
+
+    startup_start = control_waveform.find_first_edge(
+        "rising",
+        threshold_ratio=config.control_threshold_ratio,
+    )
+    if startup_start is None:
+        raise ValueError("未检测到控制器启动上升沿。")
+
+    speed_target_value = config.speed_target_value
+    speed_target_mode = config.speed_target_mode
+    if speed_target_mode == "period_ms":
+        speed_target_mode = "period_s"
+        speed_target_value = config.speed_target_value / 1000.0
+
+    speed_match = speed_waveform.find_target_cycle(
+        target_mode=speed_target_mode,
+        target_value=speed_target_value,
+        tolerance_ratio=config.speed_tolerance_ratio,
+        consecutive_periods=config.speed_consecutive_periods,
+        start_time=startup_start[0],
+        pulses_per_revolution=config.pulses_per_revolution,
+        edge_type="rising",
+    )
+    if speed_match is None:
+        raise ValueError("未检测到达到目标转速的连续脉冲窗口。")
+
+    speed_reached_point = (speed_match.reached_time_s, speed_match.threshold)
+    startup_peak_current = current_waveform.peak_absolute_between(startup_start[0], speed_match.reached_time_s)
+
+    brake_start = control_waveform.find_first_edge(
+        "falling",
+        threshold_ratio=config.control_threshold_ratio,
+        start_time=startup_start[0],
+    )
+    if brake_start is None:
+        raise ValueError("未检测到控制器刹车下降沿。")
+
+    current_zero_window = current_waveform.find_zero_stable_window(
+        start_time=brake_start[0],
+        zero_threshold=config.zero_current_threshold_a,
+        flat_threshold=config.zero_current_flat_threshold_a,
+        hold_time_s=config.zero_current_hold_s,
+    )
+    if current_zero_window is None:
+        raise ValueError("未检测到满足阈值条件的零电流稳定区间。")
+
+    if config.brake_mode == "current_zero":
+        brake_end_point = (current_zero_window.confirmed_time_s, 0.0)
+    else:
+        if not config.encoder_a_channel:
+            raise ValueError("A 相回溯模式需要选择编码器 A 相通道。")
+        encoder_waveform = waveform_map[config.encoder_a_channel]
+        brake_end_point = encoder_waveform.find_previous_edge(
+            current_zero_window.confirmed_time_s,
+            count=config.brake_backtrack_pulses,
+            edge_type="rising",
+        )
+        if brake_end_point is None:
+            raise ValueError(f"在电流归零确认点之前不足 {config.brake_backtrack_pulses} 个 A 相上升沿。")
+
+    brake_delay_s = brake_end_point[0] - brake_start[0]
+    if brake_delay_s < 0:
+        raise ValueError("刹车终点早于刹车起点，请检查波形或参数设置。")
+
+    brake_peak_current = current_waveform.peak_absolute_between(brake_start[0], brake_end_point[0])
+    return StartupBrakeTestResult(
+        startup_start_point=startup_start,
+        speed_reached_point=speed_reached_point,
+        startup_delay_s=speed_match.reached_time_s - startup_start[0],
+        startup_peak_current=startup_peak_current,
+        speed_match=speed_match,
+        brake_start_point=brake_start,
+        current_zero_window=current_zero_window,
+        brake_end_point=brake_end_point,
+        brake_delay_s=brake_delay_s,
+        brake_peak_current=brake_peak_current,
+        brake_mode=config.brake_mode,
     )
 
 
