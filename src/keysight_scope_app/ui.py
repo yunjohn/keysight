@@ -50,6 +50,7 @@ from keysight_scope_app.instrument import (
     list_visa_resources,
 )
 from keysight_scope_app.startup_brake_dialog import StartupBrakeTestDialog
+from keysight_scope_app.waveform_dialog import WaveformDetailDialog
 
 
 CAPTURE_DIR = Path("captures")
@@ -1454,35 +1455,6 @@ class WaveformAnalysisPanel(QWidget):
             self.cursor_hint_label.setText(f"波形图已导出: {output_path}")
         else:
             QMessageBox.critical(self, "导出失败", f"无法保存波形图到 {output_path}")
-
-
-class WaveformDetailDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("独立波形分析")
-        self.resize(1440, 920)
-        layout = QVBoxLayout(self)
-        self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
-        layout.addWidget(self.analysis_panel)
-
-    def set_waveform(self, waveform: WaveformData, stats: WaveformStats) -> None:
-        self.analysis_panel.set_waveform(waveform, stats)
-
-    def set_waveforms(self, waveforms: list[WaveformData], primary_stats: WaveformStats | None = None) -> None:
-        self.analysis_panel.set_waveforms(waveforms, primary_stats)
-
-    def clear(self) -> None:
-        self.analysis_panel.clear()
-
-    def set_cursor_points(
-        self,
-        point_a: tuple[float, float],
-        point_b: tuple[float, float],
-        *,
-        annotation_text: str | None = None,
-    ) -> None:
-        self.analysis_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
-
 
 
 class ScopeMainWindow(QMainWindow):
