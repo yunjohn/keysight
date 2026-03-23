@@ -3,9 +3,7 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
-from queue import Empty, Queue
 import sys
-import threading
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QFont, QPixmap, QTextCursor
@@ -41,6 +39,7 @@ from keysight_scope_app.instrument import (
     list_visa_resources,
 )
 from keysight_scope_app.startup_brake_dialog import StartupBrakeTestDialog
+from keysight_scope_app.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
 from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats
 from keysight_scope_app.waveform_dialog import WaveformDetailDialog
 from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
@@ -75,8 +74,8 @@ class ScopeMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.scope: KeysightOscilloscope | None = None
-        self.auto_measure_stop: threading.Event | None = None
-        self.ui_queue: Queue = Queue()
+        self.auto_measure_handle: RepeatingTaskHandle | None = None
+        self.task_runner = BackgroundTaskRunner()
         self.log_lines: list[str] = []
         self.measurement_checks: dict[str, QCheckBox] = {}
         self.overlay_channel_checks: dict[str, QCheckBox] = {}
@@ -352,7 +351,7 @@ class ScopeMainWindow(QMainWindow):
 
     def _build_timer(self) -> None:
         self.ui_timer = QTimer(self)
-        self.ui_timer.timeout.connect(self._drain_ui_queue)
+        self.ui_timer.timeout.connect(self.task_runner.drain_ui_queue)
         self.ui_timer.start(50)
 
     def _group_box(self, title: str) -> QGroupBox:
@@ -526,39 +525,29 @@ class ScopeMainWindow(QMainWindow):
             return
 
         self.stop_auto_measurement(log_message=False)
-        stop_event = threading.Event()
-        self.auto_measure_stop = stop_event
         channel = self._selected_channel()
         interval = max(self.interval_input.value(), 0.2)
         self.log(f"自动测量已启动，间隔 {interval:.1f}s。")
         self.measurement_status.setText(f"自动测量：运行中 ({interval:.1f}s)")
         self._refresh_auto_measure_button()
-
-        def worker() -> None:
-            while not stop_event.is_set():
-                try:
-                    results = scope.fetch_measurements(channel, measurement_names)
-                    self._post_ui(lambda data=results: self._update_measurements(data))
-                except Exception as exc:
-                    self._post_ui(lambda error=exc: self._handle_auto_measurement_error(error))
-                    stop_event.set()
-                    break
-                if stop_event.wait(interval):
-                    break
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.auto_measure_handle = self.task_runner.run_repeating(
+            lambda: scope.fetch_measurements(channel, measurement_names),
+            interval_s=interval,
+            on_result=self._update_measurements,
+            on_error=self._handle_auto_measurement_error,
+        )
 
     def stop_auto_measurement(self, log_message: bool = True) -> None:
-        if self.auto_measure_stop is not None:
-            self.auto_measure_stop.set()
-            self.auto_measure_stop = None
+        if self.auto_measure_handle is not None:
+            self.auto_measure_handle.stop()
+            self.auto_measure_handle = None
             self.measurement_status.setText("自动测量：未启动")
             self._refresh_auto_measure_button()
             if log_message:
                 self.log("自动测量已停止。")
 
     def toggle_auto_measurement(self) -> None:
-        if self.auto_measure_stop is None:
+        if self.auto_measure_handle is None:
             self.start_auto_measurement()
             return
         self.stop_auto_measurement()
@@ -719,7 +708,7 @@ class ScopeMainWindow(QMainWindow):
         self.measurement_count_label.setText(f"已选 {count} 项")
 
     def _refresh_auto_measure_button(self) -> None:
-        if self.auto_measure_stop is None:
+        if self.auto_measure_handle is None:
             self.auto_measure_button.setText("启动自动测量")
         else:
             self.auto_measure_button.setText("停止自动测量")
@@ -804,33 +793,13 @@ class ScopeMainWindow(QMainWindow):
             self.resource_combo.setCurrentIndex(index)
 
     def _run_task(self, task, on_success=None, success_message: str | None = None) -> None:
-        def worker() -> None:
-            try:
-                result = task()
-            except Exception as exc:
-                self._post_ui(lambda error=exc: self._handle_error(error))
-                return
+        def handle_success(result) -> None:
+            if on_success is not None:
+                on_success(result)
+            if success_message:
+                self.log(success_message)
 
-            def finish() -> None:
-                if on_success is not None:
-                    on_success(result)
-                if success_message:
-                    self.log(success_message)
-
-            self._post_ui(finish)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _post_ui(self, callback) -> None:
-        self.ui_queue.put(callback)
-
-    def _drain_ui_queue(self) -> None:
-        while True:
-            try:
-                callback = self.ui_queue.get_nowait()
-            except Empty:
-                break
-            callback()
+        self.task_runner.run(task, on_success=handle_success, on_error=self._handle_error)
 
     def _handle_error(self, error: Exception) -> None:
         self.log(f"操作失败: {error}")
