@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -83,6 +84,13 @@ def _format_range_hz(values: list[float]) -> str:
     return f"{min(values):.6f} ~ {max(values):.6f} Hz"
 
 
+@dataclass(frozen=True)
+class StartupBrakeHistoryEntry:
+    result: StartupBrakeTestResult
+    timestamp: str
+    config: StartupBrakeTestConfig
+
+
 class StartupBrakeTestDialog(QDialog):
     DEFAULT_SUMMARY_TEXT = "提示：执行测试时会优先复用当前波形；缺少通道时会按当前波形采样参数补抓。"
 
@@ -90,9 +98,7 @@ class StartupBrakeTestDialog(QDialog):
         super().__init__(main_window)
         self.main_window = main_window
         self.last_result: StartupBrakeTestResult | None = None
-        self.history: list[StartupBrakeTestResult] = []
-        self.history_timestamps: list[str] = []
-        self.history_configs: list[StartupBrakeTestConfig] = []
+        self.history: list[StartupBrakeHistoryEntry] = []
         self.channel_previous: dict[int, str] = {}
 
         self.setWindowTitle("启动刹车性能测试")
@@ -608,9 +614,13 @@ class StartupBrakeTestDialog(QDialog):
             return
 
         self.last_result = result
-        self.history.append(result)
-        self.history_timestamps.append(datetime.now().strftime("%H:%M:%S"))
-        self.history_configs.append(config)
+        self.history.append(
+            StartupBrakeHistoryEntry(
+                result=result,
+                timestamp=datetime.now().strftime("%H:%M:%S"),
+                config=config,
+            )
+        )
         self._update_results(result)
         self._refresh_history()
         self.main_window.log(
@@ -654,8 +664,6 @@ class StartupBrakeTestDialog(QDialog):
 
     def clear_history(self) -> None:
         self.history = []
-        self.history_timestamps = []
-        self.history_configs = []
         self._refresh_history()
         self.summary_label.setText("统计已清空。可继续执行测试重新累计范围。")
 
@@ -697,11 +705,33 @@ class StartupBrakeTestDialog(QDialog):
             writer.writerow([])
 
             writer.writerow(["summary", "sample_count", str(len(self.history))])
-            writer.writerow(["summary", "startup_delay_range_ms", _format_range_ms([result.startup_delay_s * 1000.0 for result in self.history])])
-            writer.writerow(["summary", "brake_delay_range_ms", _format_range_ms([result.brake_delay_s * 1000.0 for result in self.history])])
-            writer.writerow(["summary", "startup_peak_range_a", _format_range_amp([result.startup_peak_current.value for result in self.history if result.startup_peak_current is not None])])
-            writer.writerow(["summary", "brake_peak_range_a", _format_range_amp([result.brake_peak_current.value for result in self.history if result.brake_peak_current is not None])])
-            writer.writerow(["summary", "speed_frequency_range_hz", _format_range_hz([result.speed_match.frequency_hz for result in self.history])])
+            writer.writerow(
+                ["summary", "startup_delay_range_ms", _format_range_ms([entry.result.startup_delay_s * 1000.0 for entry in self.history])]
+            )
+            writer.writerow(
+                ["summary", "brake_delay_range_ms", _format_range_ms([entry.result.brake_delay_s * 1000.0 for entry in self.history])]
+            )
+            writer.writerow(
+                [
+                    "summary",
+                    "startup_peak_range_a",
+                    _format_range_amp(
+                        [entry.result.startup_peak_current.value for entry in self.history if entry.result.startup_peak_current is not None]
+                    ),
+                ]
+            )
+            writer.writerow(
+                [
+                    "summary",
+                    "brake_peak_range_a",
+                    _format_range_amp(
+                        [entry.result.brake_peak_current.value for entry in self.history if entry.result.brake_peak_current is not None]
+                    ),
+                ]
+            )
+            writer.writerow(
+                ["summary", "speed_frequency_range_hz", _format_range_hz([entry.result.speed_match.frequency_hz for entry in self.history])]
+            )
             writer.writerow([])
 
             writer.writerow(
@@ -720,12 +750,13 @@ class StartupBrakeTestDialog(QDialog):
                     "brake_mode",
                 ]
             )
-            for index, result in enumerate(self.history, start=1):
-                config = self.history_configs[index - 1] if index - 1 < len(self.history_configs) else None
+            for index, entry in enumerate(self.history, start=1):
+                result = entry.result
+                config = entry.config
                 writer.writerow(
                     [
                         index,
-                        self.history_timestamps[index - 1] if index - 1 < len(self.history_timestamps) else "-",
+                        entry.timestamp,
                         f"{result.startup_delay_s * 1000.0:.6f}",
                         f"{result.brake_delay_s * 1000.0:.6f}",
                         f"{result.startup_peak_current.value:.6f}" if result.startup_peak_current is not None else "",
@@ -776,10 +807,10 @@ class StartupBrakeTestDialog(QDialog):
 
     def _refresh_history(self) -> None:
         self.history_table.setRowCount(len(self.history))
-        for row, result in enumerate(self.history):
+        for row, entry in enumerate(self.history):
+            result = entry.result
             self.history_table.setItem(row, 0, self._centered_table_item(str(row + 1)))
-            timestamp = self.history_timestamps[row] if row < len(self.history_timestamps) else "-"
-            self.history_table.setItem(row, 1, self._centered_table_item(timestamp))
+            self.history_table.setItem(row, 1, self._centered_table_item(entry.timestamp))
             self.history_table.setItem(row, 2, self._centered_table_item(f"{result.startup_delay_s * 1000.0:.3f} ms"))
             self.history_table.setItem(row, 3, self._centered_table_item(f"{result.brake_delay_s * 1000.0:.3f} ms"))
             self.history_table.setItem(row, 4, self._centered_table_item(_format_peak_current(result.startup_peak_current)))
@@ -791,11 +822,15 @@ class StartupBrakeTestDialog(QDialog):
                 label.setText("-")
             return
 
-        startup_delays_ms = [result.startup_delay_s * 1000.0 for result in self.history]
-        brake_delays_ms = [result.brake_delay_s * 1000.0 for result in self.history]
-        startup_peaks = [result.startup_peak_current.value for result in self.history if result.startup_peak_current is not None]
-        brake_peaks = [result.brake_peak_current.value for result in self.history if result.brake_peak_current is not None]
-        speed_frequencies = [result.speed_match.frequency_hz for result in self.history]
+        startup_delays_ms = [entry.result.startup_delay_s * 1000.0 for entry in self.history]
+        brake_delays_ms = [entry.result.brake_delay_s * 1000.0 for entry in self.history]
+        startup_peaks = [
+            entry.result.startup_peak_current.value for entry in self.history if entry.result.startup_peak_current is not None
+        ]
+        brake_peaks = [
+            entry.result.brake_peak_current.value for entry in self.history if entry.result.brake_peak_current is not None
+        ]
+        speed_frequencies = [entry.result.speed_match.frequency_hz for entry in self.history]
 
         self.stats_labels["sample_count"].setText(str(len(self.history)))
         self.stats_labels["startup_delay_range"].setText(_format_range_ms(startup_delays_ms))
@@ -805,9 +840,9 @@ class StartupBrakeTestDialog(QDialog):
         self.stats_labels["speed_frequency_range"].setText(_format_range_hz(speed_frequencies))
 
     def _history_config_summary(self, getter) -> str:
-        if not self.history_configs:
+        if not self.history:
             return "-"
-        values = [getter(config) for config in self.history_configs]
+        values = [getter(entry.config) for entry in self.history]
         first_value = values[0]
         if all(value == first_value for value in values[1:]):
             return first_value
