@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QWidget
 
 from keysight_scope_app.instrument import WaveformData, WaveformStats
+from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
 
 
 class WaveformDetailDialog(QDialog):
@@ -11,8 +12,6 @@ class WaveformDetailDialog(QDialog):
         self.setWindowTitle("独立波形分析")
         self.resize(1440, 920)
         layout = QVBoxLayout(self)
-
-        from keysight_scope_app.ui import WaveformAnalysisPanel
 
         self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
         layout.addWidget(self.analysis_panel)
