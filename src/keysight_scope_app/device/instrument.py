@@ -57,6 +57,14 @@ class ChannelVerticalLayout:
     offset: float
 
 
+@dataclass(frozen=True)
+class EdgeTriggerSettings:
+    source: str
+    slope: str
+    level: float
+    sweep: str
+
+
 MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
     "频率": MeasurementDefinition("频率", "Hz", lambda channel: f":MEASure:FREQuency? {channel}"),
     "周期": MeasurementDefinition("周期", "s", lambda channel: f":MEASure:PERiod? {channel}"),
@@ -80,6 +88,8 @@ MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
 
 SUPPORTED_CHANNELS = ("CHANnel1", "CHANnel2", "CHANnel3", "CHANnel4")
 SUPPORTED_WAVEFORM_POINTS_MODES = ("NORMal", "MAXimum", "RAW")
+SUPPORTED_TRIGGER_SLOPES = ("POSitive", "NEGative", "EITHer")
+SUPPORTED_TRIGGER_SWEEPS = ("AUTO", "NORMal")
 KNOWN_KEYSIGHT_VENDORS = ("KEYSIGHT", "AGILENT")
 SOFTWARE_MEASUREMENT_POINTS = 2000
 CURRENT_LIKE_MEASUREMENTS = {
@@ -220,6 +230,41 @@ class KeysightOscilloscope:
     def get_channel_vertical_layouts(self, channels: list[str] | None = None) -> dict[str, ChannelVerticalLayout]:
         target_channels = channels or list(SUPPORTED_CHANNELS)
         return {channel: self.get_channel_vertical_layout(channel) for channel in target_channels}
+
+    def get_edge_trigger_settings(self) -> EdgeTriggerSettings:
+        source = _normalize_trigger_source(self.query(":TRIGger:EDGE:SOURce?"))
+        slope = _normalize_trigger_slope(self.query(":TRIGger:EDGE:SLOPe?"))
+        level = float(self.query(":TRIGger:EDGE:LEVel?"))
+        sweep = _normalize_trigger_sweep(self.query(":TRIGger:SWEep?"))
+        return EdgeTriggerSettings(
+            source=source,
+            slope=slope,
+            level=level,
+            sweep=sweep,
+        )
+
+    def apply_edge_trigger_settings(self, settings: EdgeTriggerSettings) -> None:
+        source = _normalize_trigger_source(settings.source)
+        slope = _normalize_trigger_slope(settings.slope)
+        sweep = _normalize_trigger_sweep(settings.sweep)
+        level = float(settings.level)
+        self.write(":TRIGger:MODE EDGE")
+        self.write(f":TRIGger:EDGE:SOURce {source}")
+        self.write(f":TRIGger:EDGE:SLOPe {slope}")
+        self.write(f":TRIGger:EDGE:LEVel {level}")
+        self.write(f":TRIGger:SWEep {sweep}")
+
+    def get_trigger_event_status(self) -> bool:
+        response = self.query(":TER?")
+        normalized = response.strip().upper()
+        if normalized in {"1", "+1"}:
+            return True
+        if normalized in {"0", "+0"}:
+            return False
+        try:
+            return bool(int(float(normalized)))
+        except Exception as exc:
+            raise ValueError(f"无法解析触发状态: {response}") from exc
 
     def get_max_waveform_points(
         self,
@@ -395,6 +440,46 @@ def _measurement_unit_for_channel(channel_unit: str, measurement_label: str, def
     if channel_unit == "A" and measurement_label in CURRENT_LIKE_MEASUREMENTS:
         return "A"
     return default_unit
+
+
+def _normalize_trigger_source(value: str) -> str:
+    normalized = value.strip().upper()
+    mapping = {
+        "CHAN1": "CHANnel1",
+        "CHANNEL1": "CHANnel1",
+        "CHAN2": "CHANnel2",
+        "CHANNEL2": "CHANnel2",
+        "CHAN3": "CHANnel3",
+        "CHANNEL3": "CHANnel3",
+        "CHAN4": "CHANnel4",
+        "CHANNEL4": "CHANnel4",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    for channel in SUPPORTED_CHANNELS:
+        if normalized == channel.upper():
+            return channel
+    raise ValueError(f"不支持的触发源: {value}")
+
+
+def _normalize_trigger_slope(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized.startswith("POS"):
+        return "POSitive"
+    if normalized.startswith("NEG"):
+        return "NEGative"
+    if normalized.startswith("EIT") or normalized.startswith("ALT"):
+        return "EITHer"
+    raise ValueError(f"不支持的触发斜率: {value}")
+
+
+def _normalize_trigger_sweep(value: str) -> str:
+    normalized = value.strip().upper()
+    if normalized.startswith("AUTO"):
+        return "AUTO"
+    if normalized.startswith("NORM") or normalized.startswith("TRIG"):
+        return "NORMal"
+    raise ValueError(f"不支持的触发扫描模式: {value}")
 
 
 def _parse_preamble(values: list[float]) -> WaveformPreamble:

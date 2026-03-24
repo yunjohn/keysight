@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -32,8 +33,11 @@ from PySide6.QtWidgets import (
 )
 
 from keysight_scope_app.device.instrument import (
+    EdgeTriggerSettings,
     MEASUREMENT_DEFINITIONS,
     SUPPORTED_CHANNELS,
+    SUPPORTED_TRIGGER_SLOPES,
+    SUPPORTED_TRIGGER_SWEEPS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
     ChannelVerticalLayout,
     KeysightOscilloscope,
@@ -42,13 +46,14 @@ from keysight_scope_app.device.instrument import (
 from keysight_scope_app.infra.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
 from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
-from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog, WaveformOnlyDialog
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
 from keysight_scope_app.ui.helpers import display_channel_name, normalize_channel_name
 from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
 
 
 CAPTURE_DIR = Path("captures")
 WAVEFORM_DIR = Path("captures") / "waveforms"
+UI_STATE_PATH = CAPTURE_DIR / "ui_state.json"
 MAX_LOG_LINES = 300
 DEFAULT_MEASUREMENT_SET = {"频率", "峰峰值", "均方根"}
 MEASUREMENT_TEMPLATES = {
@@ -77,17 +82,19 @@ class ScopeMainWindow(QMainWindow):
         self.log_lines: list[str] = []
         self.measurement_checks: dict[str, QCheckBox] = {}
         self.scope_display_checks: dict[str, QCheckBox] = {}
-        self.channel_units: dict[str, str] = {channel: "V" for channel in SUPPORTED_CHANNELS}
+        self.detected_channel_units: dict[str, str] = {channel: "V" for channel in SUPPORTED_CHANNELS}
+        self.channel_unit_overrides: dict[str, str | None] = {channel: None for channel in SUPPORTED_CHANNELS}
+        self.channel_unit_combos: dict[str, QComboBox] = {}
         self.channel_vertical_layouts: dict[str, dict[str, float]] = {}
         self._connect_request_id = 0
         self._updating_scope_display_checks = False
+        self._persist_ui_settings_enabled = False
         self._waveform_mode_max_points_hint = ""
         self.last_capture_path: Path | None = None
         self.last_waveform_bundle: list[WaveformData] = []
         self.last_waveform_data: WaveformData | None = None
         self.last_waveform_stats: WaveformStats | None = None
         self.waveform_detail_dialog = WaveformDetailDialog(self)
-        self.waveform_only_dialog = WaveformOnlyDialog(self)
 
         self.setWindowTitle("Keysight 示波器助手")
         self.resize(1480, 920)
@@ -148,6 +155,57 @@ class ScopeMainWindow(QMainWindow):
         self.resource_hint.setWordWrap(True)
         connection_layout.addWidget(self.resource_hint, 1, 0, 1, 6)
         left_panel.addWidget(connection_box)
+
+        trigger_box = self._group_box("触发设置")
+        trigger_layout = QGridLayout(trigger_box)
+        trigger_layout.setHorizontalSpacing(10)
+        trigger_layout.setVerticalSpacing(8)
+        self.trigger_source_combo = QComboBox()
+        for channel in SUPPORTED_CHANNELS:
+            self.trigger_source_combo.addItem(display_channel_name(channel), channel)
+        self.trigger_slope_combo = QComboBox()
+        slope_labels = {
+            "POSitive": "上升沿",
+            "NEGative": "下降沿",
+            "EITHer": "双边沿",
+        }
+        for slope in SUPPORTED_TRIGGER_SLOPES:
+            self.trigger_slope_combo.addItem(slope_labels[slope], slope)
+        self.trigger_level_input = QDoubleSpinBox()
+        self.trigger_level_input.setRange(-1_000_000.0, 1_000_000.0)
+        self.trigger_level_input.setDecimals(6)
+        self.trigger_level_input.setSingleStep(0.1)
+        self.trigger_sweep_combo = QComboBox()
+        sweep_labels = {
+            "AUTO": "AUTO",
+            "NORMal": "NORM",
+        }
+        for sweep in SUPPORTED_TRIGGER_SWEEPS:
+            self.trigger_sweep_combo.addItem(sweep_labels[sweep], sweep)
+        self.read_trigger_button = QPushButton("读取触发")
+        self.apply_trigger_button = QPushButton("应用触发")
+        self.read_trigger_status_button = QPushButton("读取状态")
+        self.single_trigger_button = QPushButton("单次等待触发")
+        self.trigger_status_value = QLabel("边沿触发：未读取")
+        self.trigger_status_value.setWordWrap(True)
+        self.trigger_event_value = QLabel("触发状态：未读取")
+        self.trigger_event_value.setWordWrap(True)
+
+        trigger_layout.addWidget(QLabel("触发源"), 0, 0)
+        trigger_layout.addWidget(self.trigger_source_combo, 0, 1)
+        trigger_layout.addWidget(QLabel("边沿"), 0, 2)
+        trigger_layout.addWidget(self.trigger_slope_combo, 0, 3)
+        trigger_layout.addWidget(QLabel("电平"), 0, 4)
+        trigger_layout.addWidget(self.trigger_level_input, 0, 5)
+        trigger_layout.addWidget(QLabel("模式"), 0, 6)
+        trigger_layout.addWidget(self.trigger_sweep_combo, 0, 7)
+        trigger_layout.addWidget(self.read_trigger_button, 1, 4)
+        trigger_layout.addWidget(self.apply_trigger_button, 1, 5)
+        trigger_layout.addWidget(self.read_trigger_status_button, 1, 6)
+        trigger_layout.addWidget(self.single_trigger_button, 1, 7)
+        trigger_layout.addWidget(self.trigger_status_value, 1, 0, 1, 6)
+        trigger_layout.addWidget(self.trigger_event_value, 2, 0, 1, 8)
+        left_panel.addWidget(trigger_box)
 
         measure_box = self._group_box("采集与测量")
         measure_layout = QVBoxLayout(measure_box)
@@ -268,6 +326,26 @@ class ScopeMainWindow(QMainWindow):
         scope_display_row.addStretch(1)
         measure_layout.addLayout(scope_display_row)
 
+        unit_row = QHBoxLayout()
+        unit_row.addWidget(QLabel("通道单位"))
+        for channel in SUPPORTED_CHANNELS:
+            unit_row.addWidget(QLabel(display_channel_name(channel)))
+            combo = QComboBox()
+            combo.addItem("自动(V)", None)
+            combo.addItem("电压(V)", "V")
+            combo.addItem("电流(A)", "A")
+            combo.currentIndexChanged.connect(
+                lambda index=0, target_channel=channel: self._set_channel_unit_override(
+                    target_channel,
+                    self.channel_unit_combos[target_channel].currentData(),
+                )
+            )
+            self.channel_unit_combos[channel] = combo
+            unit_row.addWidget(combo)
+        unit_row.addStretch(1)
+        measure_layout.addLayout(unit_row)
+        self._sync_channel_unit_controls()
+
         self.waveform_summary = QLabel("波形状态：尚未抓取")
         self.waveform_summary.setWordWrap(True)
         measure_layout.addWidget(self.waveform_summary)
@@ -317,11 +395,9 @@ class ScopeMainWindow(QMainWindow):
         waveform_box = self._group_box("波形分析")
         waveform_layout = QVBoxLayout(waveform_box)
         waveform_toolbar = QHBoxLayout()
-        self.sync_waveform_button = QPushButton("同步到独立窗")
-        self.popup_waveform_button = QPushButton("波形弹窗")
+        self.sync_waveform_button = QPushButton("独立波形显示")
         self.open_startup_brake_button = QPushButton("启动刹车测试")
         waveform_toolbar.addWidget(self.sync_waveform_button)
-        waveform_toolbar.addWidget(self.popup_waveform_button)
         waveform_toolbar.addWidget(self.open_startup_brake_button)
         waveform_toolbar.addStretch(1)
         waveform_layout.addLayout(waveform_toolbar)
@@ -344,6 +420,10 @@ class ScopeMainWindow(QMainWindow):
         self.run_button.clicked.connect(self.run_scope)
         self.stop_button.clicked.connect(self.stop_scope)
         self.capture_button.clicked.connect(self.capture_screenshot)
+        self.read_trigger_button.clicked.connect(self.read_trigger_settings)
+        self.apply_trigger_button.clicked.connect(self.apply_trigger_settings)
+        self.read_trigger_status_button.clicked.connect(self.read_trigger_status)
+        self.single_trigger_button.clicked.connect(self.arm_single_trigger)
         self.resource_combo.activated.connect(self._resource_selected)
         self.select_default_button.clicked.connect(self._select_default_measurements)
         self.select_all_button.clicked.connect(self._select_all_measurements)
@@ -352,13 +432,89 @@ class ScopeMainWindow(QMainWindow):
         self.load_waveform_button.clicked.connect(self.load_waveform_csv)
         self.export_waveform_button.clicked.connect(self.export_waveform_csv)
         self.sync_waveform_button.clicked.connect(self.sync_waveform_detail_dialog)
-        self.popup_waveform_button.clicked.connect(self.sync_waveform_only_dialog)
         self.open_startup_brake_button.clicked.connect(self.show_startup_brake_dialog)
+        self.waveform_points_input.valueChanged.connect(lambda _: self._save_ui_state())
+        self.trigger_source_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
+        self.trigger_slope_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
+        self.trigger_level_input.valueChanged.connect(lambda _: self._save_ui_state())
+        self.trigger_sweep_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
         self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
         self._stabilize_push_buttons(self)
         self._normalize_label_alignment(self)
+        self._load_ui_state()
+        self._persist_ui_settings_enabled = True
         self._update_measurement_count()
         self._refresh_auto_measure_button()
+
+    def _current_trigger_settings(self) -> EdgeTriggerSettings:
+        return EdgeTriggerSettings(
+            source=str(self.trigger_source_combo.currentData()),
+            slope=str(self.trigger_slope_combo.currentData()),
+            level=float(self.trigger_level_input.value()),
+            sweep=str(self.trigger_sweep_combo.currentData()),
+        )
+
+    def _current_ui_state(self) -> dict:
+        return {
+            "waveform_mode": self.waveform_mode_combo.currentText(),
+            "waveform_points": int(self.waveform_points_input.value()),
+            "trigger": {
+                "source": str(self.trigger_source_combo.currentData()),
+                "slope": str(self.trigger_slope_combo.currentData()),
+                "level": float(self.trigger_level_input.value()),
+                "sweep": str(self.trigger_sweep_combo.currentData()),
+            },
+        }
+
+    def _save_ui_state(self) -> None:
+        if not self._persist_ui_settings_enabled:
+            return
+        UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with UI_STATE_PATH.open("w", encoding="utf-8") as state_file:
+            json.dump(self._current_ui_state(), state_file, ensure_ascii=False, indent=2)
+
+    def _load_ui_state(self) -> None:
+        if not UI_STATE_PATH.exists():
+            return
+        try:
+            payload = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.log(f"界面设置加载失败: {exc}")
+            return
+
+        waveform_mode = payload.get("waveform_mode")
+        if waveform_mode in SUPPORTED_WAVEFORM_POINTS_MODES:
+            self.waveform_mode_combo.setCurrentText(str(waveform_mode))
+        waveform_points = payload.get("waveform_points")
+        if isinstance(waveform_points, (int, float)):
+            self.waveform_points_input.setValue(int(waveform_points))
+
+        trigger_payload = payload.get("trigger")
+        if isinstance(trigger_payload, dict):
+            settings = EdgeTriggerSettings(
+                source=str(trigger_payload.get("source", self.trigger_source_combo.currentData())),
+                slope=str(trigger_payload.get("slope", self.trigger_slope_combo.currentData())),
+                level=float(trigger_payload.get("level", self.trigger_level_input.value())),
+                sweep=str(trigger_payload.get("sweep", self.trigger_sweep_combo.currentData())),
+            )
+            self._apply_trigger_settings_to_controls(settings)
+
+    def _apply_trigger_settings_to_controls(self, settings: EdgeTriggerSettings) -> None:
+        source_index = self.trigger_source_combo.findData(settings.source)
+        slope_index = self.trigger_slope_combo.findData(settings.slope)
+        sweep_index = self.trigger_sweep_combo.findData(settings.sweep)
+        if source_index >= 0:
+            self.trigger_source_combo.setCurrentIndex(source_index)
+        if slope_index >= 0:
+            self.trigger_slope_combo.setCurrentIndex(slope_index)
+        if sweep_index >= 0:
+            self.trigger_sweep_combo.setCurrentIndex(sweep_index)
+        self.trigger_level_input.setValue(settings.level)
+        self.trigger_status_value.setText(
+            f"边沿触发：{display_channel_name(settings.source)} / "
+            f"{self.trigger_slope_combo.currentText()} / {settings.level:.6f} / {self.trigger_sweep_combo.currentText()}"
+        )
+        self._save_ui_state()
 
     def _build_timer(self) -> None:
         self.ui_timer = QTimer(self)
@@ -488,16 +644,19 @@ class ScopeMainWindow(QMainWindow):
         self.last_waveform_data = None
         self.last_waveform_bundle = []
         self.last_waveform_stats = None
-        self.channel_units = {channel: "V" for channel in SUPPORTED_CHANNELS}
+        self.detected_channel_units = {channel: "V" for channel in SUPPORTED_CHANNELS}
         self.channel_vertical_layouts = {}
         self.export_waveform_button.setEnabled(False)
         self._set_scope_display_check_enabled(False)
         self._update_scope_display_checks([])
         self._waveform_mode_max_points_hint = ""
         self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
+        self._sync_channel_unit_controls()
         self.status_value.setText("未连接")
         self.idn_value.setText("-")
         self.measurement_status.setText("自动测量：未启动")
+        self.trigger_status_value.setText("边沿触发：未读取")
+        self.trigger_event_value.setText("触发状态：未读取")
         self._refresh_auto_measure_button()
         self.waveform_summary.setText("波形状态：尚未抓取")
         self.startup_brake_dialog.reset_state()
@@ -538,6 +697,57 @@ class ScopeMainWindow(QMainWindow):
         if scope is None:
             return
         self._run_task(scope.stop, success_message="示波器已停止采集。", ui_guard=self._scope_ui_guard(scope))
+
+    def read_trigger_settings(self) -> None:
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+        self._run_task(
+            scope.get_edge_trigger_settings,
+            on_success=self._on_trigger_settings_loaded,
+            success_message="触发设置读取完成。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def apply_trigger_settings(self) -> None:
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+        settings = self._current_trigger_settings()
+        self._run_task(
+            lambda: scope.apply_edge_trigger_settings(settings),
+            on_success=lambda: self._apply_trigger_settings_to_controls(settings),
+            success_message="触发设置已应用。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def _on_trigger_settings_loaded(self, settings: EdgeTriggerSettings) -> None:
+        self._apply_trigger_settings_to_controls(settings)
+
+    def read_trigger_status(self) -> None:
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+        self._run_task(
+            scope.get_trigger_event_status,
+            on_success=self._on_trigger_status_loaded,
+            success_message="触发状态读取完成。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def arm_single_trigger(self) -> None:
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+        self._run_task(
+            scope.single,
+            on_success=lambda: self.trigger_event_value.setText("触发状态：单次等待中"),
+            success_message="示波器已进入单次等待触发。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def _on_trigger_status_loaded(self, triggered: bool) -> None:
+        self.trigger_event_value.setText(f"触发状态：{'已触发' if triggered else '等待条件'}")
 
     def run_single_measurement(self) -> None:
         scope = self._get_scope_or_warn()
@@ -801,8 +1011,6 @@ class ScopeMainWindow(QMainWindow):
             self.waveform_panel.restore_view_state(main_panel_view_state)
         if sync_detail_dialog:
             self.sync_waveform_detail_dialog()
-        if self.waveform_only_dialog.isVisible():
-            self.sync_waveform_only_dialog()
 
     def _on_waveform_exported(self, csv_path: Path) -> None:
         self.waveform_summary.setText(f"波形状态：已导出 {csv_path}")
@@ -811,19 +1019,12 @@ class ScopeMainWindow(QMainWindow):
     def _reset_waveform_visuals(self) -> None:
         self.waveform_panel.clear()
         self.waveform_detail_dialog.clear()
-        self.waveform_only_dialog.clear()
 
     def show_waveform_detail_dialog(self) -> None:
         self.waveform_detail_dialog.show()
         self.waveform_detail_dialog.raise_()
         self.waveform_detail_dialog.activateWindow()
         self.sync_waveform_detail_dialog()
-
-    def show_waveform_only_dialog(self) -> None:
-        self.waveform_only_dialog.show()
-        self.waveform_only_dialog.raise_()
-        self.waveform_only_dialog.activateWindow()
-        self.sync_waveform_only_dialog()
 
     def show_startup_brake_dialog(self) -> None:
         self.startup_brake_dialog.show_dialog()
@@ -838,17 +1039,6 @@ class ScopeMainWindow(QMainWindow):
         self.waveform_detail_dialog.show()
         self.waveform_detail_dialog.raise_()
         self.waveform_detail_dialog.activateWindow()
-
-    def sync_waveform_only_dialog(self) -> None:
-        if not self.last_waveform_bundle or self.last_waveform_stats is None:
-            self._show_warning("当前还没有波形数据可同步。")
-            return
-        self.waveform_only_dialog.set_waveforms(self.last_waveform_bundle, self.last_waveform_stats)
-        if self.channel_vertical_layouts:
-            self.waveform_only_dialog.set_scope_vertical_layouts(self.channel_vertical_layouts)
-        self.waveform_only_dialog.show()
-        self.waveform_only_dialog.raise_()
-        self.waveform_only_dialog.activateWindow()
 
     def _update_measurements(self, results) -> None:
         updated_at = datetime.now().strftime("%H:%M:%S")
@@ -907,6 +1097,7 @@ class ScopeMainWindow(QMainWindow):
         self._waveform_mode_max_points_hint = ""
         self._refresh_waveform_mode_hint(mode)
         self._request_waveform_mode_capability_hint(mode)
+        self._save_ui_state()
 
     def _request_waveform_mode_capability_hint(self, mode: str) -> None:
         scope = self.scope
@@ -1068,19 +1259,69 @@ class ScopeMainWindow(QMainWindow):
         self._update_measurements(measurements)
 
     def _channel_unit(self, channel: str) -> str:
-        return self.channel_units.get(channel, "V")
+        override = self.channel_unit_overrides.get(channel)
+        if override in {"V", "A"}:
+            return override
+        return self.detected_channel_units.get(channel, "V")
 
     def _waveform_range_label(self, channel: str) -> str:
         return "电流范围" if self._channel_unit(channel) == "A" else "电压范围"
 
     def _update_channel_units(self, channel_units: dict[str, str], *, log_message: bool = True) -> None:
-        updated_units = {channel: channel_units.get(channel, self.channel_units.get(channel, "V")) for channel in SUPPORTED_CHANNELS}
-        self.channel_units = updated_units
+        updated_units = {
+            channel: channel_units.get(channel, self.detected_channel_units.get(channel, "V"))
+            for channel in SUPPORTED_CHANNELS
+        }
+        self.detected_channel_units = updated_units
+        self._sync_channel_unit_controls()
         if log_message:
             self.log(
                 "通道单位识别: "
-                + ", ".join(f"{display_channel_name(channel)}={unit}" for channel, unit in self.channel_units.items())
+                + ", ".join(
+                    f"{display_channel_name(channel)}={self._channel_unit_status_text(channel)}"
+                    for channel in SUPPORTED_CHANNELS
+                )
             )
+
+    def _sync_channel_unit_controls(self) -> None:
+        for channel, combo in self.channel_unit_combos.items():
+            detected = self.detected_channel_units.get(channel, "V")
+            combo.blockSignals(True)
+            combo.setItemText(0, f"自动({detected})")
+            override = self.channel_unit_overrides.get(channel)
+            if override in {"V", "A"}:
+                index = combo.findData(override)
+            else:
+                index = combo.findData(None)
+            combo.setCurrentIndex(max(index, 0))
+            combo.blockSignals(False)
+
+    def _set_channel_unit_override(self, channel: str, override: str | None) -> None:
+        normalized = override if override in {"V", "A"} else None
+        self.channel_unit_overrides[channel] = normalized
+        self._sync_channel_unit_controls()
+        self.log(f"{display_channel_name(channel)} 单位已切换为 {self._channel_unit_status_text(channel)}。")
+        self._update_waveform_unit_views()
+
+    def _channel_unit_status_text(self, channel: str) -> str:
+        override = self.channel_unit_overrides.get(channel)
+        detected = self.detected_channel_units.get(channel, "V")
+        if override in {"V", "A"}:
+            return f"{override}（手动）"
+        return f"{detected}（自动）"
+
+    def _update_waveform_unit_views(self) -> None:
+        if self.last_waveform_bundle:
+            self.waveform_panel.set_waveforms(self.last_waveform_bundle, self.last_waveform_stats)
+            primary_waveform = self.last_waveform_bundle[0]
+            if self.last_waveform_stats is not None:
+                self.waveform_summary.setText(
+                    f"波形状态：已加载 {len(self.last_waveform_bundle)} 路，主通道 {display_channel_name(primary_waveform.channel)}，"
+                    f"点数 {self.last_waveform_stats.point_count}，范围 "
+                    f"{self.last_waveform_stats.voltage_min:.4f}{self._channel_unit(primary_waveform.channel)} ~ "
+                    f"{self.last_waveform_stats.voltage_max:.4f}{self._channel_unit(primary_waveform.channel)}"
+                )
+            self.waveform_detail_dialog.set_waveforms(self.last_waveform_bundle, self.last_waveform_stats)
 
     def _update_channel_vertical_layouts(self, channel_vertical_layouts: dict[str, ChannelVerticalLayout]) -> None:
         self.channel_vertical_layouts = {

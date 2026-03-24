@@ -26,12 +26,22 @@ from PySide6.QtWidgets import (
 
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats, compare_waveform_edges
 from keysight_scope_app.ui.helpers import display_channel_name
+from keysight_scope_app.utils import format_engineering_value
 
 
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
 WAVEFORM_SERIES_COLORS = ("#2d9cdb", "#eb5757", "#27ae60", "#f2994a")
 RAW_RENDER_POINT_THRESHOLD = 10000
 WAVEFORM_REDRAW_DEBOUNCE_MS = 40
+
+
+def _should_apply_scope_vertical_layouts(
+    channels: list[str],
+    unit_resolver,
+) -> bool:
+    resolved_units = {(unit_resolver(channel) or "V") for channel in channels}
+    return len(resolved_units) <= 1
+
 
 class InteractiveChartView(QChartView):
     def __init__(self, chart: QChart, parent: QWidget | None = None) -> None:
@@ -255,6 +265,7 @@ class WaveformAnalysisPanel(QWidget):
         self.cursor_channels: dict[str, str | None] = {}
         self.lock_annotation_text: str | None = None
         self.channel_unit_resolver = None
+        self.cursor_readout_changed = None
         self._axis_updates_suspended = False
         self._pending_axis_refresh = False
         self._axis_refresh_timer = QTimer(self)
@@ -836,6 +847,13 @@ class WaveformAnalysisPanel(QWidget):
         self.kpi_widget.setVisible(not enabled)
         self.stats_tabs.setVisible(not enabled)
         self.chart_view.setMinimumHeight(680 if enabled else (220 if self.compact_mode else 520))
+        layout = self.layout()
+        if isinstance(layout, QVBoxLayout):
+            for index in range(layout.count()):
+                layout.setStretch(index, 0)
+            layout.setStretch(1, 1 if enabled else 5)
+            if not enabled and layout.count() > 5:
+                layout.setStretch(5, 1)
 
     def reset_view(self) -> None:
         self._reset_visual_view()
@@ -1110,7 +1128,10 @@ class WaveformAnalysisPanel(QWidget):
         if self.active_waveform_channel not in self.visible_channels:
             self.active_waveform_channel = next(iter(self.visible_channels), None)
         self._populate_compare_channels()
-        self._render_all_waveform_series()
+        if self.scope_vertical_layouts:
+            self._apply_scope_vertical_layouts()
+        else:
+            self._render_all_waveform_series()
         self._refresh_cursor_graphics()
 
     def _refresh_chart_title(self) -> None:
@@ -1150,7 +1171,7 @@ class WaveformAnalysisPanel(QWidget):
     def _format_cursor_point(self, point: tuple[float, float] | None, unit: str) -> str:
         if point is None:
             return "-"
-        return f"t={point[0]:.6e} s, Y={point[1]:.6f} {unit}"
+        return f"t={_format_time_value(point[0])}, Y={point[1]:.6f} {unit}"
 
     def _visible_waveform_points(self, channel: str) -> tuple[list[float], list[float]] | None:
         points = self.waveform_source_map.get(channel)
@@ -1194,6 +1215,15 @@ class WaveformAnalysisPanel(QWidget):
 
     def _apply_scope_vertical_layouts(self) -> None:
         if not self.current_waveforms or not self.scope_vertical_layouts:
+            return
+        target_channels = [waveform.channel for waveform in self.current_waveforms if waveform.channel in self.visible_channels]
+        if not target_channels:
+            target_channels = [waveform.channel for waveform in self.current_waveforms]
+        if not _should_apply_scope_vertical_layouts(target_channels, self._channel_unit):
+            for channel in self.waveform_offsets:
+                self.waveform_offsets[channel] = 0.0
+            self._render_all_waveform_series()
+            self._ensure_waveform_offsets_visible()
             return
         primary_channel = self.current_waveform.channel if self.current_waveform is not None else self.current_waveforms[0].channel
         primary_layout = self.scope_vertical_layouts.get(primary_channel)
@@ -1391,6 +1421,7 @@ class WaveformAnalysisPanel(QWidget):
         self.smart_preview_label.setVisible(False)
         for label in self.cursor_labels.values():
             label.setText("-")
+        self._notify_cursor_readout_changed()
 
     def _update_cursor_readouts(self) -> None:
         point_a = self.cursor_points.get("a")
@@ -1408,11 +1439,12 @@ class WaveformAnalysisPanel(QWidget):
             self.cursor_labels["dv"].setText("-")
             self.cursor_labels["slope"].setText("-")
             self.cursor_labels["frequency"].setText("-")
+            self._notify_cursor_readout_changed()
             return
 
         dt_value = raw_point_b[0] - raw_point_a[0]
         dv_value = raw_point_b[1] - raw_point_a[1]
-        self.cursor_labels["dt"].setText(f"{dt_value:.6e} s")
+        self.cursor_labels["dt"].setText(_format_time_value(dt_value))
         dv_unit = unit_a if unit_a == unit_b else f"{unit_a}/{unit_b}"
         self.cursor_labels["dv"].setText(f"{dv_value:.6f} {dv_unit}")
         if dt_value == 0:
@@ -1421,6 +1453,21 @@ class WaveformAnalysisPanel(QWidget):
         else:
             self.cursor_labels["slope"].setText(f"{(dv_value / dt_value):.6e} {dv_unit}/s")
             self.cursor_labels["frequency"].setText(f"{(1.0 / abs(dt_value)):.6f} Hz")
+        self._notify_cursor_readout_changed()
+
+    def get_cursor_measurements(self) -> dict[str, str]:
+        return {
+            "游标 A": self.cursor_labels["a"].text(),
+            "游标 B": self.cursor_labels["b"].text(),
+            "Δt": self.cursor_labels["dt"].text(),
+            "ΔV/ΔI": self.cursor_labels["dv"].text(),
+            "ΔV/Δt": self.cursor_labels["slope"].text(),
+            "1/Δt": self.cursor_labels["frequency"].text(),
+        }
+
+    def _notify_cursor_readout_changed(self) -> None:
+        if self.cursor_readout_changed is not None:
+            self.cursor_readout_changed(self.get_cursor_measurements())
 
     def _update_cursor_visibility_hint(self) -> None:
         if self.pending_cursor_target is not None or self.dragging_cursor_target is not None:
@@ -2232,13 +2279,17 @@ def _interpolate_waveform_y_at_x(x_values: list[float], y_values: list[float], x
 def _format_cursor_point(point: tuple[float, float] | None) -> str:
     if point is None:
         return "-"
-    return f"t={point[0]:.6e} s, V={point[1]:.6f}"
+    return f"t={_format_time_value(point[0])}, V={point[1]:.6f}"
+
+
+def _format_time_value(value: float) -> str:
+    return format_engineering_value(value, "s")
 
 
 def _format_optional_seconds(value: float | None) -> str:
     if value is None:
         return "无法估算"
-    return f"{value:.6e} s"
+    return _format_time_value(value)
 
 
 def _format_optional_percent(value: float | None) -> str:

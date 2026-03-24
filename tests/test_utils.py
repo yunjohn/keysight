@@ -1,6 +1,9 @@
 from pathlib import Path
 
+from PySide6.QtWidgets import QApplication
+
 from keysight_scope_app.device.instrument import (
+    EdgeTriggerSettings,
     KeysightOscilloscope,
     StartupBrakeTestConfig,
     WaveformData,
@@ -8,6 +11,11 @@ from keysight_scope_app.device.instrument import (
     analyze_startup_brake_test,
     compare_waveform_edges,
 )
+from keysight_scope_app.ui.dialogs import waveform as waveform_dialog_module
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
+from keysight_scope_app.ui import main_window as main_window_module
+from keysight_scope_app.ui.main_window import ScopeMainWindow
+from keysight_scope_app.ui.panels.waveform import _should_apply_scope_vertical_layouts
 from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
 
 
@@ -326,6 +334,22 @@ def test_get_channel_unit_reads_scope_unit_setting() -> None:
     assert scope.get_channel_unit("CHANnel3") == "A"
 
 
+def test_scope_vertical_layouts_disabled_for_mixed_units() -> None:
+    unit_map = {
+        "CHANnel1": "V",
+        "CHANnel3": "A",
+    }
+
+    assert not _should_apply_scope_vertical_layouts(
+        ["CHANnel1", "CHANnel3"],
+        lambda channel: unit_map[channel],
+    )
+    assert _should_apply_scope_vertical_layouts(
+        ["CHANnel1"],
+        lambda channel: unit_map.get(channel, "V"),
+    )
+
+
 def test_fetch_measurements_uses_current_units_for_channel_3() -> None:
     class FakeScope(KeysightOscilloscope):
         def __init__(self) -> None:
@@ -348,6 +372,209 @@ def test_fetch_measurements_uses_current_units_for_channel_3() -> None:
     assert results[0].raw_value == 2.5
     assert results[0].unit == "A"
     assert results[0].display_value == "2.5 A"
+
+
+def test_main_window_channel_unit_auto_label_updates_from_detected_units() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window._update_channel_units({"CHANnel1": "A"}, log_message=False)
+        assert window.channel_unit_combos["CHANnel1"].itemText(0) == "自动(A)"
+        assert window._channel_unit("CHANnel1") == "A"
+    finally:
+        window.close()
+
+
+def test_main_window_channel_unit_manual_override_takes_precedence() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window._update_channel_units({"CHANnel2": "V"}, log_message=False)
+        window._set_channel_unit_override("CHANnel2", "A")
+        assert window._channel_unit("CHANnel2") == "A"
+        assert window._channel_unit_status_text("CHANnel2") == "A（手动）"
+        window._set_channel_unit_override("CHANnel2", None)
+        assert window._channel_unit("CHANnel2") == "V"
+        assert window._channel_unit_status_text("CHANnel2") == "V（自动）"
+    finally:
+        window.close()
+
+
+def test_get_edge_trigger_settings_reads_scope_values() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+
+        def query(self, command: str) -> str:
+            responses = {
+                ":TRIGger:EDGE:SOURce?": "CHAN1",
+                ":TRIGger:EDGE:SLOPe?": "NEG",
+                ":TRIGger:EDGE:LEVel?": "1.25",
+                ":TRIGger:SWEep?": "AUTO",
+            }
+            return responses[command]
+
+    scope = FakeScope()
+
+    settings = scope.get_edge_trigger_settings()
+
+    assert settings == EdgeTriggerSettings(
+        source="CHANnel1",
+        slope="NEGative",
+        level=1.25,
+        sweep="AUTO",
+    )
+
+
+def test_apply_edge_trigger_settings_writes_expected_commands() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+            self.commands: list[str] = []
+
+        def write(self, command: str) -> None:
+            self.commands.append(command)
+
+    scope = FakeScope()
+
+    scope.apply_edge_trigger_settings(
+        EdgeTriggerSettings(
+            source="CHANnel2",
+            slope="POSitive",
+            level=0.75,
+            sweep="NORMal",
+        )
+    )
+
+    assert scope.commands == [
+        ":TRIGger:MODE EDGE",
+        ":TRIGger:EDGE:SOURce CHANnel2",
+        ":TRIGger:EDGE:SLOPe POSitive",
+        ":TRIGger:EDGE:LEVel 0.75",
+        ":TRIGger:SWEep NORMal",
+    ]
+
+
+def test_get_trigger_event_status_reads_ter_query() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self, response: str) -> None:
+            super().__init__("USB::TEST")
+            self.response = response
+
+        def query(self, command: str) -> str:
+            assert command == ":TER?"
+            return self.response
+
+    assert FakeScope("1").get_trigger_event_status() is True
+    assert FakeScope("0").get_trigger_event_status() is False
+
+
+def test_waveform_detail_dialog_persists_measurement_settings(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_path = waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH
+    original_dir = waveform_dialog_module.WAVEFORM_CONFIG_DIR
+    waveform_dialog_module.WAVEFORM_CONFIG_DIR = tmp_path
+    waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH = tmp_path / "waveform_measurements.json"
+    try:
+        first = WaveformDetailDialog()
+        first.measurement_config = {
+            "CHANnel1": {"频率", "峰峰值"},
+            "CHANnel3": {"均方根", "最大值"},
+        }
+        first._save_measurement_config()
+        first.close()
+
+        second = WaveformDetailDialog()
+        assert second.measurement_config == {
+            "CHANnel1": {"频率", "峰峰值"},
+            "CHANnel3": {"均方根", "最大值"},
+        }
+        second.close()
+    finally:
+        waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH = original_path
+        waveform_dialog_module.WAVEFORM_CONFIG_DIR = original_dir
+
+
+def test_waveform_detail_dialog_ignores_corrupt_measurement_settings(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_path = waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH
+    original_dir = waveform_dialog_module.WAVEFORM_CONFIG_DIR
+    waveform_dialog_module.WAVEFORM_CONFIG_DIR = tmp_path
+    waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH = tmp_path / "waveform_measurements.json"
+    waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH.write_text("{bad json", encoding="utf-8")
+    try:
+        dialog = WaveformDetailDialog()
+        assert dialog.measurement_config == {}
+        dialog.close()
+    finally:
+        waveform_dialog_module.WAVEFORM_MEASUREMENT_SETTINGS_PATH = original_path
+        waveform_dialog_module.WAVEFORM_CONFIG_DIR = original_dir
+
+
+def test_waveform_dialog_formats_missing_measurement_as_dashdash() -> None:
+    waveform = WaveformData(
+        channel="CHANnel1",
+        points_mode="RAW",
+        preamble=WaveformPreamble(0, 0, 4, 1, 1.0, 0.0, 0, 1.0, 0.0, 0),
+        x_values=[0.0, 1.0, 2.0, 3.0],
+        y_values=[0.0, 1.0, 1.0, 0.0],
+    )
+    dialog = WaveformDetailDialog()
+    try:
+        dialog.measurement_config = {"CHANnel1": {"频率", "峰峰值"}}
+        html = dialog._build_measurement_section_html(waveform)
+        assert "频率" in html
+        assert "--" in html
+    finally:
+        dialog.close()
+
+
+def test_main_window_persists_waveform_mode_and_points(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_ui_state_path = main_window_module.UI_STATE_PATH
+    main_window_module.UI_STATE_PATH = tmp_path / "ui_state.json"
+    try:
+        first = ScopeMainWindow()
+        first.waveform_mode_combo.setCurrentText("RAW")
+        first.waveform_points_input.setValue(54321)
+        first._save_ui_state()
+        first.close()
+
+        second = ScopeMainWindow()
+        assert second.waveform_mode_combo.currentText() == "RAW"
+        assert int(second.waveform_points_input.value()) == 54321
+        second.close()
+    finally:
+        main_window_module.UI_STATE_PATH = original_ui_state_path
+
+
+def test_main_window_persists_trigger_settings(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_ui_state_path = main_window_module.UI_STATE_PATH
+    main_window_module.UI_STATE_PATH = tmp_path / "ui_state.json"
+    try:
+        first = ScopeMainWindow()
+        first._apply_trigger_settings_to_controls(
+            EdgeTriggerSettings(
+                source="CHANnel3",
+                slope="NEGative",
+                level=1.5,
+                sweep="NORMal",
+            )
+        )
+        first.close()
+
+        second = ScopeMainWindow()
+        settings = second._current_trigger_settings()
+        assert settings == EdgeTriggerSettings(
+            source="CHANnel3",
+            slope="NEGative",
+            level=1.5,
+            sweep="NORMal",
+        )
+        second.close()
+    finally:
+        main_window_module.UI_STATE_PATH = original_ui_state_path
 
 
 def test_compare_waveform_edges_returns_delay_and_phase() -> None:
