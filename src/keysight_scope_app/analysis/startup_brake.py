@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from keysight_scope_app.waveform_analysis import (
+from keysight_scope_app.analysis.waveform import (
     SignalPeak,
     SpeedTargetMatch,
     WaveformData,

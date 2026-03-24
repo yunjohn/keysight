@@ -26,13 +26,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.instrument import SUPPORTED_CHANNELS
-from keysight_scope_app.startup_brake_analysis import (
+from keysight_scope_app.device.instrument import SUPPORTED_CHANNELS
+from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestConfig,
     StartupBrakeTestResult,
     analyze_startup_brake_test,
 )
-from keysight_scope_app.ui_helpers import (
+from keysight_scope_app.analysis.waveform import WaveformData
+from keysight_scope_app.ui.helpers import (
     display_channel_name,
     format_peak_current,
     format_peak_time,
@@ -41,10 +42,9 @@ from keysight_scope_app.ui_helpers import (
     format_range_ms,
     normalize_channel_name,
 )
-from keysight_scope_app.waveform_analysis import WaveformData
 
 if TYPE_CHECKING:
-    from keysight_scope_app.ui import ScopeMainWindow
+    from keysight_scope_app.ui.main_window import ScopeMainWindow
 
 
 STARTUP_BRAKE_DIR = Path("captures") / "startup_brake_tests"

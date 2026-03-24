@@ -31,19 +31,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.instrument import (
+from keysight_scope_app.device.instrument import (
     MEASUREMENT_DEFINITIONS,
     SUPPORTED_CHANNELS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
     KeysightOscilloscope,
     list_visa_resources,
 )
-from keysight_scope_app.startup_brake_dialog import StartupBrakeTestDialog
-from keysight_scope_app.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
-from keysight_scope_app.ui_helpers import display_channel_name, normalize_channel_name
-from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats
-from keysight_scope_app.waveform_dialog import WaveformDetailDialog
-from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
+from keysight_scope_app.infra.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
+from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
+from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
+from keysight_scope_app.ui.helpers import display_channel_name, normalize_channel_name
+from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
 
 
 CAPTURE_DIR = Path("captures")

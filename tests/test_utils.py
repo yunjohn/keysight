@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from keysight_scope_app.instrument import (
+from keysight_scope_app.device.instrument import (
     KeysightOscilloscope,
     StartupBrakeTestConfig,
     WaveformData,

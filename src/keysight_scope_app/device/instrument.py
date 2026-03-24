@@ -8,13 +8,13 @@ from typing import Callable
 import pyvisa
 from pyvisa.errors import VisaIOError
 
-from keysight_scope_app.startup_brake_analysis import (
+from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestConfig,
     StartupBrakeTestResult,
     analyze_startup_brake_test,
 )
 from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
-from keysight_scope_app.waveform_analysis import (
+from keysight_scope_app.analysis.waveform import (
     EdgeComparison,
     LockRecommendation,
     PeriodWindow,

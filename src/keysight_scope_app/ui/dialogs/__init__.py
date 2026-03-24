@@ -1,0 +1,3 @@
+from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
+
