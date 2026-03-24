@@ -40,6 +40,7 @@ from keysight_scope_app.instrument import (
 )
 from keysight_scope_app.startup_brake_dialog import StartupBrakeTestDialog
 from keysight_scope_app.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
+from keysight_scope_app.ui_helpers import display_channel_name, normalize_channel_name
 from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats
 from keysight_scope_app.waveform_dialog import WaveformDetailDialog
 from keysight_scope_app.waveform_panel import WaveformAnalysisPanel
@@ -55,20 +56,6 @@ MEASUREMENT_TEMPLATES = {
     "纹波模板": {"峰峰值", "均方根", "最大值", "最小值"},
     "边沿模板": {"最大值", "最小值", "高电平估计", "低电平估计", "上升时间", "下降时间"},
 }
-
-
-def _display_channel_name(channel: str) -> str:
-    if channel.startswith("CHANnel"):
-        return channel.replace("CHANnel", "CH", 1)
-    return channel
-
-
-def _normalize_channel_name(channel: str) -> str:
-    normalized = channel.strip()
-    if normalized.upper().startswith("CH") and normalized[2:].isdigit():
-        return f"CHANnel{normalized[2:]}"
-    return normalized
-
 
 class ScopeMainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -151,7 +138,7 @@ class ScopeMainWindow(QMainWindow):
 
         self.channel_combo = QComboBox()
         for channel in SUPPORTED_CHANNELS:
-            self.channel_combo.addItem(_display_channel_name(channel), channel)
+            self.channel_combo.addItem(display_channel_name(channel), channel)
         self.interval_input = QDoubleSpinBox()
         self.interval_input.setRange(0.2, 10.0)
         self.interval_input.setSingleStep(0.2)
@@ -251,7 +238,7 @@ class ScopeMainWindow(QMainWindow):
         overlay_row = QHBoxLayout()
         overlay_row.addWidget(QLabel("叠加通道"))
         for channel in SUPPORTED_CHANNELS:
-            checkbox = QCheckBox(_display_channel_name(channel))
+            checkbox = QCheckBox(display_channel_name(channel))
             self.overlay_channel_checks[channel] = checkbox
             overlay_row.addWidget(checkbox)
         overlay_row.addStretch(1)
@@ -580,7 +567,7 @@ class ScopeMainWindow(QMainWindow):
         channels = self._selected_waveform_channels()
         points_mode = self.waveform_mode_combo.currentText()
         points = int(self.waveform_points_input.value())
-        self.log(f"开始抓取波形: {', '.join(_display_channel_name(channel) for channel in channels)}, {points_mode}, {points} 点。")
+        self.log(f"开始抓取波形: {', '.join(display_channel_name(channel) for channel in channels)}, {points_mode}, {points} 点。")
         self._run_task(
             lambda: [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels],
             on_success=self._on_waveforms_fetched,
@@ -596,7 +583,7 @@ class ScopeMainWindow(QMainWindow):
         waveforms = list(self.last_waveform_bundle)
         if len(waveforms) == 1:
             waveform = waveforms[0]
-            channel = _display_channel_name(waveform.channel)
+            channel = display_channel_name(waveform.channel)
             target = WAVEFORM_DIR / f"{channel}_{waveform.points_mode}_{timestamp}.csv"
             self._run_task(
                 lambda: waveform.export_csv(target),
@@ -657,8 +644,8 @@ class ScopeMainWindow(QMainWindow):
         self.export_waveform_button.setEnabled(True)
         self.waveform_summary.setText(
             "波形状态："
-            f"{' + '.join(_display_channel_name(waveform.channel) for waveform in waveforms)} / {primary_waveform.points_mode} / "
-            f"主通道 {_display_channel_name(primary_waveform.channel)} / {len(primary_waveform.x_values)} 点 / "
+            f"{' + '.join(display_channel_name(waveform.channel) for waveform in waveforms)} / {primary_waveform.points_mode} / "
+            f"主通道 {display_channel_name(primary_waveform.channel)} / {len(primary_waveform.x_values)} 点 / "
             f"时间跨度 {self.last_waveform_stats.duration_s:.6e}s / "
             f"电压范围 {self.last_waveform_stats.voltage_min:.4f}V ~ {self.last_waveform_stats.voltage_max:.4f}V"
         )
@@ -775,10 +762,10 @@ class ScopeMainWindow(QMainWindow):
         current = self.channel_combo.currentData()
         if isinstance(current, str) and current:
             return current
-        return _normalize_channel_name(self.channel_combo.currentText())
+        return normalize_channel_name(self.channel_combo.currentText())
 
     def _set_selected_channel(self, channel: str) -> None:
-        index = self.channel_combo.findData(_normalize_channel_name(channel))
+        index = self.channel_combo.findData(normalize_channel_name(channel))
         if index >= 0:
             self.channel_combo.setCurrentIndex(index)
 
@@ -834,33 +821,3 @@ def main() -> None:
     window = ScopeMainWindow()
     window.show()
     app.exec()
-
-
-def _format_peak_current(peak) -> str:
-    if peak is None:
-        return "-"
-    return f"{peak.value:.6f} A"
-
-
-def _format_peak_time(peak) -> str:
-    if peak is None:
-        return "-"
-    return f"{peak.time_s:.6e} s"
-
-
-def _format_range_ms(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.3f} ~ {max(values):.3f} ms"
-
-
-def _format_range_amp(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.6f} ~ {max(values):.6f} A"
-
-
-def _format_range_hz(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.6f} ~ {max(values):.6f} Hz"

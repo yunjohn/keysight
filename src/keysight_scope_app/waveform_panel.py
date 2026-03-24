@@ -23,18 +23,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from keysight_scope_app.ui_helpers import display_channel_name
 from keysight_scope_app.waveform_analysis import WaveformData, WaveformStats, compare_waveform_edges
 
 
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
 WAVEFORM_SERIES_COLORS = ("#2d9cdb", "#eb5757", "#27ae60", "#f2994a")
-
-
-def _display_channel_name(channel: str) -> str:
-    if channel.startswith("CHANnel"):
-        return channel.replace("CHANnel", "CH", 1)
-    return channel
-
 
 class InteractiveChartView(QChartView):
     def __init__(self, chart: QChart, parent: QWidget | None = None) -> None:
@@ -675,7 +669,7 @@ class WaveformAnalysisPanel(QWidget):
         all_y_values: list[float] = []
         for index, waveform in enumerate(waveforms):
             series = QLineSeries()
-            series.setName(_display_channel_name(waveform.channel))
+            series.setName(display_channel_name(waveform.channel))
             series.setPen(self._waveform_series_pen(waveform.channel))
 
             x_values, y_values = _decimate_xy(waveform.x_values, waveform.y_values, max_points=2500)
@@ -692,7 +686,7 @@ class WaveformAnalysisPanel(QWidget):
         self._render_all_waveform_series()
 
         self.chart.legend().setVisible(len(waveforms) > 1)
-        self.chart.setTitle(" / ".join(_display_channel_name(waveform.channel) for waveform in waveforms) + " 波形")
+        self.chart.setTitle(" / ".join(display_channel_name(waveform.channel) for waveform in waveforms) + " 波形")
 
         if all_x_values:
             axis_x.setRange(min(all_x_values), max(all_x_values))
@@ -824,7 +818,7 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_channel_combo.clear()
         secondary_channels = [waveform.channel for waveform in self.current_waveforms[1:]]
         for channel in secondary_channels:
-            self.compare_channel_combo.addItem(_display_channel_name(channel), channel)
+            self.compare_channel_combo.addItem(display_channel_name(channel), channel)
         self.compare_channel_combo.blockSignals(False)
         self.compare_channel_combo.setEnabled(bool(secondary_channels))
         self._update_channel_comparison()
@@ -860,13 +854,13 @@ class WaveformAnalysisPanel(QWidget):
         if comparison is None:
             for label in self.compare_labels.values():
                 label.setText("无法估算")
-            self.compare_labels["primary_channel"].setText(_display_channel_name(self.current_waveform.channel))
-            self.compare_labels["secondary_channel"].setText(_display_channel_name(secondary_waveform.channel))
+            self.compare_labels["primary_channel"].setText(display_channel_name(self.current_waveform.channel))
+            self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
             self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
             return
 
-        self.compare_labels["primary_channel"].setText(_display_channel_name(self.current_waveform.channel))
-        self.compare_labels["secondary_channel"].setText(_display_channel_name(secondary_waveform.channel))
+        self.compare_labels["primary_channel"].setText(display_channel_name(self.current_waveform.channel))
+        self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
         self.compare_labels["secondary_edge"].setText(f"{comparison.secondary_time_s:.6e} s")
         self.compare_labels["delta_t"].setText(f"{comparison.delta_t_s:.6e} s")
@@ -962,7 +956,7 @@ class WaveformAnalysisPanel(QWidget):
         self.dragging_waveform_channel = waveform_channel
         self.waveform_drag_anchor_y = y_value
         self.waveform_drag_initial_offset = self.waveform_offsets.get(waveform_channel, 0.0)
-        self.cursor_hint_label.setText(f"正在拖动 {_display_channel_name(waveform_channel)}，可上下分离显示。")
+        self.cursor_hint_label.setText(f"正在拖动 {display_channel_name(waveform_channel)}，可上下分离显示。")
         self._refresh_cursor_graphics()
         return True
 
@@ -974,7 +968,7 @@ class WaveformAnalysisPanel(QWidget):
             self.waveform_offsets[channel] = self.waveform_drag_initial_offset + (y_value - self.waveform_drag_anchor_y)
             self._render_waveform_series(channel)
             self.cursor_hint_label.setText(
-                f"正在拖动 {_display_channel_name(channel)}，显示偏移 {self.waveform_offsets[channel]:+.4f} V。"
+                f"正在拖动 {display_channel_name(channel)}，显示偏移 {self.waveform_offsets[channel]:+.4f} V。"
             )
             return True
 
@@ -1005,7 +999,7 @@ class WaveformAnalysisPanel(QWidget):
             channel = self.dragging_waveform_channel
             self.dragging_waveform_channel = None
             self.cursor_hint_label.setText(
-                f"{_display_channel_name(channel)} 已完成分离显示。{self._default_cursor_hint()}"
+                f"{display_channel_name(channel)} 已完成分离显示。{self._default_cursor_hint()}"
             )
             self._refresh_cursor_graphics()
 
@@ -1325,7 +1319,7 @@ class WaveformAnalysisPanel(QWidget):
                     if waveform_channel is None:
                         self.cursor_hint_label.setText(self._default_cursor_hint())
                     else:
-                        self.cursor_hint_label.setText(f"当前命中 {_display_channel_name(waveform_channel)}，可上下拖动分离显示。")
+                        self.cursor_hint_label.setText(f"当前命中 {display_channel_name(waveform_channel)}，可上下拖动分离显示。")
                 self._refresh_cursor_graphics()
             if waveform_channel is not None:
                 return Qt.SizeVerCursor

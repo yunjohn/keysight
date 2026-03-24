@@ -32,6 +32,15 @@ from keysight_scope_app.startup_brake_analysis import (
     StartupBrakeTestResult,
     analyze_startup_brake_test,
 )
+from keysight_scope_app.ui_helpers import (
+    display_channel_name,
+    format_peak_current,
+    format_peak_time,
+    format_range_amp,
+    format_range_hz,
+    format_range_ms,
+    normalize_channel_name,
+)
 from keysight_scope_app.waveform_analysis import WaveformData
 
 if TYPE_CHECKING:
@@ -39,50 +48,6 @@ if TYPE_CHECKING:
 
 
 STARTUP_BRAKE_DIR = Path("captures") / "startup_brake_tests"
-
-
-def _display_channel_name(channel: str) -> str:
-    if channel.startswith("CHANnel"):
-        return channel.replace("CHANnel", "CH", 1)
-    return channel
-
-
-def _normalize_channel_name(channel: str) -> str:
-    normalized = channel.strip()
-    if normalized.upper().startswith("CH") and normalized[2:].isdigit():
-        return f"CHANnel{normalized[2:]}"
-    return normalized
-
-
-def _format_peak_current(peak) -> str:
-    if peak is None:
-        return "-"
-    return f"{peak.value:.6f} A"
-
-
-def _format_peak_time(peak) -> str:
-    if peak is None:
-        return "-"
-    return f"{peak.time_s:.6e} s"
-
-
-def _format_range_ms(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.3f} ~ {max(values):.3f} ms"
-
-
-def _format_range_amp(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.6f} ~ {max(values):.6f} A"
-
-
-def _format_range_hz(values: list[float]) -> str:
-    if not values:
-        return "-"
-    return f"{min(values):.6f} ~ {max(values):.6f} Hz"
-
 
 @dataclass(frozen=True)
 class StartupBrakeHistoryEntry:
@@ -431,7 +396,7 @@ class StartupBrakeTestDialog(QDialog):
     def _create_channel_combo(self, default_channel: str) -> QComboBox:
         combo = QComboBox()
         for channel in SUPPORTED_CHANNELS:
-            combo.addItem(_display_channel_name(channel), channel)
+            combo.addItem(display_channel_name(channel), channel)
         index = combo.findData(default_channel)
         if index >= 0:
             combo.setCurrentIndex(index)
@@ -441,7 +406,7 @@ class StartupBrakeTestDialog(QDialog):
         current = combo.currentData()
         if isinstance(current, str) and current:
             return current
-        return _normalize_channel_name(combo.currentText())
+        return normalize_channel_name(combo.currentText())
 
     def _refresh_channel_options(self, changed_combo: QComboBox | None = None) -> None:
         if changed_combo is None:
@@ -582,7 +547,7 @@ class StartupBrakeTestDialog(QDialog):
         self.summary_label.setText("正在抓取启动刹车测试所需波形...")
         self.main_window.log(
             "启动刹车测试补抓波形: "
-            + ", ".join(_display_channel_name(channel) for channel in required_channels)
+            + ", ".join(display_channel_name(channel) for channel in required_channels)
         )
         self.main_window._run_task(
             lambda: [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in required_channels],
@@ -633,13 +598,13 @@ class StartupBrakeTestDialog(QDialog):
         self.result_labels["startup_start"].setText(f"{result.startup_start_point[0]:.6e} s")
         self.result_labels["startup_reach"].setText(f"{result.speed_reached_point[0]:.6e} s")
         self.result_labels["startup_delay"].setText(f"{result.startup_delay_s:.6e} s")
-        self.result_labels["startup_peak"].setText(_format_peak_current(result.startup_peak_current))
-        self.result_labels["startup_peak_time"].setText(_format_peak_time(result.startup_peak_current))
+        self.result_labels["startup_peak"].setText(format_peak_current(result.startup_peak_current))
+        self.result_labels["startup_peak_time"].setText(format_peak_time(result.startup_peak_current))
         self.result_labels["brake_start"].setText(f"{result.brake_start_point[0]:.6e} s")
         self.result_labels["current_zero"].setText(f"{result.current_zero_window.confirmed_time_s:.6e} s")
         self.result_labels["brake_end"].setText(f"{result.brake_end_point[0]:.6e} s")
         self.result_labels["brake_delay"].setText(f"{result.brake_delay_s:.6e} s")
-        self.result_labels["brake_peak"].setText(_format_peak_current(result.brake_peak_current))
+        self.result_labels["brake_peak"].setText(format_peak_current(result.brake_peak_current))
         self.result_labels["speed_frequency"].setText(f"{result.speed_match.frequency_hz:.6f} Hz")
         self.result_labels["speed_period"].setText(f"{result.speed_match.period_s * 1000.0:.6f} ms")
         self.apply_startup_cursor_button.setEnabled(True)
@@ -688,10 +653,10 @@ class StartupBrakeTestDialog(QDialog):
         with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(["section", "key", "value"])
-            writer.writerow(["config", "control_channel", self._history_config_summary(lambda config: _display_channel_name(config.control_channel))])
-            writer.writerow(["config", "speed_channel", self._history_config_summary(lambda config: _display_channel_name(config.speed_channel))])
-            writer.writerow(["config", "current_channel", self._history_config_summary(lambda config: _display_channel_name(config.current_channel))])
-            writer.writerow(["config", "encoder_a_channel", self._history_config_summary(lambda config: _display_channel_name(config.encoder_a_channel or "-"))])
+            writer.writerow(["config", "control_channel", self._history_config_summary(lambda config: display_channel_name(config.control_channel))])
+            writer.writerow(["config", "speed_channel", self._history_config_summary(lambda config: display_channel_name(config.speed_channel))])
+            writer.writerow(["config", "current_channel", self._history_config_summary(lambda config: display_channel_name(config.current_channel))])
+            writer.writerow(["config", "encoder_a_channel", self._history_config_summary(lambda config: display_channel_name(config.encoder_a_channel or "-"))])
             writer.writerow(["config", "speed_target_mode", self._history_config_summary(lambda config: self._target_mode_display_text(config.speed_target_mode))])
             writer.writerow(["config", "speed_target_value", self._history_config_summary(lambda config: f"{config.speed_target_value:.6f}")])
             writer.writerow(["config", "speed_tolerance_percent", self._history_config_summary(lambda config: f"{config.speed_tolerance_ratio * 100.0:.2f}")])
@@ -706,16 +671,16 @@ class StartupBrakeTestDialog(QDialog):
 
             writer.writerow(["summary", "sample_count", str(len(self.history))])
             writer.writerow(
-                ["summary", "startup_delay_range_ms", _format_range_ms([entry.result.startup_delay_s * 1000.0 for entry in self.history])]
+                ["summary", "startup_delay_range_ms", format_range_ms([entry.result.startup_delay_s * 1000.0 for entry in self.history])]
             )
             writer.writerow(
-                ["summary", "brake_delay_range_ms", _format_range_ms([entry.result.brake_delay_s * 1000.0 for entry in self.history])]
+                ["summary", "brake_delay_range_ms", format_range_ms([entry.result.brake_delay_s * 1000.0 for entry in self.history])]
             )
             writer.writerow(
                 [
                     "summary",
                     "startup_peak_range_a",
-                    _format_range_amp(
+                    format_range_amp(
                         [entry.result.startup_peak_current.value for entry in self.history if entry.result.startup_peak_current is not None]
                     ),
                 ]
@@ -724,13 +689,13 @@ class StartupBrakeTestDialog(QDialog):
                 [
                     "summary",
                     "brake_peak_range_a",
-                    _format_range_amp(
+                    format_range_amp(
                         [entry.result.brake_peak_current.value for entry in self.history if entry.result.brake_peak_current is not None]
                     ),
                 ]
             )
             writer.writerow(
-                ["summary", "speed_frequency_range_hz", _format_range_hz([entry.result.speed_match.frequency_hz for entry in self.history])]
+                ["summary", "speed_frequency_range_hz", format_range_hz([entry.result.speed_match.frequency_hz for entry in self.history])]
             )
             writer.writerow([])
 
@@ -813,8 +778,8 @@ class StartupBrakeTestDialog(QDialog):
             self.history_table.setItem(row, 1, self._centered_table_item(entry.timestamp))
             self.history_table.setItem(row, 2, self._centered_table_item(f"{result.startup_delay_s * 1000.0:.3f} ms"))
             self.history_table.setItem(row, 3, self._centered_table_item(f"{result.brake_delay_s * 1000.0:.3f} ms"))
-            self.history_table.setItem(row, 4, self._centered_table_item(_format_peak_current(result.startup_peak_current)))
-            self.history_table.setItem(row, 5, self._centered_table_item(_format_peak_current(result.brake_peak_current)))
+            self.history_table.setItem(row, 4, self._centered_table_item(format_peak_current(result.startup_peak_current)))
+            self.history_table.setItem(row, 5, self._centered_table_item(format_peak_current(result.brake_peak_current)))
             self.history_table.setItem(row, 6, self._centered_table_item(f"{result.speed_match.frequency_hz:.6f} Hz"))
 
         if not self.history:
@@ -833,11 +798,11 @@ class StartupBrakeTestDialog(QDialog):
         speed_frequencies = [entry.result.speed_match.frequency_hz for entry in self.history]
 
         self.stats_labels["sample_count"].setText(str(len(self.history)))
-        self.stats_labels["startup_delay_range"].setText(_format_range_ms(startup_delays_ms))
-        self.stats_labels["brake_delay_range"].setText(_format_range_ms(brake_delays_ms))
-        self.stats_labels["startup_peak_range"].setText(_format_range_amp(startup_peaks))
-        self.stats_labels["brake_peak_range"].setText(_format_range_amp(brake_peaks))
-        self.stats_labels["speed_frequency_range"].setText(_format_range_hz(speed_frequencies))
+        self.stats_labels["startup_delay_range"].setText(format_range_ms(startup_delays_ms))
+        self.stats_labels["brake_delay_range"].setText(format_range_ms(brake_delays_ms))
+        self.stats_labels["startup_peak_range"].setText(format_range_amp(startup_peaks))
+        self.stats_labels["brake_peak_range"].setText(format_range_amp(brake_peaks))
+        self.stats_labels["speed_frequency_range"].setText(format_range_hz(speed_frequencies))
 
     def _history_config_summary(self, getter) -> str:
         if not self.history:
