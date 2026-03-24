@@ -239,6 +239,117 @@ def test_fetch_measurements_supports_derived_metrics_with_single_waveform_fetch(
     assert result_map["高电平估计"] == 1.0
 
 
+def test_fetch_waveform_applies_requested_points_to_instrument() -> None:
+    class FakeInstrument:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        def write(self, command: str) -> None:
+            self.commands.append(command)
+
+        def query_ascii_values(self, command: str) -> list[float]:
+            assert command == ":WAVeform:PREamble?"
+            return [0, 0, 5, 1, 1e-6, 0.0, 0, 0.01, 0.0, 128]
+
+        def query_binary_values(
+            self,
+            command: str,
+            *,
+            datatype: str,
+            container,
+            header_fmt: str,
+            expect_termination: bool,
+        ) -> list[int]:
+            assert command == ":WAVeform:DATA?"
+            assert datatype == "B"
+            assert container is list
+            assert header_fmt == "ieee"
+            assert expect_termination is False
+            return [128, 129, 130, 131, 132]
+
+    scope = KeysightOscilloscope("USB::TEST")
+    fake_instrument = FakeInstrument()
+    scope._instrument = fake_instrument
+
+    waveform = scope.fetch_waveform("CHANnel2", points_mode="RAW", points=5)
+
+    assert fake_instrument.commands == [
+        ":WAVeform:SOURce CHANnel2",
+        ":WAVeform:FORMat BYTE",
+        ":WAVeform:UNSigned ON",
+        ":WAVeform:POINts:MODE RAW",
+        ":WAVeform:POINts 5",
+    ]
+    assert waveform.channel == "CHANnel2"
+    assert waveform.points_mode == "RAW"
+    assert waveform.preamble.points == 5
+    assert len(waveform.x_values) == 5
+    assert len(waveform.y_values) == 5
+    assert waveform.x_values == [0.0, 1e-6, 2e-6, 3e-6, 4e-6]
+    assert waveform.y_values == [0.0, 0.01, 0.02, 0.03, 0.04]
+
+
+def test_get_displayed_channels_reads_scope_display_state() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+
+        def query(self, command: str) -> str:
+            responses = {
+                ":CHANnel1:DISPlay?": "1",
+                ":CHANnel2:DISPlay?": "0",
+                ":CHANnel3:DISPlay?": "ON",
+                ":CHANnel4:DISPlay?": "OFF",
+            }
+            return responses[command]
+
+    scope = FakeScope()
+
+    assert scope.get_displayed_channels() == ["CHANnel1", "CHANnel3"]
+
+
+def test_get_channel_unit_reads_scope_unit_setting() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+
+        def query(self, command: str) -> str:
+            responses = {
+                ":CHANnel1:UNITs?": "VOLT",
+                ":CHANnel3:UNITs?": "AMPere",
+            }
+            return responses[command]
+
+    scope = FakeScope()
+
+    assert scope.get_channel_unit("CHANnel1") == "V"
+    assert scope.get_channel_unit("CHANnel3") == "A"
+
+
+def test_fetch_measurements_uses_current_units_for_channel_3() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+
+        def query(self, command: str) -> str:
+            responses = {
+                ":CHANnel3:UNITs?": "AMPere",
+                ":MEASure:VPP? CHANnel3": "2.5",
+            }
+            if command in responses:
+                return responses[command]
+            raise AssertionError(f"unexpected query: {command}")
+
+    scope = FakeScope()
+
+    results = scope.fetch_measurements("CHANnel3", ["峰峰值"])
+
+    assert len(results) == 1
+    assert results[0].raw_value == 2.5
+    assert results[0].unit == "A"
+    assert results[0].display_value == "2.5 A"
+
+
 def test_compare_waveform_edges_returns_delay_and_phase() -> None:
     primary = WaveformData(
         channel="CHANnel1",
@@ -274,6 +385,7 @@ def test_analyze_startup_brake_test_current_zero_mode() -> None:
             speed_target_mode="frequency_hz",
             speed_target_value=100.0,
             speed_consecutive_periods=2,
+            zero_current_threshold_a=0.05,
             brake_mode="current_zero",
         ),
     )
@@ -287,8 +399,29 @@ def test_analyze_startup_brake_test_current_zero_mode() -> None:
     assert abs(result.brake_start_point[0] - 0.0791) < 1e-9
     assert abs(result.current_zero_window.start_time_s - 0.086) < 1e-9
     assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
-    assert abs(result.brake_end_point[0] - 0.089) < 1e-9
-    assert abs(result.brake_delay_s - 0.0099) < 1e-9
+    assert abs(result.brake_end_point[0] - 0.086) < 1e-9
+    assert abs(result.brake_delay_s - 0.0069) < 1e-9
+
+
+def test_analyze_startup_brake_test_current_zero_mode_does_not_require_encoder_channel() -> None:
+    waveforms = [waveform for waveform in _build_startup_brake_waveforms() if waveform.channel != "CHANnel4"]
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            encoder_a_channel="CHANnel4",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            zero_current_threshold_a=0.05,
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
+    assert abs(result.brake_end_point[0] - 0.086) < 1e-9
 
 
 def test_analyze_startup_brake_test_encoder_backtrack_mode() -> None:
@@ -303,14 +436,180 @@ def test_analyze_startup_brake_test_encoder_backtrack_mode() -> None:
             speed_target_mode="frequency_hz",
             speed_target_value=100.0,
             speed_consecutive_periods=2,
+            zero_current_threshold_a=0.05,
             brake_mode="encoder_backtrack",
-            brake_backtrack_pulses=8,
+            brake_backtrack_pulses=1,
         ),
     )
 
     assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
-    assert abs(result.brake_end_point[0] - 0.0799) < 1e-9
-    assert abs(result.brake_delay_s - 0.0008) < 1e-9
+    assert abs(result.brake_end_point[0] - 0.0849) < 1e-9
+    assert abs(result.brake_delay_s - 0.0058) < 1e-9
+
+
+def test_analyze_startup_brake_test_encoder_backtrack_ignores_small_noise_pulses() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    encoder_waveform = next(waveform for waveform in waveforms if waveform.channel == "CHANnel4")
+    encoder_waveform.x_values[:] = [0.0846, 0.0848, 0.085, 0.0852, 0.0854, 0.0856, 0.0858, 0.086, 0.0862, 0.0864]
+    encoder_waveform.y_values[:] = [0.0, 0.0, 0.4, 0.0, 5.0, 0.0, 0.3, 0.0, 5.0, 0.0]
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            encoder_a_channel="CHANnel4",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            zero_current_threshold_a=0.05,
+            brake_mode="encoder_backtrack",
+            brake_backtrack_pulses=2,
+            brake_backtrack_min_step=1.0,
+            brake_backtrack_min_interval_s=0.0005,
+        ),
+    )
+
+    assert result.brake_end_point is not None
+    assert abs(result.brake_end_point[0] - 0.0853) < 1e-9
+
+
+def test_analyze_startup_brake_test_startup_only_mode() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            test_scope_mode="startup_only",
+        ),
+    )
+
+    assert result.startup_delay_s is not None
+    assert result.speed_match is not None
+    assert result.brake_delay_s is None
+    assert result.brake_start_point is None
+
+
+def test_analyze_startup_brake_test_brake_only_mode() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert result.startup_delay_s is None
+    assert result.speed_match is None
+    assert result.brake_delay_s is not None
+    assert result.current_zero_window is not None
+
+
+def test_analyze_startup_brake_test_ignores_small_control_voltage_fluctuation() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    control_waveform = next(waveform for waveform in waveforms if waveform.channel == "CHANnel1")
+    control_waveform.y_values[5] = 0.4
+    control_waveform.y_values[6] = 0.6
+    control_waveform.y_values[7] = 0.3
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            startup_min_voltage_step=1.0,
+            startup_hold_s=0.001,
+            test_scope_mode="startup_only",
+        ),
+    )
+
+    assert result.startup_start_point is not None
+    assert abs(result.startup_start_point[0] - 0.0191) < 1e-9
+
+
+def test_analyze_startup_brake_test_brake_start_uses_last_control_falling_edge_before_speed_zero() -> None:
+    waveforms = _build_startup_brake_waveforms()
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert result.brake_start_point is not None
+    assert abs(result.brake_start_point[0] - 0.0791) < 1e-9
+
+
+def test_analyze_startup_brake_test_current_zero_mode_accepts_probe_jitter_near_zero() -> None:
+    waveforms = WaveformData.load_csv_bundle(Path("captures/waveforms/test.csv"))
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel4",
+            speed_target_mode="period_ms",
+            speed_target_value=3.0,
+            speed_consecutive_periods=3,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert result.brake_start_point is not None
+    assert result.current_zero_window is not None
+    assert result.brake_end_point is not None
+    assert result.brake_delay_s is not None
+
+
+def test_analyze_startup_brake_test_current_zero_mode_accepts_small_zero_bias() -> None:
+    waveforms = WaveformData.load_csv_bundle(Path("captures/waveforms/test1.csv"))
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel4",
+            speed_target_mode="period_ms",
+            speed_target_value=3.0,
+            speed_consecutive_periods=3,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+            control_threshold_ratio=0.1,
+        ),
+    )
+
+    assert result.brake_start_point is not None
+    assert result.current_zero_window is not None
+    assert result.brake_end_point is not None
+    assert result.brake_delay_s is not None
 
 
 def _build_startup_brake_waveforms() -> list[WaveformData]:
@@ -327,7 +626,19 @@ def _build_startup_brake_waveforms() -> list[WaveformData]:
     speed_x = [index * 0.001 for index in range(101)]
     speed_y = []
     for time_value in speed_x:
-        high = any(start <= time_value < (start + 0.004) for start in (0.02, 0.03, 0.04, 0.05, 0.06))
+        high = any(
+            start <= time_value < (start + width)
+            for start, width in (
+                (0.02, 0.004),
+                (0.03, 0.004),
+                (0.04, 0.004),
+                (0.05, 0.004),
+                (0.06, 0.004),
+                (0.08, 0.002),
+                (0.085, 0.002),
+                (0.091, 0.002),
+            )
+        )
         speed_y.append(5.0 if high else 0.0)
 
     current_x = [index * 0.001 for index in range(101)]
@@ -377,7 +688,10 @@ def _build_startup_brake_waveforms() -> list[WaveformData]:
     encoder_x = [index * 0.0002 for index in range(451)]
     encoder_y = []
     for time_value in encoder_x:
-        high = any(start <= time_value < (start + 0.0004) for start in (0.08, 0.081, 0.082, 0.083, 0.084, 0.085, 0.086, 0.087))
+        high = any(
+            start <= time_value < (start + 0.0004)
+            for start in (0.0850, 0.0854, 0.0858, 0.0862, 0.0866, 0.0870, 0.0874, 0.0878)
+        )
         encoder_y.append(5.0 if high else 0.0)
 
     return [

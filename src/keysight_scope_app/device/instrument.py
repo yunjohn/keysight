@@ -51,6 +51,12 @@ class MeasurementResult:
     display_value: str
 
 
+@dataclass(frozen=True)
+class ChannelVerticalLayout:
+    scale: float
+    offset: float
+
+
 MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
     "频率": MeasurementDefinition("频率", "Hz", lambda channel: f":MEASure:FREQuency? {channel}"),
     "周期": MeasurementDefinition("周期", "s", lambda channel: f":MEASure:PERiod? {channel}"),
@@ -76,6 +82,16 @@ SUPPORTED_CHANNELS = ("CHANnel1", "CHANnel2", "CHANnel3", "CHANnel4")
 SUPPORTED_WAVEFORM_POINTS_MODES = ("NORMal", "MAXimum", "RAW")
 KNOWN_KEYSIGHT_VENDORS = ("KEYSIGHT", "AGILENT")
 SOFTWARE_MEASUREMENT_POINTS = 2000
+CURRENT_LIKE_MEASUREMENTS = {
+    "峰峰值",
+    "均方根",
+    "最大值",
+    "最小值",
+    "平均值",
+    "振幅",
+    "高电平估计",
+    "低电平估计",
+}
 
 
 def list_visa_resources(backend: str | None = None) -> tuple[str, ...]:
@@ -158,12 +174,83 @@ class KeysightOscilloscope:
     def get_system_error(self) -> str:
         return self.query(":SYSTem:ERRor?")
 
+    def get_displayed_channels(self) -> list[str]:
+        displayed_channels: list[str] = []
+        for channel in SUPPORTED_CHANNELS:
+            response = self.query(f":{channel}:DISPlay?")
+            normalized = response.strip().upper()
+            if normalized in {"1", "ON"}:
+                displayed_channels.append(channel)
+        return displayed_channels
+
+    def set_channel_display(self, channel: str, enabled: bool) -> None:
+        if channel not in SUPPORTED_CHANNELS:
+            raise ValueError(f"不支持的通道: {channel}")
+        self.write(f":{channel}:DISPlay {'ON' if enabled else 'OFF'}")
+
+    def get_channel_unit(self, channel: str) -> str:
+        if channel not in SUPPORTED_CHANNELS:
+            raise ValueError(f"不支持的通道: {channel}")
+
+        query_candidates = (
+            f":{channel}:UNITs?",
+            f":{channel}:PROBe:EXTernal:UNITs?",
+        )
+        for command in query_candidates:
+            try:
+                response = self.query(command)
+            except Exception:
+                continue
+            normalized = _normalize_channel_unit(response)
+            if normalized is not None:
+                return normalized
+        return "V"
+
+    def get_channel_units(self, channels: list[str] | None = None) -> dict[str, str]:
+        target_channels = channels or list(SUPPORTED_CHANNELS)
+        return {channel: self.get_channel_unit(channel) for channel in target_channels}
+
+    def get_channel_vertical_layout(self, channel: str) -> ChannelVerticalLayout:
+        if channel not in SUPPORTED_CHANNELS:
+            raise ValueError(f"不支持的通道: {channel}")
+        scale = float(self.query(f":{channel}:SCALe?"))
+        offset = float(self.query(f":{channel}:OFFSet?"))
+        return ChannelVerticalLayout(scale=scale, offset=offset)
+
+    def get_channel_vertical_layouts(self, channels: list[str] | None = None) -> dict[str, ChannelVerticalLayout]:
+        target_channels = channels or list(SUPPORTED_CHANNELS)
+        return {channel: self.get_channel_vertical_layout(channel) for channel in target_channels}
+
+    def get_max_waveform_points(
+        self,
+        channel: str,
+        *,
+        points_mode: str,
+        probe_points: int = 500000,
+    ) -> int:
+        if channel not in SUPPORTED_CHANNELS:
+            raise ValueError(f"不支持的通道: {channel}")
+        if points_mode not in SUPPORTED_WAVEFORM_POINTS_MODES:
+            raise ValueError(f"不支持的波形点模式: {points_mode}")
+
+        with self._lock:
+            self._ensure_connected()
+            self._instrument.write(f":WAVeform:SOURce {channel}")
+            self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
+            self._instrument.write(f":WAVeform:POINts {probe_points}")
+            response = self._instrument.query(":WAVeform:POINts?")
+        try:
+            return int(float(str(response).strip()))
+        except Exception:
+            return probe_points
+
     def fetch_measurements(self, channel: str, measurement_names: list[str]) -> list[MeasurementResult]:
         if channel not in SUPPORTED_CHANNELS:
             raise ValueError(f"不支持的通道: {channel}")
 
         results: list[MeasurementResult] = []
         waveform_stats: WaveformStats | None = None
+        channel_unit = self.get_channel_unit(channel)
         for measurement_name in measurement_names:
             definition = MEASUREMENT_DEFINITIONS[measurement_name]
             if definition.query_builder is not None:
@@ -179,12 +266,13 @@ class KeysightOscilloscope:
                     ).analyze()
                 value = definition.stats_getter(waveform_stats)
                 raw_value = value if value is not None else float("nan")
+            display_unit = _measurement_unit_for_channel(channel_unit, definition.label, definition.unit)
             results.append(
                 MeasurementResult(
                     label=definition.label,
                     raw_value=raw_value,
-                    unit=definition.unit,
-                    display_value=format_engineering_value(raw_value, definition.unit),
+                    unit=display_unit,
+                    display_value=format_engineering_value(raw_value, display_unit),
                 )
             )
         return results
@@ -292,6 +380,21 @@ class KeysightOscilloscope:
 
 def _resource_sort_key(resource_name: str) -> tuple[int, str]:
     return ("::?::" in resource_name, resource_name)
+
+
+def _normalize_channel_unit(response: str) -> str | None:
+    normalized = response.strip().upper()
+    if normalized.startswith("AMP"):
+        return "A"
+    if normalized.startswith("VOLT"):
+        return "V"
+    return None
+
+
+def _measurement_unit_for_channel(channel_unit: str, measurement_label: str, default_unit: str) -> str:
+    if channel_unit == "A" and measurement_label in CURRENT_LIKE_MEASUREMENTS:
+        return "A"
+    return default_unit
 
 
 def _parse_preamble(values: list[float]) -> WaveformPreamble:

@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QComboBox,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QMenu,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -29,12 +30,16 @@ from keysight_scope_app.ui.helpers import display_channel_name
 
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
 WAVEFORM_SERIES_COLORS = ("#2d9cdb", "#eb5757", "#27ae60", "#f2994a")
+RAW_RENDER_POINT_THRESHOLD = 10000
+WAVEFORM_REDRAW_DEBOUNCE_MS = 40
 
 class InteractiveChartView(QChartView):
     def __init__(self, chart: QChart, parent: QWidget | None = None) -> None:
         super().__init__(chart, parent)
         self.point_click_callback = None
         self.hover_cursor_callback = None
+        self.hover_leave_callback = None
+        self.crosshair_label_callback = None
         self.drag_start_callback = None
         self.drag_move_callback = None
         self.drag_end_callback = None
@@ -76,6 +81,8 @@ class InteractiveChartView(QChartView):
     def leaveEvent(self, event) -> None:  # type: ignore[override]
         self._hide_crosshair()
         self.unsetCursor()
+        if self.hover_leave_callback is not None:
+            self.hover_leave_callback()
         super().leaveEvent(event)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -91,21 +98,17 @@ class InteractiveChartView(QChartView):
         event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.RightButton:
-            if self.reset_view_callback is not None:
-                self.reset_view_callback()
-            else:
-                self.reset_view()
-            event.accept()
-            return
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
             position = event.position()
             value, inside_plot = self._map_position_to_plot_value(position)
             if inside_plot and self.point_click_callback is not None:
-                if self.point_click_callback(value.x(), value.y(), position):
+                if self.point_click_callback(value.x(), value.y(), position, event.modifiers(), event.button()):
                     event.accept()
                     return
             if self.drag_start_callback is not None:
@@ -116,6 +119,9 @@ class InteractiveChartView(QChartView):
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.RightButton:
+            event.accept()
+            return
         if event.button() == Qt.LeftButton and self._drag_callback_active:
             self._drag_callback_active = False
             if self.drag_end_callback is not None:
@@ -192,7 +198,11 @@ class InteractiveChartView(QChartView):
         self.crosshair_x.setVisible(True)
         self.crosshair_y.setVisible(True)
 
-        self.crosshair_label.setText(f"t={value.x():.6e} s\nV={value.y():.6f} V")
+        if self.crosshair_label_callback is not None:
+            label_text = self.crosshair_label_callback(value.x(), value.y())
+        else:
+            label_text = f"t={value.x():.6e} s\nV={value.y():.6f} V"
+        self.crosshair_label.setText(label_text)
         label_x = min(scene_position.x() + 12, plot_area.right() - 120)
         label_y = max(scene_position.y() - 36, plot_area.top() + 8)
         self.crosshair_label.setPos(QPointF(label_x, label_y))
@@ -225,11 +235,16 @@ class WaveformAnalysisPanel(QWidget):
         self.current_waveforms: list[WaveformData] = []
         self.current_waveform: WaveformData | None = None
         self.current_stats: WaveformStats | None = None
+        self.active_waveform_channel: str | None = None
+        self.scope_vertical_layouts: dict[str, dict[str, float]] = {}
         self.waveform_series: QLineSeries | None = None
         self.waveform_series_map: dict[str, QLineSeries] = {}
+        self.waveform_source_map: dict[str, tuple[list[float], list[float]]] = {}
         self.waveform_decimated_map: dict[str, tuple[list[float], list[float]]] = {}
+        self.visible_channels: set[str] = set()
         self.waveform_offsets: dict[str, float] = {}
         self.pending_cursor_target: str | None = None
+        self.cursor_placement_mode = "direct"
         self.dragging_cursor_target: tuple[str, str] | None = None
         self.hover_cursor_target: tuple[str, str] | None = None
         self.dragging_waveform_channel: str | None = None
@@ -237,13 +252,22 @@ class WaveformAnalysisPanel(QWidget):
         self.waveform_drag_anchor_y: float = 0.0
         self.waveform_drag_initial_offset: float = 0.0
         self.cursor_points: dict[str, tuple[float, float]] = {}
+        self.cursor_channels: dict[str, str | None] = {}
         self.lock_annotation_text: str | None = None
+        self.channel_unit_resolver = None
+        self._axis_updates_suspended = False
+        self._pending_axis_refresh = False
+        self._axis_refresh_timer = QTimer(self)
+        self._axis_refresh_timer.setSingleShot(True)
+        self._axis_refresh_timer.timeout.connect(self._process_axis_range_changed)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        chart_toolbar = QHBoxLayout()
+        self.chart_toolbar_widget = QWidget(self)
+        chart_toolbar = QHBoxLayout(self.chart_toolbar_widget)
+        chart_toolbar.setContentsMargins(0, 0, 0, 0)
         chart_toolbar.setSpacing(10)
         self.reset_view_button = QPushButton("重置视图")
         self.reset_x_button = QPushButton("横向重置")
@@ -274,7 +298,7 @@ class WaveformAnalysisPanel(QWidget):
         help_layout.addWidget(help_title)
         help_layout.addWidget(self.help_label)
         chart_toolbar.addWidget(help_card, 1)
-        layout.addLayout(chart_toolbar)
+        layout.addWidget(self.chart_toolbar_widget)
 
         self.chart = QChart()
         self.chart.legend().hide()
@@ -282,17 +306,26 @@ class WaveformAnalysisPanel(QWidget):
         self.chart_view = InteractiveChartView(self.chart)
         self.chart_view.point_click_callback = self._handle_chart_click
         self.chart_view.hover_cursor_callback = self._hover_cursor_shape
+        self.chart_view.hover_leave_callback = self._hide_smart_preview
+        self.chart_view.crosshair_label_callback = self._crosshair_label_text
         self.chart_view.drag_start_callback = self._handle_chart_drag_start
         self.chart_view.drag_move_callback = self._handle_chart_drag_move
         self.chart_view.drag_end_callback = self._handle_chart_drag_end
         self.chart_view.reset_view_callback = self._reset_visual_view
+        self.chart_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chart_view.customContextMenuRequested.connect(self._show_chart_context_menu)
         self.chart_view.setMinimumHeight(220 if self.compact_mode else 520)
         layout.addWidget(self.chart_view)
 
-        cursor_toolbar = QHBoxLayout()
+        self.cursor_toolbar_widget = QWidget(self)
+        cursor_toolbar = QHBoxLayout(self.cursor_toolbar_widget)
+        cursor_toolbar.setContentsMargins(0, 0, 0, 0)
         cursor_toolbar.setSpacing(10)
-        self.cursor_a_button = QPushButton("设置游标 A")
-        self.cursor_b_button = QPushButton("设置游标 B")
+        self.locate_cursor_a_button = QPushButton("定位 A")
+        self.locate_cursor_b_button = QPushButton("定位 B")
+        self.cursor_mode_combo = QComboBox()
+        self.cursor_mode_combo.addItem("点哪放哪", "direct")
+        self.cursor_mode_combo.addItem("智能游标", "smart")
         self.cursor_a_rise_button = QPushButton("A 吸附上升沿")
         self.cursor_a_fall_button = QPushButton("A 吸附下降沿")
         self.cursor_b_rise_button = QPushButton("B 吸附上升沿")
@@ -301,23 +334,15 @@ class WaveformAnalysisPanel(QWidget):
         self.lock_pulse_button = QPushButton("锁定最近脉冲")
         self.lock_period_button = QPushButton("锁定最近周期")
         self.clear_cursor_button = QPushButton("清除游标")
-        self.cursor_hint_label = QLabel("提示：点击“设置游标 A/B”后，在图上单击放置；拖动竖线改时间，拖动横线改电压，拖动交点同时改两者。")
+        self.cursor_hint_label = QLabel("提示：在图上右键放置或更新游标；拖动竖线改时间，拖动横线改电压，拖动交点同时改两者。")
         self.cursor_hint_label.setWordWrap(True)
-        if self.compact_mode:
-            cursor_toolbar.addWidget(
-                self._build_control_group(
-                    "快速分析",
-                    [self.smart_lock_button, self.lock_pulse_button, self.lock_period_button, self.clear_cursor_button],
-                    columns=2,
-                )
-            )
-        else:
+        if not self.compact_mode:
             cursor_toolbar.addWidget(
                 self._build_control_group(
                     "游标定位",
                     [
-                        self.cursor_a_button,
-                        self.cursor_b_button,
+                        self.locate_cursor_a_button,
+                        self.locate_cursor_b_button,
                         self.cursor_a_rise_button,
                         self.cursor_a_fall_button,
                         self.cursor_b_rise_button,
@@ -333,22 +358,25 @@ class WaveformAnalysisPanel(QWidget):
                     columns=2,
                 )
             )
-        hint_card = QFrame()
-        hint_card.setFrameShape(QFrame.StyledPanel)
-        hint_layout = QVBoxLayout(hint_card)
-        hint_layout.setContentsMargins(10, 8, 10, 8)
-        hint_title = QLabel("当前状态")
-        hint_title.setFont(QFont(hint_title.font().family(), hint_title.font().pointSize(), QFont.Bold))
-        hint_layout.addWidget(hint_title)
-        hint_layout.addWidget(self.cursor_hint_label)
-        cursor_toolbar.addWidget(hint_card, 1)
-        layout.addLayout(cursor_toolbar)
+            hint_card = QFrame()
+            hint_card.setFrameShape(QFrame.StyledPanel)
+            hint_layout = QVBoxLayout(hint_card)
+            hint_layout.setContentsMargins(10, 8, 10, 8)
+            hint_title = QLabel("当前状态")
+            hint_title.setFont(QFont(hint_title.font().family(), hint_title.font().pointSize(), QFont.Bold))
+            hint_layout.addWidget(hint_title)
+            hint_layout.addWidget(self.cursor_hint_label)
+            cursor_toolbar.addWidget(hint_card, 1)
+            layout.addWidget(self.cursor_toolbar_widget)
 
-        kpi_title = QLabel("当前视图关键指标")
-        kpi_title.setFont(QFont(kpi_title.font().family(), kpi_title.font().pointSize(), QFont.Bold))
-        layout.addWidget(kpi_title)
+        self.kpi_title_label = QLabel("当前视图关键指标")
+        self.kpi_title_label.setFont(QFont(self.kpi_title_label.font().family(), self.kpi_title_label.font().pointSize(), QFont.Bold))
+        self.kpi_title_label.setVisible(not self.compact_mode)
+        layout.addWidget(self.kpi_title_label)
 
-        kpi_grid = QGridLayout()
+        self.kpi_widget = QWidget(self)
+        kpi_grid = QGridLayout(self.kpi_widget)
+        kpi_grid.setContentsMargins(0, 0, 0, 0)
         kpi_grid.setHorizontalSpacing(8)
         kpi_grid.setVerticalSpacing(8)
         self.view_kpi_labels: dict[str, QLabel] = {}
@@ -376,9 +404,10 @@ class WaveformAnalysisPanel(QWidget):
             card_layout.addWidget(title_label)
             card_layout.addWidget(value_label)
             kpi_grid.addWidget(card, 0, index)
-        layout.addLayout(kpi_grid)
+        self.kpi_widget.setVisible(not self.compact_mode)
+        layout.addWidget(self.kpi_widget)
 
-        stats_tabs = QTabWidget()
+        self.stats_tabs = QTabWidget()
 
         self.cursor_labels = {
             "a": QLabel("-"),
@@ -397,7 +426,7 @@ class WaveformAnalysisPanel(QWidget):
             ("1/Δt", "frequency"),
         ]
         cursor_tab = self._build_metric_grid(self.cursor_labels, cursor_items, columns=4)
-        stats_tabs.addTab(cursor_tab, "游标")
+        self.stats_tabs.addTab(cursor_tab, "游标")
 
         self.stats_labels = {
             "point_count": QLabel("-"),
@@ -430,7 +459,7 @@ class WaveformAnalysisPanel(QWidget):
             ("下降时间", "fall_time"),
         ]
         stats_tab = self._build_metric_grid(self.stats_labels, stats_items, columns=4)
-        stats_tabs.addTab(stats_tab, "全局统计")
+        self.stats_tabs.addTab(stats_tab, "全局统计")
 
         self.view_stats_labels = {
             "points": QLabel("-"),
@@ -453,7 +482,7 @@ class WaveformAnalysisPanel(QWidget):
             ("上升时间", "rise_time"),
         ]
         view_stats_tab = self._build_metric_grid(self.view_stats_labels, view_stats_items, columns=4)
-        stats_tabs.addTab(view_stats_tab, "当前视图统计")
+        self.stats_tabs.addTab(view_stats_tab, "当前视图统计")
 
         compare_tab = QWidget()
         compare_layout = QVBoxLayout(compare_tab)
@@ -493,14 +522,15 @@ class WaveformAnalysisPanel(QWidget):
             ("边沿类型", "edge_type"),
         ]
         compare_layout.addWidget(self._build_metric_grid(self.compare_labels, compare_items, columns=4))
-        stats_tabs.addTab(compare_tab, "通道对比")
+        self.stats_tabs.addTab(compare_tab, "通道对比")
         if self.compact_mode:
-            stats_tabs.setCurrentIndex(2)
-            stats_tabs.setMaximumHeight(210)
+            self.stats_tabs.setCurrentIndex(2)
+            self.stats_tabs.setMaximumHeight(210)
         else:
-            stats_tabs.setMaximumHeight(260)
+            self.stats_tabs.setMaximumHeight(260)
 
-        layout.addWidget(stats_tabs)
+        self.stats_tabs.setVisible(not self.compact_mode)
+        layout.addWidget(self.stats_tabs)
         layout.setStretch(0, 0)
         layout.setStretch(1, 5)
         layout.setStretch(2, 0)
@@ -513,8 +543,9 @@ class WaveformAnalysisPanel(QWidget):
         self.reset_y_button.clicked.connect(self.chart_view.reset_vertical)
         self.reset_offsets_button.clicked.connect(self._reset_waveform_offsets)
         self.export_image_button.clicked.connect(self._export_chart_image)
-        self.cursor_a_button.clicked.connect(lambda: self._arm_cursor("a"))
-        self.cursor_b_button.clicked.connect(lambda: self._arm_cursor("b"))
+        self.locate_cursor_a_button.clicked.connect(lambda: self._locate_cursor("a"))
+        self.locate_cursor_b_button.clicked.connect(lambda: self._locate_cursor("b"))
+        self.cursor_mode_combo.currentIndexChanged.connect(self._update_cursor_mode)
         self.cursor_a_rise_button.clicked.connect(lambda: self._snap_cursor_to_edge("a", "rising"))
         self.cursor_a_fall_button.clicked.connect(lambda: self._snap_cursor_to_edge("a", "falling"))
         self.cursor_b_rise_button.clicked.connect(lambda: self._snap_cursor_to_edge("b", "rising"))
@@ -574,6 +605,15 @@ class WaveformAnalysisPanel(QWidget):
         self.lock_annotation_text_item.setBrush(QColor("#2a9d6f"))
         self.chart.scene().addItem(self.lock_annotation_line)
         self.chart.scene().addItem(self.lock_annotation_text_item)
+        preview_pen = QPen(QColor("#00b894"))
+        preview_pen.setWidth(2)
+        self.smart_preview_item = QGraphicsEllipseItem()
+        self.smart_preview_item.setPen(preview_pen)
+        self.smart_preview_item.setBrush(QColor(0, 184, 148, 60))
+        self.smart_preview_label = QGraphicsSimpleTextItem()
+        self.smart_preview_label.setBrush(QColor("#00b894"))
+        self.chart.scene().addItem(self.smart_preview_item)
+        self.chart.scene().addItem(self.smart_preview_label)
         self._clear_cursors()
 
     def _build_control_group(self, title: str, widgets: list[QWidget], columns: int = 3) -> QFrame:
@@ -645,8 +685,11 @@ class WaveformAnalysisPanel(QWidget):
         self.current_waveforms = list(waveforms)
         self.current_waveform = waveforms[0]
         self.current_stats = primary_stats or self.current_waveform.analyze()
+        self.active_waveform_channel = self.current_waveform.channel
         self.waveform_series_map = {}
+        self.waveform_source_map = {}
         self.waveform_decimated_map = {}
+        self.visible_channels = {waveform.channel for waveform in waveforms}
         self.waveform_offsets = {waveform.channel: 0.0 for waveform in waveforms}
         self.dragging_waveform_channel = None
         self.hover_waveform_channel = None
@@ -659,7 +702,7 @@ class WaveformAnalysisPanel(QWidget):
         axis_x.setTitleText("Time (s)")
         axis_x.setLabelFormat("%.4g")
         axis_y = QValueAxis()
-        axis_y.setTitleText("Voltage (V)")
+        axis_y.setTitleText(self._axis_title_text())
         axis_y.setLabelFormat("%.4g")
         self.chart.addAxis(axis_x, Qt.AlignBottom)
         self.chart.addAxis(axis_y, Qt.AlignLeft)
@@ -672,22 +715,18 @@ class WaveformAnalysisPanel(QWidget):
             series.setName(display_channel_name(waveform.channel))
             series.setPen(self._waveform_series_pen(waveform.channel))
 
-            x_values, y_values = _decimate_xy(waveform.x_values, waveform.y_values, max_points=2500)
-            self.waveform_decimated_map[waveform.channel] = (x_values, y_values)
+            self.waveform_source_map[waveform.channel] = (list(waveform.x_values), list(waveform.y_values))
             self.chart.addSeries(series)
             series.attachAxis(axis_x)
             series.attachAxis(axis_y)
             self.waveform_series_map[waveform.channel] = series
-            all_x_values.extend(x_values)
-            all_y_values.extend(y_values)
+            all_x_values.extend(waveform.x_values)
+            all_y_values.extend(waveform.y_values)
             if index == 0:
                 self.waveform_series = series
 
-        self._render_all_waveform_series()
-
-        self.chart.legend().setVisible(len(waveforms) > 1)
-        self.chart.setTitle(" / ".join(display_channel_name(waveform.channel) for waveform in waveforms) + " 波形")
-
+        self._apply_render_quality(waveforms)
+        self._axis_updates_suspended = True
         if all_x_values:
             axis_x.setRange(min(all_x_values), max(all_x_values))
         if all_y_values:
@@ -700,10 +739,57 @@ class WaveformAnalysisPanel(QWidget):
                 padding = (y_max - y_min) * 0.05
                 axis_y.setRange(y_min - padding, y_max + padding)
         self.chart_view.set_default_ranges((axis_x.min(), axis_x.max()), (axis_y.min(), axis_y.max()))
-
         self.chart_view.reset_view()
+        self._axis_updates_suspended = False
+        self._render_all_waveform_series()
+        if self.scope_vertical_layouts:
+            self._apply_scope_vertical_layouts()
         self._update_stats(self.current_stats)
         self._update_view_stats_from_axes()
+        self._ensure_default_cursors()
+        self._refresh_cursor_graphics()
+
+    def capture_view_state(self) -> dict[str, object] | None:
+        if not self.current_waveforms:
+            return None
+        x_axis = self._x_axis()
+        y_axis = self._y_axis()
+        return {
+            "primary_channel": self.current_waveform.channel if self.current_waveform is not None else None,
+            "visible_channels": set(self.visible_channels),
+            "waveform_offsets": dict(self.waveform_offsets),
+            "x_range": (x_axis.min(), x_axis.max()) if x_axis is not None else None,
+            "y_range": (y_axis.min(), y_axis.max()) if y_axis is not None else None,
+        }
+
+    def restore_view_state(self, state: dict[str, object] | None) -> None:
+        if not state or not self.current_waveforms:
+            return
+        available_channels = {waveform.channel for waveform in self.current_waveforms}
+        saved_visible = state.get("visible_channels")
+        if isinstance(saved_visible, set):
+            self.visible_channels = {channel for channel in saved_visible if channel in available_channels}
+            if not self.visible_channels:
+                self.visible_channels = {waveform.channel for waveform in self.current_waveforms}
+
+        saved_offsets = state.get("waveform_offsets")
+        if isinstance(saved_offsets, dict):
+            for channel in available_channels:
+                if channel in saved_offsets:
+                    try:
+                        self.waveform_offsets[channel] = float(saved_offsets[channel])
+                    except (TypeError, ValueError):
+                        continue
+
+        self._render_all_waveform_series()
+        x_axis = self._x_axis()
+        y_axis = self._y_axis()
+        saved_x_range = state.get("x_range")
+        if x_axis is not None and isinstance(saved_x_range, tuple) and len(saved_x_range) == 2:
+            x_axis.setRange(float(saved_x_range[0]), float(saved_x_range[1]))
+        saved_y_range = state.get("y_range")
+        if y_axis is not None and isinstance(saved_y_range, tuple) and len(saved_y_range) == 2:
+            y_axis.setRange(float(saved_y_range[0]), float(saved_y_range[1]))
         self._refresh_cursor_graphics()
 
     def clear(self) -> None:
@@ -712,8 +798,12 @@ class WaveformAnalysisPanel(QWidget):
         self.current_stats = None
         self.waveform_series = None
         self.waveform_series_map = {}
+        self.waveform_source_map = {}
         self.waveform_decimated_map = {}
+        self.visible_channels = set()
+        self.active_waveform_channel = None
         self.waveform_offsets = {}
+        self.scope_vertical_layouts = {}
         self.dragging_waveform_channel = None
         self.hover_waveform_channel = None
         self.compare_channel_combo.blockSignals(True)
@@ -725,6 +815,9 @@ class WaveformAnalysisPanel(QWidget):
             self.chart.removeAxis(axis)
         self.chart.setTitle("尚未加载波形")
         self.chart.legend().hide()
+        self.chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self._axis_refresh_timer.stop()
+        self._pending_axis_refresh = False
         for label in self.stats_labels.values():
             label.setText("-")
         for label in self.view_stats_labels.values():
@@ -736,33 +829,119 @@ class WaveformAnalysisPanel(QWidget):
         self.chart_view.reset_view()
         self._clear_cursors()
 
+    def set_waveform_only_mode(self, enabled: bool) -> None:
+        self.chart_toolbar_widget.setVisible(not enabled)
+        self.cursor_toolbar_widget.setVisible(not enabled)
+        self.kpi_title_label.setVisible(not enabled)
+        self.kpi_widget.setVisible(not enabled)
+        self.stats_tabs.setVisible(not enabled)
+        self.chart_view.setMinimumHeight(680 if enabled else (220 if self.compact_mode else 520))
+
+    def reset_view(self) -> None:
+        self._reset_visual_view()
+
+    def set_smart_cursor_enabled(self, enabled: bool) -> None:
+        if self.cursor_placement_mode == "direct":
+            return
+        self.cursor_placement_mode = "direct"
+        combo_index = self.cursor_mode_combo.findData("direct")
+        if combo_index >= 0:
+            self.cursor_mode_combo.blockSignals(True)
+            self.cursor_mode_combo.setCurrentIndex(combo_index)
+            self.cursor_mode_combo.blockSignals(False)
+        if self.pending_cursor_target is not None:
+            self._arm_cursor(self.pending_cursor_target)
+        else:
+            self.cursor_hint_label.setText(self._default_cursor_hint())
+        self._hide_smart_preview()
+
     def set_cursor_points(
         self,
         point_a: tuple[float, float],
         point_b: tuple[float, float],
         *,
         annotation_text: str | None = None,
+        channel_a: str | None = None,
+        channel_b: str | None = None,
     ) -> None:
         if self.current_waveform is None:
             return
         self.pending_cursor_target = None
         self.dragging_cursor_target = None
         self.hover_cursor_target = None
-        self.cursor_points["a"] = self._clamp_value_to_axes(point_a)
-        self.cursor_points["b"] = self._clamp_value_to_axes(point_b)
+        self.cursor_points["a"] = self._clamp_cursor_point(point_a, channel_a)
+        self.cursor_points["b"] = self._clamp_cursor_point(point_b, channel_b)
+        self.cursor_channels["a"] = channel_a
+        self.cursor_channels["b"] = channel_b
         self.lock_annotation_text = annotation_text
         self._update_cursor_readouts()
         self._refresh_cursor_graphics()
 
+    def _active_waveform(self) -> WaveformData | None:
+        if self.active_waveform_channel is not None:
+            for waveform in self.current_waveforms:
+                if waveform.channel == self.active_waveform_channel:
+                    return waveform
+        return self.current_waveform
+
+    def _set_active_waveform_channel(self, channel: str | None) -> None:
+        if channel == self.active_waveform_channel:
+            return
+        self.active_waveform_channel = channel
+        self._render_all_waveform_series()
+        self._update_view_stats_from_axes()
+        self._update_channel_comparison()
+        self._refresh_cursor_graphics()
+
+    def _ensure_default_cursors(self) -> None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
+            return
+        if "a" in self.cursor_points and "b" in self.cursor_points:
+            return
+        if not active_waveform.x_values or not active_waveform.y_values:
+            return
+
+        x_values = active_waveform.x_values
+        start_x = x_values[0]
+        end_x = x_values[-1]
+        if end_x <= start_x:
+            return
+        span = end_x - start_x
+        point_a = self._default_cursor_point(start_x + span * 0.25)
+        point_b = self._default_cursor_point(start_x + span * 0.75)
+        if point_a is None or point_b is None:
+            return
+        self.set_cursor_points(
+            self._display_cursor_point(point_a, active_waveform.channel),
+            self._display_cursor_point(point_b, active_waveform.channel),
+            channel_a=active_waveform.channel,
+            channel_b=active_waveform.channel,
+        )
+
+    def _default_cursor_point(self, x_value: float) -> tuple[float, float] | None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
+            return None
+        y_value = _interpolate_waveform_y_at_x(
+            active_waveform.x_values,
+            active_waveform.y_values,
+            x_value,
+        )
+        if y_value is None:
+            return None
+        return x_value, y_value
+
     def _update_stats(self, stats: WaveformStats) -> None:
+        unit = self._current_waveform_unit()
         self.stats_labels["point_count"].setText(str(stats.point_count))
         self.stats_labels["duration"].setText(f"{stats.duration_s:.6e} s")
         self.stats_labels["sample_period"].setText(f"{stats.sample_period_s:.6e} s")
-        self.stats_labels["vpp"].setText(f"{stats.voltage_pp:.6f} V")
-        self.stats_labels["vmin"].setText(f"{stats.voltage_min:.6f} V")
-        self.stats_labels["vmax"].setText(f"{stats.voltage_max:.6f} V")
-        self.stats_labels["mean"].setText(f"{stats.voltage_mean:.6f} V")
-        self.stats_labels["rms"].setText(f"{stats.voltage_rms:.6f} V")
+        self.stats_labels["vpp"].setText(f"{stats.voltage_pp:.6f} {unit}")
+        self.stats_labels["vmin"].setText(f"{stats.voltage_min:.6f} {unit}")
+        self.stats_labels["vmax"].setText(f"{stats.voltage_max:.6f} {unit}")
+        self.stats_labels["mean"].setText(f"{stats.voltage_mean:.6f} {unit}")
+        self.stats_labels["rms"].setText(f"{stats.voltage_rms:.6f} {unit}")
         if stats.estimated_frequency_hz is None:
             self.stats_labels["frequency"].setText("无法估算")
         else:
@@ -773,11 +952,23 @@ class WaveformAnalysisPanel(QWidget):
         self.stats_labels["fall_time"].setText(_format_optional_seconds(stats.fall_time_s))
 
     def _handle_axis_range_changed(self, minimum: float, maximum: float) -> None:
+        if self._axis_updates_suspended:
+            return
+        self._pending_axis_refresh = True
+        self._axis_refresh_timer.start(WAVEFORM_REDRAW_DEBOUNCE_MS)
+
+    def _process_axis_range_changed(self) -> None:
+        if not self._pending_axis_refresh:
+            return
+        self._pending_axis_refresh = False
+        self._render_all_waveform_series()
         self._update_view_stats_from_axes()
         self._update_channel_comparison()
+        self._refresh_cursor_graphics()
 
     def _update_view_stats_from_axes(self) -> None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             for label in self.view_stats_labels.values():
                 label.setText("-")
             for label in self.view_kpi_labels.values():
@@ -792,7 +983,7 @@ class WaveformAnalysisPanel(QWidget):
                 label.setText("-")
             return
 
-        stats = self.current_waveform.analyze_window(x_axis.min(), x_axis.max())
+        stats = active_waveform.analyze_window(x_axis.min(), x_axis.max())
         if stats is None:
             for label in self.view_stats_labels.values():
                 label.setText("不足")
@@ -800,23 +991,24 @@ class WaveformAnalysisPanel(QWidget):
                 label.setText("不足")
             return
 
+        unit = self._channel_unit(active_waveform.channel)
         self.view_stats_labels["points"].setText(str(stats.point_count))
         self.view_stats_labels["duration"].setText(f"{stats.duration_s:.6e} s")
-        self.view_stats_labels["vpp"].setText(f"{stats.voltage_pp:.6f} V")
-        self.view_stats_labels["rms"].setText(f"{stats.voltage_rms:.6f} V")
+        self.view_stats_labels["vpp"].setText(f"{stats.voltage_pp:.6f} {unit}")
+        self.view_stats_labels["rms"].setText(f"{stats.voltage_rms:.6f} {unit}")
         self.view_stats_labels["frequency"].setText(_format_optional_hz(stats.estimated_frequency_hz))
         self.view_stats_labels["pulse_width"].setText(_format_optional_seconds(stats.pulse_width_s))
         self.view_stats_labels["duty"].setText(_format_optional_percent(stats.duty_cycle))
         self.view_stats_labels["rise_time"].setText(_format_optional_seconds(stats.rise_time_s))
-        self.view_kpi_labels["vpp"].setText(f"{stats.voltage_pp:.4f} V")
+        self.view_kpi_labels["vpp"].setText(f"{stats.voltage_pp:.4f} {unit}")
         self.view_kpi_labels["frequency"].setText(_format_optional_hz(stats.estimated_frequency_hz))
         self.view_kpi_labels["pulse_width"].setText(_format_optional_seconds(stats.pulse_width_s))
-        self.view_kpi_labels["rms"].setText(f"{stats.voltage_rms:.4f} V")
+        self.view_kpi_labels["rms"].setText(f"{stats.voltage_rms:.4f} {unit}")
 
     def _populate_compare_channels(self) -> None:
         self.compare_channel_combo.blockSignals(True)
         self.compare_channel_combo.clear()
-        secondary_channels = [waveform.channel for waveform in self.current_waveforms[1:]]
+        secondary_channels = [waveform.channel for waveform in self.current_waveforms[1:] if waveform.channel in self.visible_channels]
         for channel in secondary_channels:
             self.compare_channel_combo.addItem(display_channel_name(channel), channel)
         self.compare_channel_combo.blockSignals(False)
@@ -824,7 +1016,8 @@ class WaveformAnalysisPanel(QWidget):
         self._update_channel_comparison()
 
     def _update_channel_comparison(self) -> None:
-        if len(self.current_waveforms) < 2 or self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if len(self.current_waveforms) < 2 or active_waveform is None:
             for label in self.compare_labels.values():
                 label.setText("-")
             return
@@ -845,7 +1038,7 @@ class WaveformAnalysisPanel(QWidget):
         frequency_hz = visible_stats.estimated_frequency_hz if visible_stats is not None else None
         edge_type = str(self.compare_edge_combo.currentData())
         comparison = compare_waveform_edges(
-            self.current_waveform,
+            active_waveform,
             secondary_waveform,
             self._current_x_focus(),
             edge_type,
@@ -854,12 +1047,12 @@ class WaveformAnalysisPanel(QWidget):
         if comparison is None:
             for label in self.compare_labels.values():
                 label.setText("无法估算")
-            self.compare_labels["primary_channel"].setText(display_channel_name(self.current_waveform.channel))
+            self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
             self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
             self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
             return
 
-        self.compare_labels["primary_channel"].setText(display_channel_name(self.current_waveform.channel))
+        self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
         self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
         self.compare_labels["secondary_edge"].setText(f"{comparison.secondary_time_s:.6e} s")
@@ -869,37 +1062,121 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_labels["edge_type"].setText("上升沿" if comparison.edge_type == "rising" else "下降沿")
 
     def _primary_visible_stats(self) -> WaveformStats | None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             return None
         x_axis = self._x_axis()
         if x_axis is None:
             return None
-        return self.current_waveform.analyze_window(x_axis.min(), x_axis.max())
+        return active_waveform.analyze_window(x_axis.min(), x_axis.max())
 
     def _render_all_waveform_series(self) -> None:
         for channel in self.waveform_series_map:
             self._render_waveform_series(channel)
+        self.chart.legend().setVisible(len(self.visible_channels) > 1)
+        self._refresh_chart_title()
 
     def _render_waveform_series(self, channel: str) -> None:
         series = self.waveform_series_map.get(channel)
-        points = self.waveform_decimated_map.get(channel)
+        points = self._visible_waveform_points(channel)
         if series is None or points is None:
             return
+        if channel not in self.visible_channels:
+            series.clear()
+            series.setVisible(False)
+            self.waveform_decimated_map.pop(channel, None)
+            return
+        self.waveform_decimated_map[channel] = points
         series.setPen(self._waveform_series_pen(channel))
         x_values, y_values = points
         offset = self.waveform_offsets.get(channel, 0.0)
-        series.clear()
-        for x_value, y_value in zip(x_values, y_values):
-            series.append(x_value, y_value + offset)
+        series.setVisible(True)
+        series.replace([QPointF(x_value, y_value + offset) for x_value, y_value in zip(x_values, y_values)])
 
     def _waveform_display_bounds(self) -> tuple[float, float] | None:
         all_y_values: list[float] = []
         for channel, (x_values, y_values) in self.waveform_decimated_map.items():
+            if channel not in self.visible_channels:
+                continue
             offset = self.waveform_offsets.get(channel, 0.0)
             all_y_values.extend(value + offset for value in y_values)
         if not all_y_values:
             return None
         return min(all_y_values), max(all_y_values)
+
+    def set_visible_channels(self, channels: set[str]) -> None:
+        available_channels = {waveform.channel for waveform in self.current_waveforms}
+        self.visible_channels = {channel for channel in channels if channel in available_channels}
+        if self.active_waveform_channel not in self.visible_channels:
+            self.active_waveform_channel = next(iter(self.visible_channels), None)
+        self._populate_compare_channels()
+        self._render_all_waveform_series()
+        self._refresh_cursor_graphics()
+
+    def _refresh_chart_title(self) -> None:
+        if not self.current_waveforms:
+            self.chart.setTitle("尚未加载波形")
+            return
+        axis_y = self._y_axis()
+        if axis_y is not None:
+            axis_y.setTitleText(self._axis_title_text())
+        visible_labels = []
+        for waveform in self.current_waveforms:
+            if waveform.channel not in self.visible_channels:
+                continue
+            label = display_channel_name(waveform.channel)
+            if waveform.channel == self.active_waveform_channel:
+                label = f"[{label}]"
+            visible_labels.append(label)
+        if visible_labels:
+            self.chart.setTitle(" / ".join(visible_labels) + " 波形")
+        else:
+            self.chart.setTitle("已隐藏全部通道")
+
+    def _channel_unit(self, channel: str) -> str:
+        if self.channel_unit_resolver is None:
+            return "V"
+        return str(self.channel_unit_resolver(channel) or "V")
+
+    def _current_waveform_unit(self) -> str:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
+            return "V"
+        return self._channel_unit(active_waveform.channel)
+
+    def _axis_title_text(self) -> str:
+        return "Current (A)" if self._current_waveform_unit() == "A" else "Voltage (V)"
+
+    def _format_cursor_point(self, point: tuple[float, float] | None, unit: str) -> str:
+        if point is None:
+            return "-"
+        return f"t={point[0]:.6e} s, Y={point[1]:.6f} {unit}"
+
+    def _visible_waveform_points(self, channel: str) -> tuple[list[float], list[float]] | None:
+        points = self.waveform_source_map.get(channel)
+        if points is None:
+            return None
+
+        x_values, y_values = points
+        x_axis = self._x_axis()
+        if x_axis is None:
+            return _decimate_xy_envelope(x_values, y_values, max_points=2500)
+
+        left, right = x_axis.min(), x_axis.max()
+        visible_x, visible_y = _slice_xy_by_range(x_values, y_values, left, right)
+        if not visible_x:
+            return _decimate_xy_envelope(x_values, y_values, max_points=2500)
+
+        plot_width = max(int(self.chart.plotArea().width()), 1)
+        max_points = max(plot_width * 2, 1200)
+        return _decimate_xy_envelope(visible_x, visible_y, max_points=max_points)
+
+    def _apply_render_quality(self, waveforms: list[WaveformData]) -> None:
+        should_disable_antialias = any(
+            waveform.points_mode.upper() == "RAW" and len(waveform.x_values) >= RAW_RENDER_POINT_THRESHOLD
+            for waveform in waveforms
+        )
+        self.chart_view.setRenderHint(QPainter.Antialiasing, not should_disable_antialias)
 
     def _ensure_waveform_offsets_visible(self) -> None:
         axis_y = self._y_axis()
@@ -915,24 +1192,97 @@ class WaveformAnalysisPanel(QWidget):
         padding = span * 0.05
         axis_y.setRange(min(display_min - padding, current_min), max(display_max + padding, current_max))
 
+    def _apply_scope_vertical_layouts(self) -> None:
+        if not self.current_waveforms or not self.scope_vertical_layouts:
+            return
+        primary_channel = self.current_waveform.channel if self.current_waveform is not None else self.current_waveforms[0].channel
+        primary_layout = self.scope_vertical_layouts.get(primary_channel)
+        if primary_layout is None:
+            return
+        base_scale = float(primary_layout.get("scale", 0.0) or 1.0)
+        primary_divisions = -float(primary_layout.get("offset", 0.0)) / base_scale
+        for waveform in self.current_waveforms:
+            channel = waveform.channel
+            layout = self.scope_vertical_layouts.get(channel)
+            if layout is None:
+                self.waveform_offsets[channel] = 0.0
+                continue
+            channel_scale = float(layout.get("scale", 0.0) or 1.0)
+            channel_divisions = -float(layout.get("offset", 0.0)) / channel_scale
+            self.waveform_offsets[channel] = (channel_divisions - primary_divisions) * base_scale
+        self._render_all_waveform_series()
+        self._ensure_waveform_offsets_visible()
+
     def _arm_cursor(self, cursor_name: str) -> None:
         if self.current_waveform is None:
             self.cursor_hint_label.setText("请先抓取或加载波形，再设置游标。")
             return
         self.pending_cursor_target = cursor_name
-        self.cursor_hint_label.setText(f"正在设置游标 {cursor_name.upper()}：请在图上左键单击目标位置。")
+        self.cursor_hint_label.setText(f"请在图上右键菜单中选择“设置/更新游标 {cursor_name.upper()}”。")
 
-    def _handle_chart_click(self, x_value: float, y_value: float, position) -> bool:
-        if self.pending_cursor_target is None or self.current_waveform is None:
+    def _handle_chart_click(self, x_value: float, y_value: float, position, modifiers, button) -> bool:
+        if self.current_waveform is None:
             return False
+        target_waveform = self._waveform_for_cursor_position(x_value, y_value, position)
+        target_channel = target_waveform.channel if target_waveform is not None else None
+        if target_channel is not None:
+            self._set_active_waveform_channel(target_channel)
+        return False
 
-        self.cursor_points[self.pending_cursor_target] = self._clamp_value_to_axes((x_value, y_value))
+    def _cursor_to_place_or_update(self, x_value: float, y_value: float) -> str:
+        point_a = self.cursor_points.get("a")
+        point_b = self.cursor_points.get("b")
+        if point_a is None:
+            return "a"
+        if point_b is None:
+            return "b"
+        distance_a = abs(point_a[0] - x_value) + abs(point_a[1] - y_value)
+        distance_b = abs(point_b[0] - x_value) + abs(point_b[1] - y_value)
+        return "a" if distance_a <= distance_b else "b"
+
+    def _show_chart_context_menu(self, position) -> None:
+        if self.current_waveform is None:
+            return
+        plot_position = QPointF(position)
+        plot_area = self.chart.plotArea()
+        if not plot_area.contains(plot_position):
+            return
+
+        mapped = self.chart.mapToValue(plot_position.toPoint())
+        target_waveform = self._waveform_for_cursor_position(mapped.x(), mapped.y(), plot_position)
+        target_channel = target_waveform.channel if target_waveform is not None else None
+        if target_channel is not None:
+            self._set_active_waveform_channel(target_channel)
+
+        menu = QMenu(self)
+        action_a = menu.addAction("设置/更新游标 A")
+        action_b = menu.addAction("设置/更新游标 B")
+        menu.addSeparator()
+        locate_a = menu.addAction("定位 A")
+        locate_b = menu.addAction("定位 B")
+        menu.addSeparator()
+        clear_action = menu.addAction("清除游标")
+
+        selected = menu.exec(self.chart_view.mapToGlobal(position))
+        if selected == action_a:
+            self._place_cursor_at("a", mapped.x(), mapped.y(), target_channel)
+        elif selected == action_b:
+            self._place_cursor_at("b", mapped.x(), mapped.y(), target_channel)
+        elif selected == locate_a:
+            self._locate_cursor("a")
+        elif selected == locate_b:
+            self._locate_cursor("b")
+        elif selected == clear_action:
+            self._clear_cursors()
+
+    def _place_cursor_at(self, cursor_name: str, x_value: float, y_value: float, channel: str | None) -> None:
+        self.cursor_points[cursor_name] = self._clamp_cursor_point((x_value, y_value), channel)
+        self.cursor_channels[cursor_name] = channel
         self.lock_annotation_text = None
         self.pending_cursor_target = None
-        self.cursor_hint_label.setText(self._default_cursor_hint())
+        self.cursor_hint_label.setText(f"已设置游标 {cursor_name.upper()}。{self._default_cursor_hint()}")
         self._update_cursor_readouts()
         self._refresh_cursor_graphics()
-        return True
 
     def _handle_chart_drag_start(self, x_value: float, y_value: float, position) -> bool:
         if self.pending_cursor_target is not None:
@@ -965,10 +1315,11 @@ class WaveformAnalysisPanel(QWidget):
             if self.dragging_waveform_channel is None:
                 return False
             channel = self.dragging_waveform_channel
+            unit = self._channel_unit(channel)
             self.waveform_offsets[channel] = self.waveform_drag_initial_offset + (y_value - self.waveform_drag_anchor_y)
             self._render_waveform_series(channel)
             self.cursor_hint_label.setText(
-                f"正在拖动 {display_channel_name(channel)}，显示偏移 {self.waveform_offsets[channel]:+.4f} V。"
+                f"正在拖动 {display_channel_name(channel)}，显示偏移 {self.waveform_offsets[channel]:+.4f} {unit}。"
             )
             return True
 
@@ -979,7 +1330,10 @@ class WaveformAnalysisPanel(QWidget):
 
         next_x = x_value if "x" in axis_mode else point[0]
         next_y = y_value if "y" in axis_mode else point[1]
-        self.cursor_points[cursor_name] = self._clamp_value_to_axes((next_x, next_y))
+        self.cursor_points[cursor_name] = self._clamp_cursor_point(
+            (next_x, next_y),
+            self.cursor_channels.get(cursor_name),
+        )
         self.lock_annotation_text = None
         self._update_cursor_readouts()
         self._refresh_cursor_graphics()
@@ -1003,11 +1357,26 @@ class WaveformAnalysisPanel(QWidget):
             )
             self._refresh_cursor_graphics()
 
+    def _locate_cursor(self, cursor_name: str) -> None:
+        point = self.cursor_points.get(cursor_name)
+        if point is None:
+            self.cursor_hint_label.setText(f"游标 {cursor_name.upper()} 尚未放置。")
+            return
+        channel = self.cursor_channels.get(cursor_name)
+        raw_point = self._raw_cursor_point(point, channel)
+        if raw_point is None:
+            self.cursor_hint_label.setText(f"游标 {cursor_name.upper()} 尚未放置。")
+            return
+        self._center_view_on_point(raw_point, channel=channel)
+        self._refresh_cursor_graphics()
+        self.cursor_hint_label.setText(f"已定位到游标 {cursor_name.upper()}。")
+
     def _clear_cursors(self) -> None:
         self.pending_cursor_target = None
         self.dragging_cursor_target = None
         self.hover_cursor_target = None
         self.cursor_points.clear()
+        self.cursor_channels.clear()
         self.lock_annotation_text = None
         self.cursor_hint_label.setText(self._default_cursor_hint())
         for key in ("a", "b"):
@@ -1018,47 +1387,172 @@ class WaveformAnalysisPanel(QWidget):
             self.cursor_mode_items[key].setVisible(False)
         self.lock_annotation_line.setVisible(False)
         self.lock_annotation_text_item.setVisible(False)
+        self.smart_preview_item.setVisible(False)
+        self.smart_preview_label.setVisible(False)
         for label in self.cursor_labels.values():
             label.setText("-")
 
     def _update_cursor_readouts(self) -> None:
         point_a = self.cursor_points.get("a")
         point_b = self.cursor_points.get("b")
-        self.cursor_labels["a"].setText(_format_cursor_point(point_a))
-        self.cursor_labels["b"].setText(_format_cursor_point(point_b))
+        raw_point_a = self._raw_cursor_point(point_a, self.cursor_channels.get("a"))
+        raw_point_b = self._raw_cursor_point(point_b, self.cursor_channels.get("b"))
+        unit_a = self._channel_unit(self.cursor_channels.get("a")) if self.cursor_channels.get("a") is not None else self._current_waveform_unit()
+        unit_b = self._channel_unit(self.cursor_channels.get("b")) if self.cursor_channels.get("b") is not None else self._current_waveform_unit()
+        self.cursor_labels["a"].setText(self._format_cursor_point(raw_point_a, unit_a))
+        self.cursor_labels["b"].setText(self._format_cursor_point(raw_point_b, unit_b))
+        self._update_cursor_visibility_hint()
 
-        if point_a is None or point_b is None:
+        if raw_point_a is None or raw_point_b is None:
             self.cursor_labels["dt"].setText("-")
             self.cursor_labels["dv"].setText("-")
             self.cursor_labels["slope"].setText("-")
             self.cursor_labels["frequency"].setText("-")
             return
 
-        dt_value = point_b[0] - point_a[0]
-        dv_value = point_b[1] - point_a[1]
+        dt_value = raw_point_b[0] - raw_point_a[0]
+        dv_value = raw_point_b[1] - raw_point_a[1]
         self.cursor_labels["dt"].setText(f"{dt_value:.6e} s")
-        self.cursor_labels["dv"].setText(f"{dv_value:.6f} V")
+        dv_unit = unit_a if unit_a == unit_b else f"{unit_a}/{unit_b}"
+        self.cursor_labels["dv"].setText(f"{dv_value:.6f} {dv_unit}")
         if dt_value == 0:
             self.cursor_labels["slope"].setText("无穷大")
             self.cursor_labels["frequency"].setText("无法估算")
         else:
-            self.cursor_labels["slope"].setText(f"{(dv_value / dt_value):.6e} V/s")
+            self.cursor_labels["slope"].setText(f"{(dv_value / dt_value):.6e} {dv_unit}/s")
             self.cursor_labels["frequency"].setText(f"{(1.0 / abs(dt_value)):.6f} Hz")
 
+    def _update_cursor_visibility_hint(self) -> None:
+        if self.pending_cursor_target is not None or self.dragging_cursor_target is not None:
+            return
+        invisible: list[str] = []
+        for cursor_name in ("a", "b"):
+            point = self.cursor_points.get(cursor_name)
+            if point is None:
+                continue
+            if not self._point_visible_in_axes(point):
+                invisible.append(cursor_name.upper())
+        if not invisible:
+            return
+        joined = " / ".join(invisible)
+        self.cursor_hint_label.setText(f"游标 {joined} 在当前视图外，可点“定位 A/B”跳回，或直接重新设置。")
+
+    def _update_cursor_mode(self, index: int) -> None:
+        self.cursor_placement_mode = "direct"
+        if self.pending_cursor_target is not None:
+            self._arm_cursor(self.pending_cursor_target)
+
+    def _nearest_smart_point(
+        self,
+        x_hint: float,
+        waveform: WaveformData | None = None,
+    ) -> tuple[float, float] | None:
+        target_waveform = waveform or self._active_waveform()
+        if target_waveform is None:
+            return None
+
+        candidates: list[tuple[float, float]] = []
+        for edge_type in ("rising", "falling"):
+            edge = target_waveform.snap_to_edge(x_hint, edge_type)
+            if edge is not None:
+                candidates.append(edge)
+
+        pulse = target_waveform.find_nearest_pulse(x_hint)
+        if pulse is not None:
+            candidates.extend([pulse.rising_edge, pulse.falling_edge])
+
+        period = target_waveform.find_nearest_period(x_hint, edge_type="rising")
+        if period is not None:
+            candidates.extend([period.start_edge, period.end_edge])
+
+        sample_point = self._nearest_sample_extreme(x_hint, target_waveform)
+        if sample_point is not None:
+            candidates.append(sample_point)
+
+        if not candidates:
+            return None
+        return min(candidates, key=lambda point: abs(point[0] - x_hint))
+
+    def _nearest_sample_extreme(
+        self,
+        x_hint: float,
+        waveform: WaveformData | None = None,
+    ) -> tuple[float, float] | None:
+        target_waveform = waveform or self._active_waveform()
+        if target_waveform is None or not target_waveform.x_values:
+            return None
+
+        x_values = target_waveform.x_values
+        y_values = target_waveform.y_values
+        point_count = min(len(x_values), len(y_values))
+        nearest_index = min(range(point_count), key=lambda index: abs(x_values[index] - x_hint))
+        left = max(0, nearest_index - 20)
+        right = min(point_count, nearest_index + 21)
+        window = list(zip(x_values[left:right], y_values[left:right]))
+        if not window:
+            return None
+        peak = max(window, key=lambda item: abs(item[1]))
+        return peak
+
+    def _smart_place_pulse_window(self, x_hint: float, waveform: WaveformData | None = None) -> bool:
+        target_waveform = waveform or self._active_waveform()
+        if target_waveform is None:
+            return False
+        pulse = target_waveform.find_nearest_pulse(x_hint)
+        if pulse is None:
+            self.cursor_hint_label.setText("当前附近没有完整脉冲可供智能放置。")
+            return False
+        channel = target_waveform.channel
+        self.cursor_points["a"] = self._clamp_cursor_point(self._display_cursor_point(pulse.rising_edge, channel), channel)
+        self.cursor_points["b"] = self._clamp_cursor_point(self._display_cursor_point(pulse.falling_edge, channel), channel)
+        self.cursor_channels["a"] = channel
+        self.cursor_channels["b"] = channel
+        self.pending_cursor_target = None
+        self.lock_annotation_text = "Pulse Window"
+        self.cursor_hint_label.setText("已按最近脉冲自动放置 A/B 游标。")
+        self._hide_smart_preview()
+        self._update_cursor_readouts()
+        self._refresh_cursor_graphics()
+        return True
+
+    def _smart_place_period_window(self, x_hint: float, waveform: WaveformData | None = None) -> bool:
+        target_waveform = waveform or self._active_waveform()
+        if target_waveform is None:
+            return False
+        period = target_waveform.find_nearest_period(x_hint, edge_type="rising")
+        if period is None:
+            self.cursor_hint_label.setText("当前附近没有完整周期可供智能放置。")
+            return False
+        channel = target_waveform.channel
+        self.cursor_points["a"] = self._clamp_cursor_point(self._display_cursor_point(period.start_edge, channel), channel)
+        self.cursor_points["b"] = self._clamp_cursor_point(self._display_cursor_point(period.end_edge, channel), channel)
+        self.cursor_channels["a"] = channel
+        self.cursor_channels["b"] = channel
+        self.pending_cursor_target = None
+        self.lock_annotation_text = "Period Window"
+        self.cursor_hint_label.setText("已按最近周期自动放置 A/B 游标。")
+        self._hide_smart_preview()
+        self._update_cursor_readouts()
+        self._refresh_cursor_graphics()
+        return True
+
     def _snap_cursor_to_edge(self, cursor_name: str, edge_type: str) -> None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             self.cursor_hint_label.setText("请先抓取或加载波形，再吸附边沿。")
             return
 
         base_point = self.cursor_points.get(cursor_name)
         x_hint = base_point[0] if base_point is not None else self._current_x_focus()
-        snapped_point = self.current_waveform.snap_to_edge(x_hint, edge_type)
+        snapped_point = active_waveform.snap_to_edge(x_hint, edge_type)
         if snapped_point is None:
             edge_label = "上升沿" if edge_type == "rising" else "下降沿"
             self.cursor_hint_label.setText(f"当前波形没有可用的{edge_label}。")
             return
 
-        self.cursor_points[cursor_name] = snapped_point
+        channel = active_waveform.channel
+        self.cursor_points[cursor_name] = self._clamp_cursor_point(self._display_cursor_point(snapped_point, channel), channel)
+        self.cursor_channels[cursor_name] = channel
         self.lock_annotation_text = None
         self.cursor_hint_label.setText(
             f"游标 {cursor_name.upper()} 已吸附到最近{'上升沿' if edge_type == 'rising' else '下降沿'}。"
@@ -1067,51 +1561,63 @@ class WaveformAnalysisPanel(QWidget):
         self._refresh_cursor_graphics()
 
     def _lock_nearest_pulse(self) -> None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             self.cursor_hint_label.setText("请先抓取或加载波形，再锁定脉冲。")
             return
 
-        pulse = self.current_waveform.find_nearest_pulse(self._current_x_focus())
+        pulse = active_waveform.find_nearest_pulse(self._current_x_focus())
         if pulse is None:
             self.cursor_hint_label.setText("当前波形没有检测到完整脉冲。")
             return
 
-        self.cursor_points["a"] = pulse.rising_edge
-        self.cursor_points["b"] = pulse.falling_edge
+        channel = active_waveform.channel
+        self.cursor_points["a"] = self._clamp_cursor_point(self._display_cursor_point(pulse.rising_edge, channel), channel)
+        self.cursor_points["b"] = self._clamp_cursor_point(self._display_cursor_point(pulse.falling_edge, channel), channel)
+        self.cursor_channels["a"] = channel
+        self.cursor_channels["b"] = channel
         self.lock_annotation_text = "Pulse Window"
         self.cursor_hint_label.setText("已锁定最近完整脉冲，A/B 游标已自动对齐。")
         self._update_cursor_readouts()
         self._refresh_cursor_graphics()
 
     def _lock_nearest_period(self) -> None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             self.cursor_hint_label.setText("请先抓取或加载波形，再锁定周期。")
             return
 
-        period = self.current_waveform.find_nearest_period(self._current_x_focus(), edge_type="rising")
+        period = active_waveform.find_nearest_period(self._current_x_focus(), edge_type="rising")
         if period is None:
             self.cursor_hint_label.setText("当前波形没有检测到完整周期。")
             return
 
-        self.cursor_points["a"] = period.start_edge
-        self.cursor_points["b"] = period.end_edge
+        channel = active_waveform.channel
+        self.cursor_points["a"] = self._clamp_cursor_point(self._display_cursor_point(period.start_edge, channel), channel)
+        self.cursor_points["b"] = self._clamp_cursor_point(self._display_cursor_point(period.end_edge, channel), channel)
+        self.cursor_channels["a"] = channel
+        self.cursor_channels["b"] = channel
         self.lock_annotation_text = "Period Window"
         self.cursor_hint_label.setText("已锁定最近完整周期，A/B 游标已对齐到相邻上升沿。")
         self._update_cursor_readouts()
         self._refresh_cursor_graphics()
 
     def _smart_lock_window(self) -> None:
-        if self.current_waveform is None:
+        active_waveform = self._active_waveform()
+        if active_waveform is None:
             self.cursor_hint_label.setText("请先抓取或加载波形，再执行智能锁定。")
             return
 
-        recommendation = self.current_waveform.recommend_lock_window(self._current_x_focus())
+        recommendation = active_waveform.recommend_lock_window(self._current_x_focus())
         if recommendation is None:
             self.cursor_hint_label.setText("当前波形没有检测到可锁定的完整周期或脉冲。")
             return
 
-        self.cursor_points["a"] = recommendation.start_edge
-        self.cursor_points["b"] = recommendation.end_edge
+        channel = active_waveform.channel
+        self.cursor_points["a"] = self._clamp_cursor_point(self._display_cursor_point(recommendation.start_edge, channel), channel)
+        self.cursor_points["b"] = self._clamp_cursor_point(self._display_cursor_point(recommendation.end_edge, channel), channel)
+        self.cursor_channels["a"] = channel
+        self.cursor_channels["b"] = channel
         self.lock_annotation_text = "Period Window" if recommendation.mode == "period" else "Pulse Window"
         self.cursor_hint_label.setText(recommendation.description)
         self._update_cursor_readouts()
@@ -1124,6 +1630,80 @@ class WaveformAnalysisPanel(QWidget):
                 return 0.0
             return (self.current_waveform.x_values[0] + self.current_waveform.x_values[-1]) / 2
         return (x_axis.min() + x_axis.max()) / 2
+
+    def set_timebase_scale(self, seconds_per_div: float, *, divisions: int = 10) -> None:
+        if self.current_waveform is None or not self.current_waveform.x_values:
+            return
+        if seconds_per_div <= 0 or divisions <= 0:
+            return
+
+        x_axis = self._x_axis()
+        if x_axis is None:
+            return
+
+        full_start = self.current_waveform.x_values[0]
+        full_end = self.current_waveform.x_values[-1]
+        span = seconds_per_div * divisions
+        if full_end <= full_start:
+            return
+        if span >= (full_end - full_start):
+            x_axis.setRange(full_start, full_end)
+            return
+
+        target_end = min(full_start + span, full_end)
+        x_axis.setRange(full_start, target_end)
+
+    def set_scope_vertical_layouts(self, layouts: dict[str, dict[str, float]]) -> None:
+        self.scope_vertical_layouts = dict(layouts)
+        self._apply_scope_vertical_layouts()
+
+    def focus_on_point(self, point: tuple[float, float], *, annotation_text: str | None = None) -> None:
+        self.focus_on_channel_point(point, channel=None, annotation_text=annotation_text)
+
+    def focus_on_channel_point(
+        self,
+        point: tuple[float, float],
+        *,
+        channel: str | None,
+        annotation_text: str | None = None,
+    ) -> None:
+        self._center_view_on_point(point, channel=channel)
+        display_point = self._display_cursor_point(point, channel)
+        self.set_cursor_points(
+            display_point,
+            display_point,
+            annotation_text=annotation_text,
+            channel_a=channel,
+            channel_b=channel,
+        )
+
+    def _center_view_on_point(
+        self,
+        point: tuple[float, float],
+        *,
+        channel: str | None,
+    ) -> None:
+        if self.current_waveform is None or not self.current_waveform.x_values:
+            return
+        x_axis = self._x_axis()
+        y_axis = self._y_axis()
+        display_point = self._display_cursor_point(point, channel)
+        if x_axis is not None:
+            full_start = self.current_waveform.x_values[0]
+            full_end = self.current_waveform.x_values[-1]
+            current_span = max(x_axis.max() - x_axis.min(), 1e-9)
+            half_span = current_span / 2
+            next_min = max(point[0] - half_span, full_start)
+            next_max = min(point[0] + half_span, full_end)
+            if next_max - next_min < current_span:
+                if next_min <= full_start:
+                    next_max = min(full_start + current_span, full_end)
+                else:
+                    next_min = max(full_end - current_span, full_start)
+            x_axis.setRange(next_min, next_max)
+        if y_axis is not None:
+            span = max(y_axis.max() - y_axis.min(), 1e-9)
+            y_axis.setRange(display_point[1] - span / 2, display_point[1] + span / 2)
 
     def _reset_visual_view(self) -> None:
         self.chart_view.reset_view()
@@ -1146,18 +1726,54 @@ class WaveformAnalysisPanel(QWidget):
                 return axis
         return None
 
-    def _clamp_value_to_axes(self, point: tuple[float, float]) -> tuple[float, float]:
-        x_axis = self._x_axis()
-        y_axis = self._y_axis()
+    def _clamp_value_to_waveform(self, point: tuple[float, float]) -> tuple[float, float]:
+        if self.current_waveform is None:
+            return point
+
         x_value, y_value = point
-        if x_axis is not None:
-            x_value = min(max(x_value, x_axis.min()), x_axis.max())
-        if y_axis is not None:
-            y_value = min(max(y_value, y_axis.min()), y_axis.max())
+        if self.current_waveform.x_values:
+            x_value = min(max(x_value, self.current_waveform.x_values[0]), self.current_waveform.x_values[-1])
+        if self.current_waveform.y_values:
+            y_min = min(self.current_waveform.y_values)
+            y_max = max(self.current_waveform.y_values)
+            y_value = min(max(y_value, y_min), y_max)
         return x_value, y_value
 
-    def _display_point_for_cursor(self, point: tuple[float, float]) -> tuple[float, float]:
-        return self._clamp_value_to_axes(point)
+    def _clamp_cursor_point(self, point: tuple[float, float], channel: str | None) -> tuple[float, float]:
+        if self.current_waveform is None:
+            return point
+        if channel is None:
+            return self._clamp_value_to_waveform(point)
+
+        x_value, y_value = point
+        if self.current_waveform.x_values:
+            x_value = min(max(x_value, self.current_waveform.x_values[0]), self.current_waveform.x_values[-1])
+        return x_value, y_value
+
+    def _point_visible_in_axes(self, point: tuple[float, float]) -> bool:
+        x_axis = self._x_axis()
+        y_axis = self._y_axis()
+        if x_axis is not None and not (x_axis.min() <= point[0] <= x_axis.max()):
+            return False
+        if y_axis is not None and not (y_axis.min() <= point[1] <= y_axis.max()):
+            return False
+        return True
+
+    def _display_cursor_point(self, point: tuple[float, float], channel: str | None) -> tuple[float, float]:
+        if channel is None:
+            return point
+        return point[0], point[1] + self.waveform_offsets.get(channel, 0.0)
+
+    def _raw_cursor_point(
+        self,
+        point: tuple[float, float] | None,
+        channel: str | None,
+    ) -> tuple[float, float] | None:
+        if point is None:
+            return None
+        if channel is None:
+            return point
+        return point[0], point[1] - self.waveform_offsets.get(channel, 0.0)
 
     def _refresh_cursor_graphics(self) -> None:
         plot_area = self.chart.plotArea()
@@ -1174,7 +1790,8 @@ class WaveformAnalysisPanel(QWidget):
 
         for key, color_name in (("a", "A"), ("b", "B")):
             point = self.cursor_points.get(key)
-            if point is None:
+            channel = self.cursor_channels.get(key)
+            if point is None or not self._point_visible_in_axes(point):
                 self.cursor_line_items[key].setVisible(False)
                 self.cursor_hline_items[key].setVisible(False)
                 self.cursor_handle_items[key].setVisible(False)
@@ -1189,8 +1806,7 @@ class WaveformAnalysisPanel(QWidget):
                 active_mode = self.hover_cursor_target[1]
             self.cursor_line_items[key].setPen(self._cursor_pen(key, "x", active_mode))
             self.cursor_hline_items[key].setPen(self._cursor_pen(key, "y", active_mode))
-            display_point = self._display_point_for_cursor(point)
-            position = self.chart.mapToPosition(QPointF(display_point[0], display_point[1]), self.waveform_series)
+            position = self.chart.mapToPosition(QPointF(point[0], point[1]), self.waveform_series)
             self.cursor_line_items[key].setLine(position.x(), plot_area.top(), position.x(), plot_area.bottom())
             self.cursor_hline_items[key].setLine(plot_area.left(), position.y(), plot_area.right(), position.y())
             handle_radius = 6 if active_mode == "xy" else 5
@@ -1205,7 +1821,10 @@ class WaveformAnalysisPanel(QWidget):
             self.cursor_line_items[key].setVisible(True)
             self.cursor_hline_items[key].setVisible(True)
             self.cursor_handle_items[key].setVisible(True)
-            self.cursor_text_items[key].setText(f"{color_name}\nt={point[0]:.3e}\nV={point[1]:.3f}")
+            unit = self._channel_unit(channel) if channel is not None else self._current_waveform_unit()
+            raw_point = self._raw_cursor_point(point, channel)
+            y_text = raw_point[1] if raw_point is not None else point[1]
+            self.cursor_text_items[key].setText(f"{color_name}\nt={point[0]:.3e}\nY={y_text:.3f} {unit}")
             label_x = min(position.x() + 6, plot_area.right() - 90)
             label_y = max(min(position.y() - 30, plot_area.bottom() - 48), plot_area.top() + 6)
             if key == "b":
@@ -1225,12 +1844,15 @@ class WaveformAnalysisPanel(QWidget):
         if point_a is None or point_b is None or self.lock_annotation_text is None:
             self.lock_annotation_line.setVisible(False)
             self.lock_annotation_text_item.setVisible(False)
+            self._hide_smart_preview()
+            return
+        if not self._point_visible_in_axes(point_a) or not self._point_visible_in_axes(point_b):
+            self.lock_annotation_line.setVisible(False)
+            self.lock_annotation_text_item.setVisible(False)
             return
 
-        display_point_a = self._display_point_for_cursor(point_a)
-        display_point_b = self._display_point_for_cursor(point_b)
-        position_a = self.chart.mapToPosition(QPointF(display_point_a[0], display_point_a[1]), self.waveform_series)
-        position_b = self.chart.mapToPosition(QPointF(display_point_b[0], display_point_b[1]), self.waveform_series)
+        position_a = self.chart.mapToPosition(QPointF(point_a[0], point_a[1]), self.waveform_series)
+        position_b = self.chart.mapToPosition(QPointF(point_b[0], point_b[1]), self.waveform_series)
         left_x = min(position_a.x(), position_b.x())
         right_x = max(position_a.x(), position_b.x())
         annotation_y = plot_area.bottom() - 18
@@ -1257,8 +1879,9 @@ class WaveformAnalysisPanel(QWidget):
             point = self.cursor_points.get(key)
             if point is None:
                 continue
-            display_point = self._display_point_for_cursor(point)
-            mapped = self.chart.mapToPosition(QPointF(display_point[0], display_point[1]), self.waveform_series)
+            if not self._point_visible_in_axes(point):
+                continue
+            mapped = self.chart.mapToPosition(QPointF(point[0], point[1]), self.waveform_series)
             dx = abs(position.x() - mapped.x())
             dy = abs(position.y() - mapped.y())
             if dx <= 8 and dy <= 8:
@@ -1274,7 +1897,7 @@ class WaveformAnalysisPanel(QWidget):
         return key, mode
 
     def _waveform_drag_target_at(self, position) -> str | None:
-        if len(self.current_waveforms) < 2:
+        if not self.current_waveforms:
             return None
         plot_area = self.chart.plotArea()
         if plot_area.isEmpty() or not plot_area.contains(position):
@@ -1284,8 +1907,10 @@ class WaveformAnalysisPanel(QWidget):
         cursor_x = cursor_value.x()
         cursor_y = cursor_value.y()
         hit_candidates: list[tuple[float, str]] = []
-        for waveform in self.current_waveforms[1:]:
+        for waveform in self.current_waveforms:
             channel = waveform.channel
+            if channel not in self.visible_channels:
+                continue
             points = self.waveform_decimated_map.get(channel)
             if points is None:
                 continue
@@ -1293,16 +1918,76 @@ class WaveformAnalysisPanel(QWidget):
             if interpolated_y is None:
                 continue
             display_y = interpolated_y + self.waveform_offsets.get(channel, 0.0)
-            distance = abs(cursor_y - display_y)
-            if distance <= 0.18:
-                hit_candidates.append((distance, channel))
+            mapped = self.chart.mapToPosition(QPointF(cursor_x, display_y), self.waveform_series)
+            distance_px = abs(position.y() - mapped.y())
+            if distance_px <= 12:
+                hit_candidates.append((distance_px, channel))
 
         if not hit_candidates:
             return None
         _, channel = min(hit_candidates, key=lambda item: item[0])
         return channel
 
+    def _waveform_for_cursor_position(self, x_value: float, y_value: float, position) -> WaveformData | None:
+        target_channel = self._waveform_drag_target_at(position)
+        if target_channel is None:
+            nearest_channel = self._nearest_channel_at_x(x_value, y_value)
+            target_channel = nearest_channel
+        if target_channel is None:
+            return self._active_waveform()
+        return next((waveform for waveform in self.current_waveforms if waveform.channel == target_channel), self._active_waveform())
+
+    def _nearest_channel_at_x(self, x_value: float, y_value: float) -> str | None:
+        best_match: tuple[float, str] | None = None
+        for waveform in self.current_waveforms:
+            channel = waveform.channel
+            if channel not in self.visible_channels:
+                continue
+            points = self.waveform_source_map.get(channel)
+            if points is None:
+                continue
+            interpolated_y = _interpolate_waveform_y_at_x(points[0], points[1], x_value)
+            if interpolated_y is None:
+                continue
+            display_y = interpolated_y + self.waveform_offsets.get(channel, 0.0)
+            distance = abs(display_y - y_value)
+            if best_match is None or distance < best_match[0]:
+                best_match = (distance, channel)
+        return None if best_match is None else best_match[1]
+
+    def _crosshair_label_text(self, x_value: float, y_value: float) -> str:
+        lines = [f"t={x_value:.6e} s"]
+        appended = False
+        for waveform in self.current_waveforms:
+            channel = waveform.channel
+            if channel not in self.visible_channels:
+                continue
+            points = self.waveform_source_map.get(channel)
+            if points is None:
+                continue
+            interpolated_y = _interpolate_waveform_y_at_x(points[0], points[1], x_value)
+            if interpolated_y is None:
+                continue
+            unit = self._channel_unit(channel)
+            lines.append(f"{display_channel_name(channel)}={interpolated_y:.6f} {unit}".strip())
+            appended = True
+        if not appended:
+            lines.append(f"Y={y_value:.6f} {self._current_waveform_unit()}")
+        return "\n".join(lines)
+
+    def _channel_unit(self, channel: str) -> str:
+        if self.channel_unit_resolver is not None:
+            resolved = self.channel_unit_resolver(channel)
+            if resolved:
+                return resolved
+        return "V"
+
     def _hover_cursor_shape(self, position) -> Qt.CursorShape:
+        if self.dragging_waveform_channel is None:
+            hover_channel = self._waveform_drag_target_at(position)
+            if hover_channel is not None and hover_channel != self.hover_waveform_channel:
+                self.hover_waveform_channel = hover_channel
+                self._refresh_cursor_graphics()
         target = self.dragging_cursor_target or self._cursor_drag_target_at(position)
         if target != self.hover_cursor_target:
             self.hover_cursor_target = target
@@ -1334,6 +2019,53 @@ class WaveformAnalysisPanel(QWidget):
             return Qt.SizeVerCursor
         return Qt.SizeAllCursor
 
+    def _update_smart_preview(self, position) -> None:
+        if (
+            self.current_waveform is None
+            or self.pending_cursor_target is None
+            or self.cursor_placement_mode != "smart"
+            or self.waveform_series is None
+        ):
+            self._hide_smart_preview()
+            return
+
+        plot_area = self.chart.plotArea()
+        if plot_area.isEmpty() or not plot_area.contains(position):
+            self._hide_smart_preview()
+            return
+
+        mapped = self.chart.mapToValue(position.toPoint())
+        target_waveform = self._waveform_for_cursor_position(mapped.x(), mapped.y(), position)
+        preview_point = self._nearest_smart_point(mapped.x(), target_waveform)
+        if preview_point is None:
+            self._hide_smart_preview()
+            return
+
+        preview_channel = target_waveform.channel if target_waveform is not None else None
+        display_preview_point = self._display_cursor_point(preview_point, preview_channel)
+        preview_position = self.chart.mapToPosition(QPointF(display_preview_point[0], display_preview_point[1]), self.waveform_series)
+        radius = 6
+        self.smart_preview_item.setRect(
+            preview_position.x() - radius,
+            preview_position.y() - radius,
+            radius * 2,
+            radius * 2,
+        )
+        self.smart_preview_item.setVisible(True)
+        preview_name = display_channel_name(preview_channel) if preview_channel is not None else "当前通道"
+        self.smart_preview_label.setText(f"预判 {preview_name}\n t={preview_point[0]:.3e}")
+        self.smart_preview_label.setPos(
+            QPointF(
+                min(preview_position.x() + 8, plot_area.right() - 72),
+                max(preview_position.y() - 28, plot_area.top() + 4),
+            )
+        )
+        self.smart_preview_label.setVisible(True)
+
+    def _hide_smart_preview(self) -> None:
+        self.smart_preview_item.setVisible(False)
+        self.smart_preview_label.setVisible(False)
+
     def _cursor_pen(self, key: str, axis: str, active_mode: str | None) -> QPen:
         color = QColor("#1f77b4" if key == "a" else "#ff7f0e")
         pen = QPen(color)
@@ -1354,7 +2086,7 @@ class WaveformAnalysisPanel(QWidget):
         return f"{key.upper()}-{active_mode.upper()}"
 
     def _default_cursor_hint(self) -> str:
-        return "提示：点击“设置游标 A/B”后，在图上单击放置；拖动竖线改时间，拖动横线改电压，拖动交点同时改两者；叠加通道可上下拖动分离显示。"
+        return "提示：在图上右键放置或更新游标；拖动竖线改时间，拖动横线改电压，拖动交点同时改两者；叠加通道可上下拖动分离显示。"
 
     def _reset_waveform_offsets(self) -> None:
         self._clear_waveform_offsets(update_hint=True)
@@ -1374,10 +2106,13 @@ class WaveformAnalysisPanel(QWidget):
         color_index = channels.index(channel) if channel in channels else 0
         color = QColor(WAVEFORM_SERIES_COLORS[color_index % len(WAVEFORM_SERIES_COLORS)])
         pen = QPen(color)
-        is_active = channel == self.dragging_waveform_channel or channel == self.hover_waveform_channel
-        pen.setWidth(4 if is_active else 2)
-        if is_active:
+        is_hovered = channel == self.dragging_waveform_channel or channel == self.hover_waveform_channel
+        is_active = channel == self.active_waveform_channel
+        pen.setWidth(5 if is_hovered else (4 if is_active else 2))
+        if is_hovered:
             pen.setColor(color.lighter(115))
+        elif is_active:
+            pen.setColor(color.lighter(108))
         return pen
 
     def _export_chart_image(self) -> None:
@@ -1405,18 +2140,61 @@ class WaveformAnalysisPanel(QWidget):
         else:
             QMessageBox.critical(self, "导出失败", f"无法保存波形图到 {output_path}")
 
-def _decimate_xy(x_values: list[float], y_values: list[float], max_points: int) -> tuple[list[float], list[float]]:
+def _decimate_xy_envelope(x_values: list[float], y_values: list[float], max_points: int) -> tuple[list[float], list[float]]:
     point_count = min(len(x_values), len(y_values))
     if point_count <= max_points:
         return x_values[:point_count], y_values[:point_count]
 
-    step = max(point_count // max_points, 1)
-    reduced_x = x_values[::step]
-    reduced_y = y_values[::step]
+    bucket_count = max(max_points // 2, 1)
+    bucket_size = max((point_count + bucket_count - 1) // bucket_count, 1)
+    reduced_x: list[float] = []
+    reduced_y: list[float] = []
+
+    for bucket_start in range(0, point_count, bucket_size):
+        bucket_end = min(bucket_start + bucket_size, point_count)
+        bucket_x = x_values[bucket_start:bucket_end]
+        bucket_y = y_values[bucket_start:bucket_end]
+        if not bucket_x:
+            continue
+        min_index = min(range(len(bucket_y)), key=bucket_y.__getitem__)
+        max_index = max(range(len(bucket_y)), key=bucket_y.__getitem__)
+        for index in sorted({min_index, max_index}):
+            reduced_x.append(bucket_x[index])
+            reduced_y.append(bucket_y[index])
+
+    if not reduced_x or reduced_x[0] != x_values[0]:
+        reduced_x.insert(0, x_values[0])
+        reduced_y.insert(0, y_values[0])
     if reduced_x[-1] != x_values[point_count - 1]:
         reduced_x.append(x_values[point_count - 1])
         reduced_y.append(y_values[point_count - 1])
     return reduced_x, reduced_y
+
+
+def _slice_xy_by_range(
+    x_values: list[float],
+    y_values: list[float],
+    start_x: float,
+    end_x: float,
+) -> tuple[list[float], list[float]]:
+    point_count = min(len(x_values), len(y_values))
+    if point_count == 0:
+        return [], []
+
+    left = min(start_x, end_x)
+    right = max(start_x, end_x)
+    start_index = 0
+    while start_index < point_count and x_values[start_index] < left:
+        start_index += 1
+    end_index = start_index
+    while end_index < point_count and x_values[end_index] <= right:
+        end_index += 1
+
+    if start_index > 0:
+        start_index -= 1
+    if end_index < point_count:
+        end_index += 1
+    return x_values[start_index:end_index], y_values[start_index:end_index]
 
 
 def _interpolate_waveform_y_at_x(x_values: list[float], y_values: list[float], x_value: float) -> float | None:

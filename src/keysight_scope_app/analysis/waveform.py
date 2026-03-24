@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import math
+import statistics
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -540,35 +542,24 @@ class WaveformData:
         if hold_time_s < 0:
             raise ValueError("保持时间不能为负数。")
 
+        threshold_margin = min(flat_threshold, zero_threshold * 0.1) if zero_threshold >= 0.2 else 0.0
+        effective_zero_threshold = zero_threshold + threshold_margin
         point_count = min(len(self.x_values), len(self.y_values))
         start_index = 0
         while start_index < point_count and self.x_values[start_index] < start_time:
             start_index += 1
 
-        for left in range(start_index, point_count):
-            left_value = self.y_values[left]
-            if abs(left_value) > zero_threshold:
-                continue
-
-            min_value = left_value
-            max_value = left_value
-            max_abs_value = abs(left_value)
-            for right in range(left, point_count):
-                value = self.y_values[right]
-                min_value = min(min_value, value)
-                max_value = max(max_value, value)
-                max_abs_value = max(max_abs_value, abs(value))
-                if max_abs_value > zero_threshold or (max_value - min_value) > flat_threshold:
-                    break
-                duration_s = self.x_values[right] - self.x_values[left]
-                if duration_s >= hold_time_s:
-                    return ZeroStableWindow(
-                        start_time_s=self.x_values[left],
-                        confirmed_time_s=self.x_values[right],
-                        max_abs_value=max_abs_value,
-                        span_value=max_value - min_value,
-                    )
-        return None
+        return _find_stable_window(
+            self.x_values,
+            self.y_values,
+            start_index=start_index,
+            target_level=0.0,
+            abs_threshold=effective_zero_threshold,
+            flat_threshold=flat_threshold,
+            hold_time_s=hold_time_s,
+            relaxed_mean_abs_limit=max(flat_threshold * 2.0, zero_threshold * 0.25),
+            relaxed_std_limit=max(flat_threshold, zero_threshold * 0.5),
+        )
 
     def find_previous_edge(
         self,
@@ -576,6 +567,7 @@ class WaveformData:
         *,
         count: int = 1,
         edge_type: str = "rising",
+        threshold_ratio: float = 0.5,
     ) -> tuple[float, float] | None:
         if not self.x_values or not self.y_values:
             return None
@@ -584,7 +576,7 @@ class WaveformData:
         if edge_type not in {"rising", "falling"}:
             raise ValueError(f"不支持的边沿类型: {edge_type}")
 
-        threshold = _edge_threshold(self.y_values, edge_type=edge_type, threshold_ratio=0.5)
+        threshold = _edge_threshold(self.y_values, edge_type=edge_type, threshold_ratio=threshold_ratio)
         crossings = [
             crossing
             for crossing in _find_crossings(self.x_values, self.y_values, threshold, edge_type)
@@ -610,6 +602,95 @@ class WaveformData:
 
         peak_time, peak_value = max(candidates, key=lambda item: (abs(item[1]), -item[0]))
         return SignalPeak(time_s=peak_time, value=peak_value, absolute_value=abs(peak_value))
+
+
+def _find_stable_window(
+    x_values: list[float],
+    y_values: list[float],
+    *,
+    start_index: int,
+    target_level: float,
+    abs_threshold: float,
+    flat_threshold: float,
+    hold_time_s: float,
+    relaxed_mean_abs_limit: float | None = None,
+    relaxed_std_limit: float | None = None,
+) -> ZeroStableWindow | None:
+    point_count = min(len(x_values), len(y_values))
+    if start_index >= point_count:
+        return None
+
+    prefix_sum = [0.0]
+    prefix_sum_sq = [0.0]
+    for value in y_values[:point_count]:
+        prefix_sum.append(prefix_sum[-1] + value)
+        prefix_sum_sq.append(prefix_sum_sq[-1] + value * value)
+
+    min_queue: deque[int] = deque()
+    max_queue: deque[int] = deque()
+    dev_queue: deque[int] = deque()
+    right = start_index - 1
+
+    def _push(index: int) -> None:
+        value = y_values[index]
+        while min_queue and y_values[min_queue[-1]] >= value:
+            min_queue.pop()
+        min_queue.append(index)
+        while max_queue and y_values[max_queue[-1]] <= value:
+            max_queue.pop()
+        max_queue.append(index)
+        deviation = abs(value - target_level)
+        while dev_queue and abs(y_values[dev_queue[-1]] - target_level) <= deviation:
+            dev_queue.pop()
+        dev_queue.append(index)
+
+    for left in range(start_index, point_count):
+        if right < left:
+            right = left
+            min_queue.clear()
+            max_queue.clear()
+            dev_queue.clear()
+            _push(right)
+
+        while right < point_count and (x_values[right] - x_values[left]) < hold_time_s:
+            right += 1
+            if right >= point_count:
+                break
+            _push(right)
+        if right >= point_count:
+            break
+
+        while min_queue and min_queue[0] < left:
+            min_queue.popleft()
+        while max_queue and max_queue[0] < left:
+            max_queue.popleft()
+        while dev_queue and dev_queue[0] < left:
+            dev_queue.popleft()
+
+        max_abs_value = abs(y_values[dev_queue[0]] - target_level)
+        span_value = y_values[max_queue[0]] - y_values[min_queue[0]]
+        if max_abs_value <= abs_threshold:
+            if span_value <= flat_threshold:
+                return ZeroStableWindow(
+                    start_time_s=x_values[left],
+                    confirmed_time_s=x_values[right],
+                    max_abs_value=max_abs_value,
+                    span_value=span_value,
+                )
+            if relaxed_mean_abs_limit is not None and relaxed_std_limit is not None:
+                sample_count = right - left + 1
+                window_sum = prefix_sum[right + 1] - prefix_sum[left]
+                window_sum_sq = prefix_sum_sq[right + 1] - prefix_sum_sq[left]
+                mean_value = window_sum / sample_count
+                variance = max((window_sum_sq / sample_count) - (mean_value * mean_value), 0.0)
+                if abs(mean_value - target_level) <= relaxed_mean_abs_limit and math.sqrt(variance) <= relaxed_std_limit:
+                    return ZeroStableWindow(
+                        start_time_s=x_values[left],
+                        confirmed_time_s=x_values[right],
+                        max_abs_value=max_abs_value,
+                        span_value=span_value,
+                    )
+    return None
 
 
 def _find_crossings(x_values: list[float], y_values: list[float], threshold: float, edge_type: str) -> list[float]:

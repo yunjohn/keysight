@@ -35,13 +35,14 @@ from keysight_scope_app.device.instrument import (
     MEASUREMENT_DEFINITIONS,
     SUPPORTED_CHANNELS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
+    ChannelVerticalLayout,
     KeysightOscilloscope,
     list_visa_resources,
 )
 from keysight_scope_app.infra.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
 from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
-from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog, WaveformOnlyDialog
 from keysight_scope_app.ui.helpers import display_channel_name, normalize_channel_name
 from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
 
@@ -56,6 +57,16 @@ MEASUREMENT_TEMPLATES = {
     "纹波模板": {"峰峰值", "均方根", "最大值", "最小值"},
     "边沿模板": {"最大值", "最小值", "高电平估计", "低电平估计", "上升时间", "下降时间"},
 }
+WAVEFORM_MODE_HINTS = {
+    "NORMal": "NORMal：常规模式，抓取速度和点数比较均衡，适合日常查看波形。",
+    "MAXimum": "MAXimum：尽量返回更多显示细节，适合比 NORMal 更关注局部波形时使用。",
+    "RAW": "RAW：尽量读取更接近原始采样内存的数据，点数更多，适合启动刹车、边沿和局部放大分析。",
+}
+WAVEFORM_MODE_DEFAULT_POINTS = {
+    "NORMal": 2000,
+    "MAXimum": 10000,
+    "RAW": 20000,
+}
 
 class ScopeMainWindow(QMainWindow):
     def __init__(self) -> None:
@@ -65,12 +76,18 @@ class ScopeMainWindow(QMainWindow):
         self.task_runner = BackgroundTaskRunner()
         self.log_lines: list[str] = []
         self.measurement_checks: dict[str, QCheckBox] = {}
-        self.overlay_channel_checks: dict[str, QCheckBox] = {}
+        self.scope_display_checks: dict[str, QCheckBox] = {}
+        self.channel_units: dict[str, str] = {channel: "V" for channel in SUPPORTED_CHANNELS}
+        self.channel_vertical_layouts: dict[str, dict[str, float]] = {}
+        self._connect_request_id = 0
+        self._updating_scope_display_checks = False
+        self._waveform_mode_max_points_hint = ""
         self.last_capture_path: Path | None = None
         self.last_waveform_bundle: list[WaveformData] = []
         self.last_waveform_data: WaveformData | None = None
         self.last_waveform_stats: WaveformStats | None = None
         self.waveform_detail_dialog = WaveformDetailDialog(self)
+        self.waveform_only_dialog = WaveformOnlyDialog(self)
 
         self.setWindowTitle("Keysight 示波器助手")
         self.resize(1480, 920)
@@ -214,6 +231,7 @@ class ScopeMainWindow(QMainWindow):
         waveform_row = QHBoxLayout()
         self.waveform_mode_combo = QComboBox()
         self.waveform_mode_combo.addItems(SUPPORTED_WAVEFORM_POINTS_MODES)
+        self.waveform_mode_combo.currentTextChanged.connect(self._on_waveform_mode_changed)
         self.waveform_points_input = QDoubleSpinBox()
         self.waveform_points_input.setDecimals(0)
         self.waveform_points_input.setRange(100, 500000)
@@ -235,14 +253,20 @@ class ScopeMainWindow(QMainWindow):
         waveform_row.addStretch(1)
         measure_layout.addLayout(waveform_row)
 
-        overlay_row = QHBoxLayout()
-        overlay_row.addWidget(QLabel("叠加通道"))
+        self.waveform_mode_hint_label = QLabel("")
+        self.waveform_mode_hint_label.setWordWrap(True)
+        measure_layout.addWidget(self.waveform_mode_hint_label)
+
+        scope_display_row = QHBoxLayout()
+        scope_display_row.addWidget(QLabel("示波器通道"))
         for channel in SUPPORTED_CHANNELS:
             checkbox = QCheckBox(display_channel_name(channel))
-            self.overlay_channel_checks[channel] = checkbox
-            overlay_row.addWidget(checkbox)
-        overlay_row.addStretch(1)
-        measure_layout.addLayout(overlay_row)
+            checkbox.setEnabled(False)
+            checkbox.toggled.connect(lambda checked=False, target_channel=channel: self._toggle_scope_channel_display(target_channel, checked))
+            self.scope_display_checks[channel] = checkbox
+            scope_display_row.addWidget(checkbox)
+        scope_display_row.addStretch(1)
+        measure_layout.addLayout(scope_display_row)
 
         self.waveform_summary = QLabel("波形状态：尚未抓取")
         self.waveform_summary.setWordWrap(True)
@@ -293,16 +317,17 @@ class ScopeMainWindow(QMainWindow):
         waveform_box = self._group_box("波形分析")
         waveform_layout = QVBoxLayout(waveform_box)
         waveform_toolbar = QHBoxLayout()
-        self.detach_waveform_button = QPushButton("独立显示")
         self.sync_waveform_button = QPushButton("同步到独立窗")
+        self.popup_waveform_button = QPushButton("波形弹窗")
         self.open_startup_brake_button = QPushButton("启动刹车测试")
-        waveform_toolbar.addWidget(self.detach_waveform_button)
         waveform_toolbar.addWidget(self.sync_waveform_button)
+        waveform_toolbar.addWidget(self.popup_waveform_button)
         waveform_toolbar.addWidget(self.open_startup_brake_button)
         waveform_toolbar.addStretch(1)
         waveform_layout.addLayout(waveform_toolbar)
 
         self.waveform_panel = WaveformAnalysisPanel(self, compact_mode=True)
+        self.waveform_panel.channel_unit_resolver = self._channel_unit
         waveform_layout.addWidget(self.waveform_panel)
         right_panel.addWidget(waveform_box, 1)
 
@@ -320,17 +345,16 @@ class ScopeMainWindow(QMainWindow):
         self.stop_button.clicked.connect(self.stop_scope)
         self.capture_button.clicked.connect(self.capture_screenshot)
         self.resource_combo.activated.connect(self._resource_selected)
-        self.channel_combo.currentTextChanged.connect(lambda _: self._refresh_overlay_channel_checks())
         self.select_default_button.clicked.connect(self._select_default_measurements)
         self.select_all_button.clicked.connect(self._select_all_measurements)
         self.clear_selection_button.clicked.connect(self._clear_measurements)
         self.fetch_waveform_button.clicked.connect(self.fetch_waveform)
         self.load_waveform_button.clicked.connect(self.load_waveform_csv)
         self.export_waveform_button.clicked.connect(self.export_waveform_csv)
-        self.detach_waveform_button.clicked.connect(self.show_waveform_detail_dialog)
         self.sync_waveform_button.clicked.connect(self.sync_waveform_detail_dialog)
+        self.popup_waveform_button.clicked.connect(self.sync_waveform_only_dialog)
         self.open_startup_brake_button.clicked.connect(self.show_startup_brake_dialog)
-        self._refresh_overlay_channel_checks()
+        self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
         self._stabilize_push_buttons(self)
         self._normalize_label_alignment(self)
         self._update_measurement_count()
@@ -403,6 +427,8 @@ class ScopeMainWindow(QMainWindow):
             self._show_warning("请先刷新资源并选择一个示波器地址。")
             return
 
+        self._connect_request_id += 1
+        connect_request_id = self._connect_request_id
         self.log(f"正在连接设备: {resource_name}")
 
         def task() -> tuple[KeysightOscilloscope, str]:
@@ -415,7 +441,12 @@ class ScopeMainWindow(QMainWindow):
                 scope.disconnect()
                 raise
 
-        self._run_task(task, on_success=self._on_connected, success_message="设备连接成功。")
+        self._run_task(
+            task,
+            on_success=self._on_connected,
+            success_message="设备连接成功。",
+            ui_guard=lambda request_id=connect_request_id: request_id == self._connect_request_id,
+        )
 
     def _on_connected(self, result: tuple[KeysightOscilloscope, str]) -> None:
         if self.scope is not None:
@@ -431,6 +462,20 @@ class ScopeMainWindow(QMainWindow):
         self.measurement_status.setText("自动测量：未启动")
         self._refresh_auto_measure_button()
         self.log(f"实际连接地址: {self.scope.resource_name}")
+        self._set_scope_display_check_enabled(True)
+        self._run_task(
+            self.scope.get_channel_units,
+            on_success=self._update_channel_units,
+            success_message="通道单位识别完成。",
+            ui_guard=self._scope_ui_guard(self.scope),
+        )
+        self._run_task(
+            lambda: self._get_scope_display_context(self.scope),
+            on_success=self._on_scope_displayed_channels_loaded,
+            success_message="示波器通道同步完成。",
+            ui_guard=self._scope_ui_guard(self.scope),
+        )
+        self._request_waveform_mode_capability_hint(self.waveform_mode_combo.currentText())
 
     def disconnect_scope(self) -> None:
         self.stop_auto_measurement(log_message=False)
@@ -439,10 +484,17 @@ class ScopeMainWindow(QMainWindow):
 
         scope = self.scope
         self.scope = None
+        self._connect_request_id += 1
         self.last_waveform_data = None
         self.last_waveform_bundle = []
         self.last_waveform_stats = None
+        self.channel_units = {channel: "V" for channel in SUPPORTED_CHANNELS}
+        self.channel_vertical_layouts = {}
         self.export_waveform_button.setEnabled(False)
+        self._set_scope_display_check_enabled(False)
+        self._update_scope_display_checks([])
+        self._waveform_mode_max_points_hint = ""
+        self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
         self.status_value.setText("未连接")
         self.idn_value.setText("-")
         self.measurement_status.setText("自动测量：未启动")
@@ -457,31 +509,35 @@ class ScopeMainWindow(QMainWindow):
         scope = self._get_scope_or_warn()
         if scope is None:
             return
-        self._run_task(scope.get_system_error, on_success=lambda error: self.log(f"SYST:ERR -> {error}"))
+        self._run_task(
+            scope.get_system_error,
+            on_success=lambda error: self.log(f"SYST:ERR -> {error}"),
+            ui_guard=self._scope_ui_guard(scope),
+        )
 
     def autoscale(self) -> None:
         scope = self._get_scope_or_warn()
         if scope is None:
             return
-        self._run_task(scope.autoscale, success_message="AUToscale 已执行。")
+        self._run_task(scope.autoscale, success_message="AUToscale 已执行。", ui_guard=self._scope_ui_guard(scope))
 
     def run_scope(self) -> None:
         scope = self._get_scope_or_warn()
         if scope is None:
             return
-        self._run_task(scope.run, success_message="示波器已进入 RUN。")
+        self._run_task(scope.run, success_message="示波器已进入 RUN。", ui_guard=self._scope_ui_guard(scope))
 
     def single_acquire(self) -> None:
         scope = self._get_scope_or_warn()
         if scope is None:
             return
-        self._run_task(scope.single, success_message="示波器已进入 SINGLE 单次采集。")
+        self._run_task(scope.single, success_message="示波器已进入 SINGLE 单次采集。", ui_guard=self._scope_ui_guard(scope))
 
     def stop_scope(self) -> None:
         scope = self._get_scope_or_warn()
         if scope is None:
             return
-        self._run_task(scope.stop, success_message="示波器已停止采集。")
+        self._run_task(scope.stop, success_message="示波器已停止采集。", ui_guard=self._scope_ui_guard(scope))
 
     def run_single_measurement(self) -> None:
         scope = self._get_scope_or_warn()
@@ -493,12 +549,11 @@ class ScopeMainWindow(QMainWindow):
             self._show_warning("请至少勾选一个测量项。")
             return
 
-        channel = self._selected_channel()
-        self.log(f"执行单次测量: {channel} / {', '.join(measurement_names)}")
         self._run_task(
-            lambda: scope.fetch_measurements(channel, measurement_names),
-            on_success=self._update_measurements,
+            lambda: self._sync_scope_channels_and_fetch_measurements(scope, measurement_names),
+            on_success=self._on_measurements_fetched_with_scope_sync,
             success_message="单次测量完成。",
+            ui_guard=self._scope_ui_guard(scope),
         )
 
     def start_auto_measurement(self) -> None:
@@ -512,16 +567,17 @@ class ScopeMainWindow(QMainWindow):
             return
 
         self.stop_auto_measurement(log_message=False)
-        channel = self._selected_channel()
         interval = max(self.interval_input.value(), 0.2)
-        self.log(f"自动测量已启动，间隔 {interval:.1f}s。")
-        self.measurement_status.setText(f"自动测量：运行中 ({interval:.1f}s)")
-        self._refresh_auto_measure_button()
-        self.auto_measure_handle = self.task_runner.run_repeating(
-            lambda: scope.fetch_measurements(channel, measurement_names),
-            interval_s=interval,
-            on_result=self._update_measurements,
-            on_error=self._handle_auto_measurement_error,
+        self._run_task(
+            lambda: self._get_scope_display_context(scope),
+            on_success=lambda context, captured_scope=scope, captured_names=measurement_names, captured_interval=interval: self._start_auto_measurement_with_scope_sync(
+                captured_scope,
+                captured_names,
+                captured_interval,
+                context,
+            ),
+            success_message="自动测量通道同步完成。",
+            ui_guard=self._scope_ui_guard(scope),
         )
 
     def stop_auto_measurement(self, log_message: bool = True) -> None:
@@ -551,6 +607,7 @@ class ScopeMainWindow(QMainWindow):
             lambda: scope.capture_screenshot(target),
             on_success=self._on_screenshot_saved,
             success_message="截图保存成功。",
+            ui_guard=self._scope_ui_guard(scope),
         )
 
     def _on_screenshot_saved(self, image_path: Path) -> None:
@@ -564,15 +621,74 @@ class ScopeMainWindow(QMainWindow):
         if scope is None:
             return
 
-        channels = self._selected_waveform_channels()
         points_mode = self.waveform_mode_combo.currentText()
         points = int(self.waveform_points_input.value())
-        self.log(f"开始抓取波形: {', '.join(display_channel_name(channel) for channel in channels)}, {points_mode}, {points} 点。")
+        self.log(f"开始同步示波器当前显示通道并抓取波形: {points_mode}, {points} 点。")
         self._run_task(
-            lambda: [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels],
-            on_success=self._on_waveforms_fetched,
+            lambda: self._fetch_waveforms_from_scope_display(scope, points_mode, points),
+            on_success=self._on_scope_waveforms_fetched,
             success_message="波形抓取完成。",
+            ui_guard=self._scope_ui_guard(scope),
         )
+
+    def refresh_waveform_detail_dialog(self) -> None:
+        self.waveform_detail_dialog.show()
+        self.waveform_detail_dialog.raise_()
+        self.waveform_detail_dialog.activateWindow()
+        self.fetch_waveform()
+
+    def _fetch_waveforms_from_scope_display(
+        self,
+        scope: KeysightOscilloscope,
+        points_mode: str,
+        points: int,
+    ) -> tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData]]:
+        channels, channel_units, channel_vertical_layouts = self._get_scope_display_context(scope)
+        if not channels:
+            raise RuntimeError("示波器当前没有打开的通道，无法抓取波形。")
+        waveforms = [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels]
+        return channels, channel_units, channel_vertical_layouts, waveforms
+
+    def _on_scope_waveforms_fetched(self, result: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData]]) -> None:
+        channels, channel_units, channel_vertical_layouts, waveforms = result
+        supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
+        self._update_channel_units(channel_units, log_message=False)
+        self._update_channel_vertical_layouts(channel_vertical_layouts)
+        requested_points = int(self.waveform_points_input.value())
+        returned_points = ", ".join(
+            f"{display_channel_name(waveform.channel)}={len(waveform.y_values)}"
+            for waveform in waveforms
+        )
+        self.log(f"波形点数: 请求 {requested_points}，返回 {returned_points}")
+        if supported_channels:
+            primary_channel = self._apply_scope_displayed_channels(supported_channels, log_prefix="抓取前已同步示波器显示通道")
+            waveforms = self._reorder_waveforms_for_primary_channel(waveforms, primary_channel)
+        self._on_waveforms_fetched(waveforms)
+
+    def sync_scope_displayed_channels(self) -> None:
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+
+        self.log("正在同步示波器当前显示通道。")
+        self._run_task(
+            lambda: self._get_scope_display_context(scope),
+            on_success=self._on_scope_displayed_channels_loaded,
+            success_message="示波器通道同步完成。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def _on_scope_displayed_channels_loaded(self, context: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout]]) -> None:
+        channels, channel_units, channel_vertical_layouts = context
+        supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
+        self._update_scope_display_checks(supported_channels)
+        if not supported_channels:
+            self._show_warning("示波器当前没有打开的通道。")
+            return
+
+        self._update_channel_units(channel_units, log_message=False)
+        self._update_channel_vertical_layouts(channel_vertical_layouts)
+        self._apply_scope_displayed_channels(supported_channels, log_prefix="已同步示波器显示通道")
 
     def export_waveform_csv(self) -> None:
         if not self.last_waveform_bundle:
@@ -633,25 +749,60 @@ class ScopeMainWindow(QMainWindow):
         self.preview_label.setPixmap(scaled)
 
     def _on_waveforms_fetched(self, waveforms: list[WaveformData]) -> None:
+        self._apply_fetched_waveforms(
+            waveforms,
+            sync_detail_dialog=self.waveform_detail_dialog.isVisible(),
+            notify_startup_dialog=True,
+            preserve_main_panel_view=False,
+        )
+
+    def _apply_fetched_waveforms(
+        self,
+        waveforms: list[WaveformData],
+        *,
+        sync_detail_dialog: bool,
+        notify_startup_dialog: bool,
+        preserve_main_panel_view: bool,
+    ) -> None:
         if not waveforms:
             return
+        main_panel_view_state = self.waveform_panel.capture_view_state() if preserve_main_panel_view else None
+        preferred_primary_channel = None
+        if preserve_main_panel_view:
+            selected_channel = self._selected_channel()
+            available_channels = {waveform.channel for waveform in waveforms}
+            if selected_channel in available_channels:
+                preferred_primary_channel = selected_channel
+                waveforms = self._reorder_waveforms_for_primary_channel(list(waveforms), preferred_primary_channel)
         primary_waveform = waveforms[0]
         self.last_waveform_bundle = list(waveforms)
         self.last_waveform_data = primary_waveform
         self.last_waveform_stats = primary_waveform.analyze()
-        self.startup_brake_dialog.handle_waveforms_updated()
-        self._sync_waveform_channel_selection(waveforms)
+        if notify_startup_dialog:
+            self.startup_brake_dialog.handle_waveforms_updated()
+        if preserve_main_panel_view and preferred_primary_channel is not None:
+            self._update_scope_display_checks([waveform.channel for waveform in waveforms if waveform.channel in SUPPORTED_CHANNELS])
+        else:
+            self._sync_waveform_channel_selection(waveforms)
         self.export_waveform_button.setEnabled(True)
         self.waveform_summary.setText(
             "波形状态："
             f"{' + '.join(display_channel_name(waveform.channel) for waveform in waveforms)} / {primary_waveform.points_mode} / "
             f"主通道 {display_channel_name(primary_waveform.channel)} / {len(primary_waveform.x_values)} 点 / "
             f"时间跨度 {self.last_waveform_stats.duration_s:.6e}s / "
-            f"电压范围 {self.last_waveform_stats.voltage_min:.4f}V ~ {self.last_waveform_stats.voltage_max:.4f}V"
+            f"{self._waveform_range_label(primary_waveform.channel)} "
+            f"{self.last_waveform_stats.voltage_min:.4f}{self._channel_unit(primary_waveform.channel)} ~ "
+            f"{self.last_waveform_stats.voltage_max:.4f}{self._channel_unit(primary_waveform.channel)}"
         )
         self.waveform_panel.set_waveforms(waveforms, self.last_waveform_stats)
-        if self.waveform_detail_dialog.isVisible():
-            self.waveform_detail_dialog.set_waveforms(waveforms, self.last_waveform_stats)
+        if self.channel_vertical_layouts:
+            self.waveform_panel.set_scope_vertical_layouts(self.channel_vertical_layouts)
+        if preserve_main_panel_view:
+            self.waveform_panel.restore_view_state(main_panel_view_state)
+        if sync_detail_dialog:
+            self.sync_waveform_detail_dialog()
+        if self.waveform_only_dialog.isVisible():
+            self.sync_waveform_only_dialog()
 
     def _on_waveform_exported(self, csv_path: Path) -> None:
         self.waveform_summary.setText(f"波形状态：已导出 {csv_path}")
@@ -660,12 +811,19 @@ class ScopeMainWindow(QMainWindow):
     def _reset_waveform_visuals(self) -> None:
         self.waveform_panel.clear()
         self.waveform_detail_dialog.clear()
+        self.waveform_only_dialog.clear()
 
     def show_waveform_detail_dialog(self) -> None:
         self.waveform_detail_dialog.show()
         self.waveform_detail_dialog.raise_()
         self.waveform_detail_dialog.activateWindow()
         self.sync_waveform_detail_dialog()
+
+    def show_waveform_only_dialog(self) -> None:
+        self.waveform_only_dialog.show()
+        self.waveform_only_dialog.raise_()
+        self.waveform_only_dialog.activateWindow()
+        self.sync_waveform_only_dialog()
 
     def show_startup_brake_dialog(self) -> None:
         self.startup_brake_dialog.show_dialog()
@@ -675,9 +833,22 @@ class ScopeMainWindow(QMainWindow):
             self._show_warning("当前还没有波形数据可同步。")
             return
         self.waveform_detail_dialog.set_waveforms(self.last_waveform_bundle, self.last_waveform_stats)
+        if self.channel_vertical_layouts:
+            self.waveform_detail_dialog.set_scope_vertical_layouts(self.channel_vertical_layouts)
         self.waveform_detail_dialog.show()
         self.waveform_detail_dialog.raise_()
         self.waveform_detail_dialog.activateWindow()
+
+    def sync_waveform_only_dialog(self) -> None:
+        if not self.last_waveform_bundle or self.last_waveform_stats is None:
+            self._show_warning("当前还没有波形数据可同步。")
+            return
+        self.waveform_only_dialog.set_waveforms(self.last_waveform_bundle, self.last_waveform_stats)
+        if self.channel_vertical_layouts:
+            self.waveform_only_dialog.set_scope_vertical_layouts(self.channel_vertical_layouts)
+        self.waveform_only_dialog.show()
+        self.waveform_only_dialog.raise_()
+        self.waveform_only_dialog.activateWindow()
 
     def _update_measurements(self, results) -> None:
         updated_at = datetime.now().strftime("%H:%M:%S")
@@ -722,41 +893,63 @@ class ScopeMainWindow(QMainWindow):
         self._update_measurement_count()
         self.log(f"已应用测量模板: {template_name}")
 
+    def _refresh_waveform_mode_hint(self, mode: str) -> None:
+        hint = WAVEFORM_MODE_HINTS.get(mode, "")
+        if self._waveform_mode_max_points_hint:
+            hint = f"{hint}\n{self._waveform_mode_max_points_hint}" if hint else self._waveform_mode_max_points_hint
+        self.waveform_mode_combo.setToolTip(hint)
+        self.waveform_mode_hint_label.setText(hint)
+
+    def _on_waveform_mode_changed(self, mode: str) -> None:
+        default_points = WAVEFORM_MODE_DEFAULT_POINTS.get(mode)
+        if default_points is not None:
+            self.waveform_points_input.setValue(default_points)
+        self._waveform_mode_max_points_hint = ""
+        self._refresh_waveform_mode_hint(mode)
+        self._request_waveform_mode_capability_hint(mode)
+
+    def _request_waveform_mode_capability_hint(self, mode: str) -> None:
+        scope = self.scope
+        if scope is None or not scope.is_connected:
+            return
+        self._run_task(
+            lambda captured_scope=scope, captured_mode=mode: self._query_waveform_mode_capability_hint(captured_scope, captured_mode),
+            on_success=self._apply_waveform_mode_capability_hint,
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def _query_waveform_mode_capability_hint(
+        self,
+        scope: KeysightOscilloscope,
+        mode: str,
+    ) -> tuple[str, str]:
+        channels = scope.get_displayed_channels()
+        if not channels:
+            channels = [self._selected_channel()]
+        primary_channel = self._choose_primary_channel_from_displayed(channels)
+        max_points = scope.get_max_waveform_points(primary_channel, points_mode=mode)
+        return mode, f"当前示波器该模式可接受点数上限约为 {max_points} 点（基于 {display_channel_name(primary_channel)} 查询）"
+
+    def _apply_waveform_mode_capability_hint(self, result: tuple[str, str]) -> None:
+        mode, hint = result
+        if self.waveform_mode_combo.currentText() != mode:
+            return
+        self._waveform_mode_max_points_hint = hint
+        self._refresh_waveform_mode_hint(mode)
+
     def _selected_measurements(self) -> list[str]:
         return [name for name, checkbox in self.measurement_checks.items() if checkbox.isChecked()]
-
-    def _selected_waveform_channels(self) -> list[str]:
-        primary_channel = self._selected_channel()
-        channels = [primary_channel]
-        for channel, checkbox in self.overlay_channel_checks.items():
-            if channel == primary_channel:
-                continue
-            if checkbox.isChecked():
-                channels.append(channel)
-        return channels
-
-    def _refresh_overlay_channel_checks(self, selected_channels: set[str] | None = None) -> None:
-        primary_channel = self._selected_channel()
-        for channel, checkbox in self.overlay_channel_checks.items():
-            is_primary = channel == primary_channel
-            checkbox.blockSignals(True)
-            if is_primary:
-                checkbox.setChecked(False)
-            elif selected_channels is not None:
-                checkbox.setChecked(channel in selected_channels)
-            checkbox.setEnabled(not is_primary)
-            checkbox.blockSignals(False)
 
     def _sync_waveform_channel_selection(self, waveforms: list[WaveformData]) -> None:
         supported_channels = [waveform.channel for waveform in waveforms if waveform.channel in SUPPORTED_CHANNELS]
         if not supported_channels:
             return
 
-        primary_channel = supported_channels[0]
+        primary_channel = self._choose_primary_channel_from_displayed(supported_channels)
         self.channel_combo.blockSignals(True)
         self._set_selected_channel(primary_channel)
         self.channel_combo.blockSignals(False)
-        self._refresh_overlay_channel_checks(set(supported_channels[1:]))
+        self._update_scope_display_checks(supported_channels)
 
     def _selected_channel(self) -> str:
         current = self.channel_combo.currentData()
@@ -769,24 +962,196 @@ class ScopeMainWindow(QMainWindow):
         if index >= 0:
             self.channel_combo.setCurrentIndex(index)
 
+    def _choose_primary_channel_from_displayed(self, channels: list[str]) -> str:
+        selected_channel = self._selected_channel()
+        if selected_channel in channels:
+            return selected_channel
+        return channels[0]
+
+    def _reorder_waveforms_for_primary_channel(
+        self,
+        waveforms: list[WaveformData],
+        primary_channel: str,
+    ) -> list[WaveformData]:
+        primary_waveforms = [waveform for waveform in waveforms if waveform.channel == primary_channel]
+        if not primary_waveforms:
+            return waveforms
+        return primary_waveforms + [waveform for waveform in waveforms if waveform.channel != primary_channel]
+
+    def _apply_scope_displayed_channels(self, channels: list[str], *, log_prefix: str) -> str:
+        primary_channel = self._choose_primary_channel_from_displayed(channels)
+        self.channel_combo.blockSignals(True)
+        self._set_selected_channel(primary_channel)
+        self.channel_combo.blockSignals(False)
+        self._update_scope_display_checks(channels)
+        self.log(
+            f"{log_prefix}: " + ", ".join(display_channel_name(channel) for channel in channels)
+        )
+        return primary_channel
+
+    def _get_scope_display_context(
+        self,
+        scope: KeysightOscilloscope,
+    ) -> tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout]]:
+        channels = scope.get_displayed_channels()
+        channel_units = scope.get_channel_units(channels)
+        channel_vertical_layouts = scope.get_channel_vertical_layouts(channels)
+        return channels, channel_units, channel_vertical_layouts
+
+    def _sync_scope_channels_and_fetch_measurements(
+        self,
+        scope: KeysightOscilloscope,
+        measurement_names: list[str],
+    ):
+        channels, channel_units, channel_vertical_layouts = self._get_scope_display_context(scope)
+        if not channels:
+            raise RuntimeError("示波器当前没有打开的通道，无法执行测量。")
+        measurement_channel = self._choose_primary_channel_from_displayed(channels)
+        results = scope.fetch_measurements(measurement_channel, measurement_names)
+        return channels, channel_units, channel_vertical_layouts, results
+
+    def _on_measurements_fetched_with_scope_sync(self, result) -> None:
+        channels, channel_units, channel_vertical_layouts, measurements = result
+        supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
+        self._update_channel_units(channel_units, log_message=False)
+        self._update_channel_vertical_layouts(channel_vertical_layouts)
+        if supported_channels:
+            primary_channel = self._apply_scope_displayed_channels(
+                supported_channels,
+                log_prefix="测量前已同步示波器显示通道",
+            )
+            self.log(f"执行单次测量: {display_channel_name(primary_channel)}")
+        self._update_measurements(measurements)
+
+    def _start_auto_measurement_with_scope_sync(
+        self,
+        scope: KeysightOscilloscope,
+        measurement_names: list[str],
+        interval: float,
+        context: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout]],
+    ) -> None:
+        channels, channel_units, channel_vertical_layouts = context
+        supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
+        if not supported_channels:
+            self._show_warning("示波器当前没有打开的通道，无法启动自动测量。")
+            return
+
+        self._update_channel_units(channel_units, log_message=False)
+        self._update_channel_vertical_layouts(channel_vertical_layouts)
+        channel = self._apply_scope_displayed_channels(
+            supported_channels,
+            log_prefix="自动测量前已同步示波器显示通道",
+        )
+        self.log(f"自动测量已启动，主通道 {display_channel_name(channel)}，间隔 {interval:.1f}s。")
+        self.measurement_status.setText(f"自动测量：运行中 ({interval:.1f}s)")
+        self.auto_measure_handle = self.task_runner.run_repeating(
+            lambda: self._sync_scope_channels_and_fetch_measurements(scope, measurement_names),
+            interval_s=interval,
+            on_result=self._on_auto_measurements_fetched_with_scope_sync,
+            on_error=self._handle_auto_measurement_error,
+        )
+        self._refresh_auto_measure_button()
+
+    def _on_auto_measurements_fetched_with_scope_sync(self, result) -> None:
+        channels, channel_units, channel_vertical_layouts, measurements = result
+        supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
+        self._update_channel_units(channel_units, log_message=False)
+        self._update_channel_vertical_layouts(channel_vertical_layouts)
+        if supported_channels:
+            primary_channel = self._apply_scope_displayed_channels(
+                supported_channels,
+                log_prefix="自动测量已同步示波器显示通道",
+            )
+            self.measurement_status.setText(
+                f"自动测量：运行中 ({display_channel_name(primary_channel)})"
+            )
+        self._update_measurements(measurements)
+
+    def _channel_unit(self, channel: str) -> str:
+        return self.channel_units.get(channel, "V")
+
+    def _waveform_range_label(self, channel: str) -> str:
+        return "电流范围" if self._channel_unit(channel) == "A" else "电压范围"
+
+    def _update_channel_units(self, channel_units: dict[str, str], *, log_message: bool = True) -> None:
+        updated_units = {channel: channel_units.get(channel, self.channel_units.get(channel, "V")) for channel in SUPPORTED_CHANNELS}
+        self.channel_units = updated_units
+        if log_message:
+            self.log(
+                "通道单位识别: "
+                + ", ".join(f"{display_channel_name(channel)}={unit}" for channel, unit in self.channel_units.items())
+            )
+
+    def _update_channel_vertical_layouts(self, channel_vertical_layouts: dict[str, ChannelVerticalLayout]) -> None:
+        self.channel_vertical_layouts = {
+            channel: {"scale": layout.scale, "offset": layout.offset}
+            for channel, layout in channel_vertical_layouts.items()
+        }
+
+    def _set_scope_display_check_enabled(self, enabled: bool) -> None:
+        for checkbox in self.scope_display_checks.values():
+            checkbox.setEnabled(enabled)
+
+    def _update_scope_display_checks(self, channels: list[str]) -> None:
+        active_channels = set(channels)
+        self._updating_scope_display_checks = True
+        try:
+            for channel, checkbox in self.scope_display_checks.items():
+                checkbox.setChecked(channel in active_channels)
+        finally:
+            self._updating_scope_display_checks = False
+
+    def _toggle_scope_channel_display(self, channel: str, enabled: bool) -> None:
+        if self._updating_scope_display_checks:
+            return
+        scope = self._get_scope_or_warn()
+        if scope is None:
+            return
+        self.log(f"正在设置 {display_channel_name(channel)} {'显示' if enabled else '隐藏'}。")
+        self._run_task(
+            lambda: self._set_scope_channel_display_and_reload(scope, channel, enabled),
+            on_success=self._on_scope_displayed_channels_loaded,
+            success_message="示波器通道状态已更新。",
+            ui_guard=self._scope_ui_guard(scope),
+        )
+
+    def _set_scope_channel_display_and_reload(
+        self,
+        scope: KeysightOscilloscope,
+        channel: str,
+        enabled: bool,
+    ) -> tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout]]:
+        scope.set_channel_display(channel, enabled)
+        return self._get_scope_display_context(scope)
+
     def _get_scope_or_warn(self) -> KeysightOscilloscope | None:
         if self.scope is None or not self.scope.is_connected:
             self._show_warning("请先连接示波器。")
             return None
         return self.scope
 
+    def _scope_ui_guard(self, scope: KeysightOscilloscope):
+        return lambda current_scope=scope: self.scope is current_scope and current_scope.is_connected
+
     def _resource_selected(self, index: int) -> None:
         if index >= 0:
             self.resource_combo.setCurrentIndex(index)
 
-    def _run_task(self, task, on_success=None, success_message: str | None = None) -> None:
+    def _run_task(self, task, on_success=None, success_message: str | None = None, ui_guard=None) -> None:
         def handle_success(result) -> None:
+            if ui_guard is not None and not ui_guard():
+                return
             if on_success is not None:
                 on_success(result)
             if success_message:
                 self.log(success_message)
 
-        self.task_runner.run(task, on_success=handle_success, on_error=self._handle_error)
+        def handle_error(error: Exception) -> None:
+            if ui_guard is not None and not ui_guard():
+                return
+            self._handle_error(error)
+
+        self.task_runner.run(task, on_success=handle_success, on_error=handle_error)
 
     def _handle_error(self, error: Exception) -> None:
         self.log(f"操作失败: {error}")
