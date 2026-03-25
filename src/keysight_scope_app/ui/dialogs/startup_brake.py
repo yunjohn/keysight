@@ -178,7 +178,7 @@ class StartupBrakeTestDialog(QDialog):
         self.tolerance_input.setDecimals(2)
         self.tolerance_input.setSuffix(" %")
         self.tolerance_input.setRange(0.0, 100.0)
-        self.tolerance_input.setValue(5.0)
+        self.tolerance_input.setValue(1.0)
         self.consecutive_input = QDoubleSpinBox()
         self.consecutive_input.setDecimals(0)
         self.consecutive_input.setRange(1, 20)
@@ -405,9 +405,9 @@ class StartupBrakeTestDialog(QDialog):
         history_title.setFont(QFont(history_title.font().family(), history_title.font().pointSize(), QFont.Bold))
         layout.addWidget(history_title)
 
-        self.history_table = QTableWidget(0, 7)
+        self.history_table = QTableWidget(0, 8)
         self.history_table.setHorizontalHeaderLabels(
-            ["#", "时间", "启动(ms)", "刹车(ms)", "启动峰值(A)", "刹车峰值(A)", "命中频率(Hz)"]
+            ["#", "时间", "启动(ms)", "刹车(ms)", "启动峰值(A)", "刹车峰值(A)", "命中频率(Hz)", "命中周期(ms)"]
         )
         self.history_table.setMinimumHeight(220)
         self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -422,7 +422,8 @@ class StartupBrakeTestDialog(QDialog):
         self.history_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.history_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.history_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        self.history_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
         self.history_table.verticalHeader().setDefaultSectionSize(28)
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
@@ -624,7 +625,7 @@ class StartupBrakeTestDialog(QDialog):
             speed_tolerance_ratio=float(self.tolerance_input.value()) / 100.0,
             speed_consecutive_periods=int(self.consecutive_input.value()),
             pulses_per_revolution=int(self.ppr_input.value()),
-            control_threshold_ratio=0.1,
+            control_threshold_ratio=0.02,
             startup_min_voltage_step=float(self.startup_step_input.value()),
             startup_hold_s=float(self.startup_hold_ms_input.value()) / 1000.0,
             zero_current_threshold_a=float(self.zero_threshold_input.value()),
@@ -839,9 +840,8 @@ class StartupBrakeTestDialog(QDialog):
 
         if point_a is None or point_b is None:
             return
-        self.main_window.waveform_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
-        if self.main_window.waveform_detail_dialog.isVisible():
-            self.main_window.waveform_detail_dialog.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
+        self.main_window.sync_waveform_detail_dialog(show_window=False)
+        self.main_window.waveform_detail_dialog.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
 
     def _refresh_marker_table(self, result: StartupBrakeTestResult) -> None:
         marker_items = [
@@ -889,9 +889,8 @@ class StartupBrakeTestDialog(QDialog):
             self.marker_table.setCellWidget(row, column_offset + 2, locate_button)
 
     def _focus_marker_point(self, point: tuple[float, float], channel: str | None, title: str) -> None:
-        self.main_window.waveform_panel.focus_on_channel_point(point, channel=channel, annotation_text=title)
-        if self.main_window.waveform_detail_dialog.isVisible():
-            self.main_window.waveform_detail_dialog.focus_on_channel_point(point, channel=channel, annotation_text=title)
+        self.main_window.sync_waveform_detail_dialog()
+        self.main_window.waveform_detail_dialog.focus_on_channel_point(point, channel=channel, annotation_text=title)
 
     def _save_history(self) -> None:
         STARTUP_BRAKE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1033,7 +1032,12 @@ class StartupBrakeTestDialog(QDialog):
                 [
                     "序号",
                     "时间",
+                    "启动起点(s)",
+                    "达速时刻(s)",
                     "启动时长(ms)",
+                    "刹车起点(s)",
+                    "零电流确认(s)",
+                    "刹车终点(s)",
                     "刹车时长(ms)",
                     "启动峰值电流(A)",
                     "刹车峰值电流(A)",
@@ -1053,7 +1057,12 @@ class StartupBrakeTestDialog(QDialog):
                     [
                         index,
                         entry.timestamp,
+                        f"{result.startup_start_point[0]:.6f}" if result.startup_start_point is not None else "",
+                        f"{result.speed_reached_point[0]:.6f}" if result.speed_reached_point is not None else "",
                         f"{result.startup_delay_s * 1000.0:.6f}" if result.startup_delay_s is not None else "",
+                        f"{result.brake_start_point[0]:.6f}" if result.brake_start_point is not None else "",
+                        f"{result.current_zero_window.confirmed_time_s:.6f}" if result.current_zero_window is not None else "",
+                        f"{result.brake_end_point[0]:.6f}" if result.brake_end_point is not None else "",
                         f"{result.brake_delay_s * 1000.0:.6f}" if result.brake_delay_s is not None else "",
                         f"{result.startup_peak_current.value:.6f}" if result.startup_peak_current is not None else "",
                         f"{result.brake_peak_current.value:.6f}" if result.brake_peak_current is not None else "",
@@ -1077,17 +1086,12 @@ class StartupBrakeTestDialog(QDialog):
         if self.last_result.startup_start_point is None or self.last_result.speed_reached_point is None:
             self.main_window._show_warning("当前结果不包含启动段游标。")
             return
-        self.main_window.waveform_panel.set_cursor_points(
+        self.main_window.sync_waveform_detail_dialog()
+        self.main_window.waveform_detail_dialog.set_cursor_points(
             self.last_result.startup_start_point,
             self.last_result.speed_reached_point,
             annotation_text="Startup Window",
         )
-        if self.main_window.waveform_detail_dialog.isVisible():
-            self.main_window.waveform_detail_dialog.set_cursor_points(
-                self.last_result.startup_start_point,
-                self.last_result.speed_reached_point,
-                annotation_text="Startup Window",
-            )
 
     def _apply_brake_cursors(self) -> None:
         if self.last_result is None:
@@ -1096,17 +1100,12 @@ class StartupBrakeTestDialog(QDialog):
         if self.last_result.brake_start_point is None or self.last_result.brake_end_point is None:
             self.main_window._show_warning("当前结果不包含刹车段游标。")
             return
-        self.main_window.waveform_panel.set_cursor_points(
+        self.main_window.sync_waveform_detail_dialog()
+        self.main_window.waveform_detail_dialog.set_cursor_points(
             self.last_result.brake_start_point,
             self.last_result.brake_end_point,
             annotation_text="Brake Window",
         )
-        if self.main_window.waveform_detail_dialog.isVisible():
-            self.main_window.waveform_detail_dialog.set_cursor_points(
-                self.last_result.brake_start_point,
-                self.last_result.brake_end_point,
-                annotation_text="Brake Window",
-            )
 
     def _refresh_history(self) -> None:
         self.history_table.setRowCount(len(self.history))
@@ -1119,6 +1118,7 @@ class StartupBrakeTestDialog(QDialog):
             self.history_table.setItem(row, 4, self._centered_table_item(self._format_peak_current_display(result.startup_peak_current)))
             self.history_table.setItem(row, 5, self._centered_table_item(self._format_peak_current_display(result.brake_peak_current)))
             self.history_table.setItem(row, 6, self._centered_table_item(self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)))
+            self.history_table.setItem(row, 7, self._centered_table_item(self._format_optional_period_ms(result.speed_match.period_s if result.speed_match is not None else None)))
 
         if not self.history:
             for label in self.stats_labels.values():

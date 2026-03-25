@@ -23,7 +23,7 @@ class StartupBrakeTestConfig:
     speed_tolerance_ratio: float = 0.05
     speed_consecutive_periods: int = 3
     pulses_per_revolution: int = 1
-    control_threshold_ratio: float = 0.1
+    control_threshold_ratio: float = 0.02
     startup_min_voltage_step: float = 1.0
     startup_hold_s: float = 0.001
     zero_current_threshold_a: float = 0.5

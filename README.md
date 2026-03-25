@@ -1,35 +1,54 @@
-# Keysight 示波器桌面工具
+# Keysight 示波器助手
 
-基于 `PyVISA + PySide6` 的是德示波器桌面应用，支持：
+基于 `PySide6 + PyVISA` 的是德示波器桌面工具，用于：
 
-- 自动扫描 VISA 资源
 - 连接 Keysight / Agilent 示波器
-- 自动测量频率、周期、峰峰值、RMS、最大值、最小值、上升时间
-- 扩展测量项：平均值、振幅、占空比、正/负脉宽、高/低电平时间、下降时间、高低电平估计
-- 测量模板一键切换
-- 波形抓取并导出 CSV，多通道可导出为单文件多表 bundle
-- 波形图显示与基础统计分析
-- 多通道波形叠加显示
-- 主通道与叠加通道的边沿 `Δt / 相位差` 对比
-- 已导出 CSV 的离线加载与复盘
-- 双游标读数与 `Δt / ΔV / ΔV/Δt` 分析
-- 游标一键吸附最近上升沿/下降沿
-- 脉宽、占空比、上升时间、下降时间估算
-- 自动锁定最近完整脉冲到 A/B 游标
-- 自动锁定最近完整周期到 A/B 游标
-- 智能锁定：优先完整周期，失败时回退到单个脉冲
-- 当前波形视图导出 PNG 图片
-- 当前可见视图的局部统计会随缩放自动更新
-- 一键截图到本地 `captures/`
-- `AUToscale` 一键自动整定
+- 抓取多通道波形并离线复盘
+- 单次测量、自动测量
+- 独立波形窗口缩放、游标、局部测量
+- 启动刹车性能测试与记录导出
 
-## 环境准备
+当前应用标题为：`Keysight 示波器助手 | 作者：徐`
 
-1. 安装是德 `Keysight IO Libraries Suite` 或 NI-VISA。
-2. 创建并激活虚拟环境后安装依赖：
+## 主要功能
+
+- 自动扫描并连接 VISA 资源
+- 主界面控制示波器通道开关
+- 抓取 `NORMal / MAXimum / RAW` 波形
+- 支持高点数波形显示、局部缩放、导出 CSV / PNG
+- 独立波形窗口支持：
+  - 多通道显示
+  - 鼠标框选时间轴缩放
+  - A/B 游标
+  - 游标联动拖动
+  - 按当前视图 / 游标 A-B / 整条波形测量
+- 触发区支持：
+  - 单次等待触发
+  - 触发状态读取
+  - `ROLL / 标准模式` 切换
+- 启动刹车测试支持：
+  - 完整流程 / 仅启动段 / 仅刹车段
+  - 电流归零 / A 相回溯
+  - 结果点定位
+  - 历史记录持久化
+  - CSV 统计导出
+
+## 环境要求
+
+- Windows x64
+- Python 3.12
+- Keysight IO Libraries Suite
+
+建议优先安装：
+
+- `Keysight IO Libraries Suite (IOLS)`
+
+如果没有安装 VISA 运行环境，程序即使能启动，也无法正常连接示波器。
+
+## 安装依赖
 
 ```powershell
-.venv\Scripts\pip install -r requirements.txt
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 ## 运行
@@ -38,24 +57,85 @@
 .venv\Scripts\python main.py
 ```
 
-没有示波器时，可参考离线测试清单：
+## 打包 EXE
 
-- `LOCAL_TEST_PLAN.md`
+目录版：
 
-## 使用说明
+```powershell
+.venv\Scripts\python -m PyInstaller --noconfirm --clean --windowed --name KeysightScopeApp --icon assets\app.ico --paths src main.py
+```
 
-1. 点击“刷新资源”选择示波器资源地址。
-2. 点击“连接设备”，确认 `*IDN?` 返回是德/安捷伦设备。
-3. 选择通道和测量项，点击“单次测量”或“启动自动测量”。
-4. 使用“抓取波形”读取当前通道波形，可直接查看波形图和统计值。
-5. 用“导出 CSV”保存波形，或用“加载 CSV”复盘已有波形文件。
-6. 在波形图中用滚轮缩放、框选局部放大，并通过 A/B 双游标读取 `Δt / ΔV`。
-7. 使用“吸附上升沿/下降沿”快速把游标对准边沿，并查看脉宽/占空比/上升下降时间。
-8. 使用“智能锁定”快速对齐 A/B 游标；它会优先锁完整周期，找不到时自动回退到单个脉冲。
-9. 放大到局部区域后，查看“当前视图统计”获取这一段波形的局部结果。
-10. 必要时把当前波形视图导出为 PNG。
-11. 点击“一键截图”自动保存示波器屏幕 PNG 文件。
+单文件版：
 
-资源列表会优先显示可直接连接的真实资源地址；如果同时看到 `USB...::?::...` 和 `USB...::MYxxxx::...`，优先使用后者。
+```powershell
+.venv\Scripts\python -m PyInstaller --noconfirm --clean --onefile --windowed --name KeysightScopeApp-OneFile --icon assets\app.ico --paths src main.py
+```
 
-部分 SCPI 命令在不同系列上会有差异；当前实现针对 InfiniiVision 常见命令集做了兼容优先的封装。
+打包后产物位于：
+
+- `dist\KeysightScopeApp\KeysightScopeApp.exe`
+- `dist\KeysightScopeApp-OneFile.exe`
+
+## 使用流程
+
+1. 点击 `刷新资源`，选择示波器资源地址。
+2. 点击 `连接设备`。
+3. 在主界面设置通道、触发、测量参数。
+4. 点击 `抓取波形`，程序会自动打开独立波形窗口。
+5. 在独立波形窗口里进行缩放、游标、局部测量和导出。
+6. 需要做性能分析时，打开 `启动刹车测试`。
+
+## 波形窗口说明
+
+独立波形窗口顶部支持：
+
+- `抓取波形`
+- `重置波形`
+- `测量项设置`
+- `测量范围`
+
+测量范围有三种：
+
+- `当前视图`：按当前可见时间窗计算
+- `游标 A-B`：按两根游标之间的时间窗计算
+- `整条波形`：按整条波形计算
+
+## 触发说明
+
+- `ROLL` 模式下，边沿触发不可用
+- 可先切换到 `标准模式` 再执行 `单次等待触发`
+- `单次等待触发` 会自动应用当前界面里的触发参数
+
+## 启动刹车测试说明
+
+- 执行测试时优先抓取最新波形
+- 不会自动弹出波形窗口
+- 只有点击结果点 `定位` 或手动应用游标时，才会弹出独立波形窗口
+- 测试记录支持本地持久化与 CSV 导出
+
+## 目录说明
+
+- `src/keysight_scope_app/`：主程序代码
+- `tests/`：回归测试
+- `assets/`：图标等资源
+- `captures/`：运行期抓图、波形、测试记录
+
+## 测试
+
+语法检查：
+
+```powershell
+.venv\Scripts\python -m py_compile src\keysight_scope_app\ui\main_window.py
+```
+
+示例回归：
+
+```powershell
+.venv\Scripts\python -m pytest tests\test_utils.py -k startup_brake
+```
+
+## 说明
+
+- 不同 Keysight 系列的 SCPI 支持会有差异
+- 当前实现优先兼容 InfiniiVision 常见命令集
+- 部分功能依赖示波器当前采集状态、时基模式和通道配置

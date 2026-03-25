@@ -6,6 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QFrame,
     QGridLayout,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
+from keysight_scope_app.device.instrument import SUPPORTED_CHANNELS
 from keysight_scope_app.ui.helpers import display_channel_name
 from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
 from keysight_scope_app.utils import format_engineering_value
@@ -231,24 +233,33 @@ class WaveformDetailDialog(QDialog):
         self.current_waveforms: list[WaveformData] = []
         self.measurement_config: dict[str, set[str]] = {}
         self.cursor_measurements: dict[str, str] = {}
+        self._updating_channel_checks = False
         self._load_measurement_config()
 
         toolbar = QHBoxLayout()
-        self.reset_waveform_button = QPushButton("重置波形")
-        self.reset_waveform_button.clicked.connect(self._reset_waveform_view)
-        self.measurement_settings_button = QPushButton("测量项设置")
-        self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
-        toolbar.addWidget(self.reset_waveform_button)
-        toolbar.addWidget(self.measurement_settings_button)
         self.refresh_waveform_button = QPushButton("抓取波形")
         self.refresh_waveform_button.clicked.connect(self._request_waveform_refresh)
-        toolbar.addStretch(1)
+        self.reset_waveform_button = QPushButton("重置波形")
+        self.reset_waveform_button.clicked.connect(self._reset_waveform_view)
+        self.measurement_scope_combo = QComboBox()
+        self.measurement_scope_combo.addItem("当前视图", "view")
+        self.measurement_scope_combo.addItem("游标 A-B", "cursor")
+        self.measurement_scope_combo.addItem("整条波形", "full")
+        self.measurement_scope_combo.currentIndexChanged.connect(self._refresh_measurement_footer)
+        self.measurement_settings_button = QPushButton("测量项设置")
+        self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
         toolbar.addWidget(self.refresh_waveform_button)
+        toolbar.addWidget(self.reset_waveform_button)
+        toolbar.addWidget(self.measurement_settings_button)
+        toolbar.addStretch(1)
+        toolbar.addWidget(QLabel("测量范围"))
+        toolbar.addWidget(self.measurement_scope_combo)
         layout.addLayout(toolbar)
 
         self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
         self.analysis_panel.channel_unit_resolver = self._channel_unit
         self.analysis_panel.cursor_readout_changed = self._handle_cursor_measurements_changed
+        self.analysis_panel.view_window_changed = self._refresh_measurement_footer
         self.analysis_panel.set_waveform_only_mode(True)
         layout.addWidget(self.analysis_panel)
 
@@ -362,6 +373,7 @@ class WaveformDetailDialog(QDialog):
         self.analysis_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
 
     def _rebuild_channel_visibility_checks(self, waveforms: list[WaveformData]) -> None:
+        parent = self.parent()
         previous_states = {
             channel: checkbox.isChecked()
             for channel, checkbox in self.channel_visibility_checks.items()
@@ -375,11 +387,19 @@ class WaveformDetailDialog(QDialog):
         self.channel_toggle_layout.addStretch(1)
         self.channel_toggle_layout.addWidget(QLabel("显示通道"))
         self.channel_visibility_checks = {}
-        for waveform in waveforms:
-            channel = waveform.channel
+        active_waveform_channels = {waveform.channel for waveform in waveforms}
+        for channel in SUPPORTED_CHANNELS:
             checkbox = QCheckBox(display_channel_name(channel))
-            checkbox.setChecked(previous_states.get(channel, True))
-            checkbox.toggled.connect(lambda checked=False: self._apply_channel_visibility())
+            if parent is not None and hasattr(parent, "scope_display_checks"):
+                parent_checks = getattr(parent, "scope_display_checks", {})
+                parent_checkbox = parent_checks.get(channel)
+                checked = parent_checkbox.isChecked() if parent_checkbox is not None else previous_states.get(channel, channel in active_waveform_channels)
+            else:
+                checked = previous_states.get(channel, channel in active_waveform_channels)
+            checkbox.setChecked(checked)
+            checkbox.toggled.connect(
+                lambda checked=False, target_channel=channel: self._handle_channel_checkbox_toggled(target_channel, checked)
+            )
             self.channel_visibility_checks[channel] = checkbox
             self.channel_toggle_layout.addWidget(checkbox)
         self.channel_toggle_layout.addStretch(1)
@@ -404,6 +424,26 @@ class WaveformDetailDialog(QDialog):
         parent = self.parent()
         if parent is not None and hasattr(parent, "refresh_waveform_detail_dialog"):
             parent.refresh_waveform_detail_dialog()
+
+    def _handle_channel_checkbox_toggled(self, channel: str, checked: bool) -> None:
+        if self._updating_channel_checks:
+            self._apply_channel_visibility()
+            return
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "request_scope_channel_display_from_detail_dialog"):
+            parent.request_scope_channel_display_from_detail_dialog(channel, checked)
+            return
+        self._apply_channel_visibility()
+
+    def sync_scope_channel_checks(self, channels: list[str]) -> None:
+        active_channels = set(channels)
+        self._updating_channel_checks = True
+        try:
+            for channel, checkbox in self.channel_visibility_checks.items():
+                checkbox.setChecked(channel in active_channels)
+        finally:
+            self._updating_channel_checks = False
+        self._apply_channel_visibility()
 
     def _reset_waveform_view(self) -> None:
         self.analysis_panel.reset_view()
@@ -476,27 +516,42 @@ class WaveformDetailDialog(QDialog):
             return
 
         channel_sections: list[str] = []
+        measurement_scope = self._selected_measurement_scope()
         for waveform in self.current_waveforms:
-            section_html = self._build_measurement_section_html(waveform)
+            section_html = self._build_measurement_section_html(waveform, measurement_scope)
             if section_html:
                 channel_sections.append(section_html)
 
         cursor_section = self._build_cursor_measurement_section_html()
 
+        hint_text = ""
+        if measurement_scope == "cursor" and self.analysis_panel.cursor_time_window() is None:
+            hint_text = "当前测量范围：游标 A-B。请先放置两根游标。"
+        elif measurement_scope == "cursor":
+            hint_text = "当前测量范围：游标 A-B。"
+        elif measurement_scope == "full":
+            hint_text = "当前测量范围：整条波形。"
+        else:
+            hint_text = "当前测量范围：当前视图。"
+
         if not channel_sections and not cursor_section:
-            self.measurement_overlay_hint.clear()
+            self.measurement_overlay_hint.setText(hint_text if hint_text else "")
             self.measurement_text_label.clear()
             self.measurement_overlay.hide()
             self.cursor_text_label.clear()
             self.cursor_overlay.hide()
         else:
             if channel_sections:
-                self.measurement_overlay_hint.clear()
+                self.measurement_overlay_hint.setText(hint_text)
                 self.measurement_text_label.setText(self._build_measurement_overlay_html(channel_sections))
                 self.measurement_overlay.show()
             else:
                 self.measurement_text_label.clear()
-                self.measurement_overlay.hide()
+                if hint_text:
+                    self.measurement_overlay_hint.setText(hint_text)
+                    self.measurement_overlay.show()
+                else:
+                    self.measurement_overlay.hide()
 
             if cursor_section:
                 self.cursor_overlay_hint.setText("游标测量")
@@ -508,8 +563,20 @@ class WaveformDetailDialog(QDialog):
 
             self._reposition_measurement_overlay()
 
-    def _build_measurement_section_html(self, waveform: WaveformData) -> str:
-        stats = waveform.analyze()
+    def _selected_measurement_scope(self) -> str:
+        return str(self.measurement_scope_combo.currentData())
+
+    def _measurement_stats_for_channel(self, channel: str, measurement_scope: str) -> WaveformStats | None:
+        if measurement_scope == "cursor":
+            return self.analysis_panel.cursor_window_stats_for_channel(channel)
+        if measurement_scope == "full":
+            return self.analysis_panel.full_stats_for_channel(channel)
+        return self.analysis_panel.visible_stats_for_channel(channel)
+
+    def _build_measurement_section_html(self, waveform: WaveformData, measurement_scope: str) -> str:
+        stats = self._measurement_stats_for_channel(waveform.channel, measurement_scope)
+        if stats is None:
+            return ""
         channel_unit = self._channel_unit(waveform.channel)
         selected_names = self.measurement_config.get(waveform.channel, set(WAVEFORM_DEFAULT_MEASUREMENTS))
         metric_items: list[str] = []

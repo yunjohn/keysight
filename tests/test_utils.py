@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
+from pyvisa.errors import VisaIOError
 
 from keysight_scope_app.device.instrument import (
     EdgeTriggerSettings,
@@ -374,6 +375,31 @@ def test_fetch_measurements_uses_current_units_for_channel_3() -> None:
     assert results[0].display_value == "2.5 A"
 
 
+def test_fetch_measurements_timeout_on_single_item_does_not_abort_all_results() -> None:
+    class FakeScope(KeysightOscilloscope):
+        def __init__(self) -> None:
+            super().__init__("USB::TEST")
+
+        def query(self, command: str) -> str:
+            if command == ":CHANnel1:UNITs?":
+                return "VOLT"
+            if command == ":MEASure:FREQuency? CHANnel1":
+                raise VisaIOError(-1073807339)
+            if command == ":MEASure:VPP? CHANnel1":
+                return "2.5"
+            raise AssertionError(f"unexpected query: {command}")
+
+    scope = FakeScope()
+
+    results = scope.fetch_measurements("CHANnel1", ["频率", "峰峰值"])
+
+    assert len(results) == 2
+    assert results[0].label == "频率"
+    assert results[0].display_value == "超时"
+    assert results[1].label == "峰峰值"
+    assert results[1].display_value == "2.5 V"
+
+
 def test_main_window_channel_unit_auto_label_updates_from_detected_units() -> None:
     app = QApplication.instance() or QApplication([])
     window = ScopeMainWindow()
@@ -623,11 +649,11 @@ def test_analyze_startup_brake_test_current_zero_mode() -> None:
     assert result.startup_peak_current is not None
     assert result.startup_peak_current.value == 2.0
     assert result.startup_peak_current.time_s == 0.02
-    assert abs(result.brake_start_point[0] - 0.0791) < 1e-9
+    assert abs(result.brake_start_point[0] - 0.07902) < 1e-9
     assert abs(result.current_zero_window.start_time_s - 0.086) < 1e-9
     assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
     assert abs(result.brake_end_point[0] - 0.086) < 1e-9
-    assert abs(result.brake_delay_s - 0.0069) < 1e-9
+    assert abs(result.brake_delay_s - 0.00698) < 1e-9
 
 
 def test_analyze_startup_brake_test_current_zero_mode_does_not_require_encoder_channel() -> None:
@@ -671,7 +697,7 @@ def test_analyze_startup_brake_test_encoder_backtrack_mode() -> None:
 
     assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
     assert abs(result.brake_end_point[0] - 0.0849) < 1e-9
-    assert abs(result.brake_delay_s - 0.0058) < 1e-9
+    assert abs(result.brake_delay_s - 0.00588) < 1e-9
 
 
 def test_analyze_startup_brake_test_encoder_backtrack_ignores_small_noise_pulses() -> None:
@@ -789,7 +815,7 @@ def test_analyze_startup_brake_test_brake_start_uses_last_control_falling_edge_b
     )
 
     assert result.brake_start_point is not None
-    assert abs(result.brake_start_point[0] - 0.0791) < 1e-9
+    assert abs(result.brake_start_point[0] - 0.07902) < 1e-9
 
 
 def test_analyze_startup_brake_test_current_zero_mode_accepts_probe_jitter_near_zero() -> None:

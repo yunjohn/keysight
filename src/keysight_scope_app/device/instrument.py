@@ -6,7 +6,7 @@ import threading
 from typing import Callable
 
 import pyvisa
-from pyvisa.errors import VisaIOError
+from pyvisa.errors import InvalidSession, VisaIOError
 
 from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestConfig,
@@ -162,12 +162,20 @@ class KeysightOscilloscope:
     def query(self, command: str) -> str:
         with self._lock:
             self._ensure_connected()
-            return str(self._instrument.query(command)).strip()
+            try:
+                return str(self._instrument.query(command)).strip()
+            except InvalidSession as exc:
+                self._invalidate_session()
+                raise RuntimeError("示波器会话已失效，请重新连接设备。") from exc
 
     def write(self, command: str) -> None:
         with self._lock:
             self._ensure_connected()
-            self._instrument.write(command)
+            try:
+                self._instrument.write(command)
+            except InvalidSession as exc:
+                self._invalidate_session()
+                raise RuntimeError("示波器会话已失效，请重新连接设备。") from exc
 
     def autoscale(self) -> None:
         self.write(":AUToscale")
@@ -254,6 +262,13 @@ class KeysightOscilloscope:
         self.write(f":TRIGger:EDGE:LEVel {level}")
         self.write(f":TRIGger:SWEep {sweep}")
 
+    def get_timebase_mode(self) -> str:
+        return self.query(":TIMebase:MODE?").strip().upper()
+
+    def set_timebase_mode(self, mode: str) -> None:
+        normalized = mode.strip().upper()
+        self.write(f":TIMebase:MODE {normalized}")
+
     def get_trigger_event_status(self) -> bool:
         response = self.query(":TER?")
         normalized = response.strip().upper()
@@ -295,32 +310,48 @@ class KeysightOscilloscope:
 
         results: list[MeasurementResult] = []
         waveform_stats: WaveformStats | None = None
+        waveform_stats_error: Exception | None = None
         channel_unit = self.get_channel_unit(channel)
         for measurement_name in measurement_names:
             definition = MEASUREMENT_DEFINITIONS[measurement_name]
-            if definition.query_builder is not None:
-                raw_value = float(self.query(definition.query_builder(channel)))
-            else:
-                if definition.stats_getter is None:
-                    raise ValueError(f"测量项定义不完整: {measurement_name}")
-                if waveform_stats is None:
-                    waveform_stats = self.fetch_waveform(
-                        channel,
-                        points_mode="NORMal",
-                        points=SOFTWARE_MEASUREMENT_POINTS,
-                    ).analyze()
-                value = definition.stats_getter(waveform_stats)
-                raw_value = value if value is not None else float("nan")
             display_unit = _measurement_unit_for_channel(channel_unit, definition.label, definition.unit)
+            try:
+                if definition.query_builder is not None:
+                    raw_value = float(self.query(definition.query_builder(channel)))
+                    display_value = format_engineering_value(raw_value, display_unit)
+                else:
+                    if definition.stats_getter is None:
+                        raise ValueError(f"测量项定义不完整: {measurement_name}")
+                    if waveform_stats is None and waveform_stats_error is None:
+                        try:
+                            waveform_stats = self.fetch_waveform(
+                                channel,
+                                points_mode="NORMal",
+                                points=SOFTWARE_MEASUREMENT_POINTS,
+                            ).analyze()
+                        except Exception as exc:
+                            waveform_stats_error = exc
+                    if waveform_stats_error is not None:
+                        raise waveform_stats_error
+                    value = definition.stats_getter(waveform_stats)
+                    raw_value = value if value is not None else float("nan")
+                    display_value = format_engineering_value(raw_value, display_unit)
+            except VisaIOError as exc:
+                error_code = getattr(exc, "error_code", None)
+                if error_code != -1073807339:
+                    raise
+                raw_value = float("nan")
+                display_value = "超时"
             results.append(
                 MeasurementResult(
                     label=definition.label,
                     raw_value=raw_value,
                     unit=display_unit,
-                    display_value=format_engineering_value(raw_value, display_unit),
+                    display_value=display_value,
                 )
             )
         return results
+
 
     def capture_screenshot(self, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,6 +434,22 @@ class KeysightOscilloscope:
     def _ensure_connected(self) -> None:
         if self._instrument is None:
             raise RuntimeError("示波器尚未连接。")
+
+    def _invalidate_session(self) -> None:
+        instrument = self._instrument
+        resource_manager = self._resource_manager
+        self._instrument = None
+        self._resource_manager = None
+        if instrument is not None:
+            try:
+                instrument.close()
+            except Exception:
+                pass
+        if resource_manager is not None:
+            try:
+                resource_manager.close()
+            except Exception:
+                pass
 
     def _resolve_resource_name(self, resource_name: str) -> str:
         if "::?::" not in resource_name:
