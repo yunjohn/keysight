@@ -60,6 +60,8 @@ class StartupBrakeTestDialog(QDialog):
     DEFAULT_SUMMARY_TEXT = (
         f"提示：执行测试时会优先抓取示波器当前最新波形，且固定至少使用 {STARTUP_BRAKE_MIN_CAPTURE_POINTS} 点；"
         "未连接示波器时可退回使用已加载波形。"
+        "启动段建议主要调整“高电平保持时间”；刹车段真假下降沿建议优先调整“低电平保持时间”，"
+        "而“零电流波动阈值”只影响电流归零稳定区间判定。"
     )
 
     def __init__(self, main_window: ScopeMainWindow) -> None:
@@ -197,6 +199,20 @@ class StartupBrakeTestDialog(QDialog):
         self.startup_hold_ms_input.setSuffix(" ms")
         self.startup_hold_ms_input.setRange(0.0, 1000.0)
         self.startup_hold_ms_input.setValue(1.0)
+        self.startup_min_rise_ms_input = QDoubleSpinBox()
+        self.startup_min_rise_ms_input.setDecimals(3)
+        self.startup_min_rise_ms_input.setSuffix(" ms")
+        self.startup_min_rise_ms_input.setRange(0.0, 1000.0)
+        self.startup_min_rise_ms_input.setValue(0.0)
+        self.startup_max_rise_ms_input = QDoubleSpinBox()
+        self.startup_max_rise_ms_input.setDecimals(3)
+        self.startup_max_rise_ms_input.setSuffix(" ms")
+        self.startup_max_rise_ms_input.setRange(0.0, 1000.0)
+        self.startup_max_rise_ms_input.setValue(0.0)
+        self.startup_step_input.setToolTip("控制信号相对低电平至少跳变到这个幅度，才会进入启动候选。")
+        self.startup_hold_ms_input.setToolTip("启动候选沿出现后，控制信号需要在高电平区持续保持这么久，避免轻微抖动误判为启动。")
+        self.startup_min_rise_ms_input.setToolTip("可选过滤项。限制启动上升沿自身的持续时间；设为 0 表示不启用。")
+        self.startup_max_rise_ms_input.setToolTip("可选过滤项。限制启动上升沿自身的持续时间；设为 0 表示不启用。")
         self._set_compact_field_width(
             self.target_mode_combo,
             self.target_value_input,
@@ -205,6 +221,8 @@ class StartupBrakeTestDialog(QDialog):
             self.ppr_input,
             self.startup_step_input,
             self.startup_hold_ms_input,
+            self.startup_min_rise_ms_input,
+            self.startup_max_rise_ms_input,
         )
         speed_grid = QGridLayout()
         speed_grid.setHorizontalSpacing(12)
@@ -217,7 +235,9 @@ class StartupBrakeTestDialog(QDialog):
         self.ppr_field = self._inline_form_field("每转脉冲数", self.ppr_input)
         speed_grid.addWidget(self.ppr_field, 1, 0)
         speed_grid.addWidget(self._inline_form_field("启动最小跳变", self.startup_step_input), 1, 1)
-        speed_grid.addWidget(self._inline_form_field("启动保持时间", self.startup_hold_ms_input), 1, 2)
+        speed_grid.addWidget(self._inline_form_field("高电平保持时间", self.startup_hold_ms_input), 1, 2)
+        speed_grid.addWidget(self._inline_form_field("最小上升时间", self.startup_min_rise_ms_input), 2, 0)
+        speed_grid.addWidget(self._inline_form_field("最大上升时间", self.startup_max_rise_ms_input), 2, 1)
         layout.addLayout(speed_grid)
 
         self.target_hint_label = QLabel("")
@@ -259,6 +279,11 @@ class StartupBrakeTestDialog(QDialog):
         self.hold_ms_input.setSuffix(" ms")
         self.hold_ms_input.setRange(0.0, 1000.0)
         self.hold_ms_input.setValue(2.0)
+        self.brake_low_hold_ms_input = QDoubleSpinBox()
+        self.brake_low_hold_ms_input.setDecimals(3)
+        self.brake_low_hold_ms_input.setSuffix(" ms")
+        self.brake_low_hold_ms_input.setRange(0.0, 1000.0)
+        self.brake_low_hold_ms_input.setValue(2.0)
         self.backtrack_pulses_input = QDoubleSpinBox()
         self.backtrack_pulses_input.setDecimals(0)
         self.backtrack_pulses_input.setRange(1, 1000)
@@ -272,14 +297,33 @@ class StartupBrakeTestDialog(QDialog):
         self.backtrack_min_interval_ms_input.setSuffix(" ms")
         self.backtrack_min_interval_ms_input.setRange(0.0, 1000.0)
         self.backtrack_min_interval_ms_input.setValue(0.2)
+        self.brake_min_fall_ms_input = QDoubleSpinBox()
+        self.brake_min_fall_ms_input.setDecimals(3)
+        self.brake_min_fall_ms_input.setSuffix(" ms")
+        self.brake_min_fall_ms_input.setRange(0.0, 1000.0)
+        self.brake_min_fall_ms_input.setValue(0.0)
+        self.brake_max_fall_ms_input = QDoubleSpinBox()
+        self.brake_max_fall_ms_input.setDecimals(3)
+        self.brake_max_fall_ms_input.setSuffix(" ms")
+        self.brake_max_fall_ms_input.setRange(0.0, 1000.0)
+        self.brake_max_fall_ms_input.setValue(0.0)
+        self.zero_threshold_input.setToolTip("电流绝对值低于该阈值时，才可能进入零电流稳定区间。")
+        self.flat_threshold_input.setToolTip("只用于零电流稳定区间判定，限制窗口内允许的电流波动范围。")
+        self.hold_ms_input.setToolTip("零电流窗口需要持续保持这么久，才会确认归零。")
+        self.brake_low_hold_ms_input.setToolTip("控制器下降沿之后，低电平需要至少保持这么久，才认定为真实刹车动作；优先用它过滤手抖和假下降沿。")
+        self.brake_min_fall_ms_input.setToolTip("可选过滤项。限制刹车下降沿自身的持续时间；设为 0 表示不启用。")
+        self.brake_max_fall_ms_input.setToolTip("可选过滤项。限制刹车下降沿自身的持续时间；设为 0 表示不启用。")
         self._set_compact_field_width(
             self.brake_mode_combo,
             self.zero_threshold_input,
             self.flat_threshold_input,
             self.hold_ms_input,
+            self.brake_low_hold_ms_input,
             self.backtrack_pulses_input,
             self.backtrack_min_step_input,
             self.backtrack_min_interval_ms_input,
+            self.brake_min_fall_ms_input,
+            self.brake_max_fall_ms_input,
         )
         brake_grid = QGridLayout()
         brake_grid.setHorizontalSpacing(12)
@@ -289,12 +333,15 @@ class StartupBrakeTestDialog(QDialog):
         brake_grid.addWidget(self._inline_form_field("零电流阈值", self.zero_threshold_input), 0, 1)
         brake_grid.addWidget(self._inline_form_field("水平线波动", self.flat_threshold_input), 0, 2)
         brake_grid.addWidget(self._inline_form_field("零流保持时间", self.hold_ms_input), 0, 3)
+        brake_grid.addWidget(self._inline_form_field("低电平保持时间", self.brake_low_hold_ms_input), 1, 3)
         self.backtrack_field = self._inline_form_field("回溯脉冲数", self.backtrack_pulses_input)
         self.backtrack_min_step_field = self._inline_form_field("回溯最小跳变", self.backtrack_min_step_input)
         self.backtrack_min_interval_field = self._inline_form_field("回溯最小间隔", self.backtrack_min_interval_ms_input)
         brake_grid.addWidget(self.backtrack_field, 1, 0)
         brake_grid.addWidget(self.backtrack_min_step_field, 1, 1)
         brake_grid.addWidget(self.backtrack_min_interval_field, 1, 2)
+        brake_grid.addWidget(self._inline_form_field("最小下降时间", self.brake_min_fall_ms_input), 2, 0)
+        brake_grid.addWidget(self._inline_form_field("最大下降时间", self.brake_max_fall_ms_input), 2, 1)
         layout.addLayout(brake_grid)
 
         button_row = QHBoxLayout()
@@ -533,10 +580,15 @@ class StartupBrakeTestDialog(QDialog):
         self.ppr_input.setEnabled(startup_enabled and str(self.target_mode_combo.currentData()) == "rpm")
         self.startup_step_input.setEnabled(startup_enabled)
         self.startup_hold_ms_input.setEnabled(startup_enabled)
+        self.startup_min_rise_ms_input.setEnabled(startup_enabled)
+        self.startup_max_rise_ms_input.setEnabled(startup_enabled)
         self.brake_mode_combo.setEnabled(brake_enabled)
         self.zero_threshold_input.setEnabled(brake_enabled)
         self.flat_threshold_input.setEnabled(brake_enabled)
         self.hold_ms_input.setEnabled(brake_enabled)
+        self.brake_low_hold_ms_input.setEnabled(brake_enabled)
+        self.brake_min_fall_ms_input.setEnabled(brake_enabled)
+        self.brake_max_fall_ms_input.setEnabled(brake_enabled)
         self.encoder_field.setEnabled(encoder_enabled)
         self.backtrack_field.setEnabled(encoder_enabled)
         self.backtrack_min_step_field.setEnabled(encoder_enabled)
@@ -628,10 +680,15 @@ class StartupBrakeTestDialog(QDialog):
             control_threshold_ratio=0.02,
             startup_min_voltage_step=float(self.startup_step_input.value()),
             startup_hold_s=float(self.startup_hold_ms_input.value()) / 1000.0,
+            startup_min_rise_s=float(self.startup_min_rise_ms_input.value()) / 1000.0,
+            startup_max_rise_s=float(self.startup_max_rise_ms_input.value()) / 1000.0,
             zero_current_threshold_a=float(self.zero_threshold_input.value()),
             zero_current_flat_threshold_a=float(self.flat_threshold_input.value()),
             zero_current_hold_s=float(self.hold_ms_input.value()) / 1000.0,
+            brake_low_hold_s=float(self.brake_low_hold_ms_input.value()) / 1000.0,
             brake_mode=brake_mode,
+            brake_min_fall_s=float(self.brake_min_fall_ms_input.value()) / 1000.0,
+            brake_max_fall_s=float(self.brake_max_fall_ms_input.value()) / 1000.0,
             brake_backtrack_pulses=int(self.backtrack_pulses_input.value()),
             brake_backtrack_min_step=float(self.backtrack_min_step_input.value()),
             brake_backtrack_min_interval_s=float(self.backtrack_min_interval_ms_input.value()) / 1000.0,
@@ -991,10 +1048,15 @@ class StartupBrakeTestDialog(QDialog):
             writer.writerow(["配置", "测试模式", self._history_config_summary(lambda config: self._test_scope_mode_display_text(config.test_scope_mode))])
             writer.writerow(["配置", "刹车模式", self._history_config_summary(lambda config: self._brake_mode_display_text(config.brake_mode))])
             writer.writerow(["配置", "启动最小跳变(V)", self._history_config_summary(lambda config: f"{config.startup_min_voltage_step:.6f}")])
-            writer.writerow(["配置", "启动保持时间(ms)", self._history_config_summary(lambda config: f"{config.startup_hold_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "高电平保持时间(ms)", self._history_config_summary(lambda config: f"{config.startup_hold_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "最小上升时间(ms)", self._history_config_summary(lambda config: f"{config.startup_min_rise_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "最大上升时间(ms)", self._history_config_summary(lambda config: f"{config.startup_max_rise_s * 1000.0:.6f}")])
             writer.writerow(["配置", "零电流阈值(A)", self._history_config_summary(lambda config: f"{config.zero_current_threshold_a:.6f}")])
             writer.writerow(["配置", "零电流波动阈值(A)", self._history_config_summary(lambda config: f"{config.zero_current_flat_threshold_a:.6f}")])
             writer.writerow(["配置", "零电流保持时间(ms)", self._history_config_summary(lambda config: f"{config.zero_current_hold_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "低电平保持时间(ms)", self._history_config_summary(lambda config: f"{config.brake_low_hold_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "最小下降时间(ms)", self._history_config_summary(lambda config: f"{config.brake_min_fall_s * 1000.0:.6f}")])
+            writer.writerow(["配置", "最大下降时间(ms)", self._history_config_summary(lambda config: f"{config.brake_max_fall_s * 1000.0:.6f}")])
             writer.writerow(["配置", "回溯脉冲数", self._history_config_summary(lambda config: str(config.brake_backtrack_pulses))])
             writer.writerow([])
 

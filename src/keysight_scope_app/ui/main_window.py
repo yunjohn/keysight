@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QMenu,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
@@ -24,7 +25,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSizePolicy,
     QHeaderView,
     QTableWidget,
@@ -40,6 +40,7 @@ from keysight_scope_app.device.instrument import (
     MEASUREMENT_DEFINITIONS,
     MeasurementResult,
     SUPPORTED_CHANNELS,
+    SUPPORTED_ACQUIRE_TYPES,
     SUPPORTED_TRIGGER_SLOPES,
     SUPPORTED_TRIGGER_SWEEPS,
     SUPPORTED_WAVEFORM_POINTS_MODES,
@@ -75,6 +76,12 @@ WAVEFORM_MODE_DEFAULT_POINTS = {
     "NORMal": 2000,
     "MAXimum": 10000,
     "RAW": 20000,
+}
+ACQUIRE_TYPE_LABELS = {
+    "NORMal": "普通",
+    "AVERage": "平均",
+    "HRESolution": "高分辨率",
+    "PEAK": "峰值检测",
 }
 AUTHOR_NAME = "徐"
 APP_TITLE = f"Keysight 示波器助手 | 作者：{AUTHOR_NAME}"
@@ -134,11 +141,14 @@ class ScopeMainWindow(QMainWindow):
         self.channel_vertical_layouts: dict[str, dict[str, float]] = {}
         self._connect_request_id = 0
         self._updating_scope_display_checks = False
+        self._updating_acquire_type_combo = False
+        self._last_applied_acquire_type = "NORMal"
         self._persist_ui_settings_enabled = False
         self._waveform_mode_max_points_hint = ""
         self._single_trigger_waiting = False
         self._current_timebase_mode = "UNKNOWN"
         self._trigger_status_poll_inflight = False
+        self._full_idn_text = "-"
         self.last_capture_path: Path | None = None
         self.last_waveform_bundle: list[WaveformData] = []
         self.last_waveform_data: WaveformData | None = None
@@ -147,9 +157,9 @@ class ScopeMainWindow(QMainWindow):
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(build_app_icon())
-        self.resize(1480, 920)
         self._build_ui()
         self._build_timer()
+        self._apply_initial_window_geometry()
         self.log("界面已启动。请先点击“刷新资源”，确认示波器地址后再连接。")
 
     def _build_ui(self) -> None:
@@ -165,17 +175,12 @@ class ScopeMainWindow(QMainWindow):
         left_panel.setContentsMargins(0, 0, 0, 0)
         left_panel.setSpacing(12)
 
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setWidget(left_container)
-
         right_container = QWidget()
         right_panel = QVBoxLayout(right_container)
         right_panel.setContentsMargins(0, 0, 0, 0)
         right_panel.setSpacing(12)
 
-        root.addWidget(left_scroll, 2)
+        root.addWidget(left_container, 2)
         root.addWidget(right_container, 1)
 
         top_status = QGridLayout()
@@ -184,6 +189,8 @@ class ScopeMainWindow(QMainWindow):
 
         self.status_value = QLabel("未连接")
         self.idn_value = QLabel("-")
+        self.idn_value.setWordWrap(False)
+        self.idn_value.setToolTip("-")
         self.capture_value = QLabel("-")
         top_status.addWidget(self._build_status_card("连接状态", self.status_value), 0, 0)
         top_status.addWidget(self._build_status_card("设备标识", self.idn_value), 0, 1)
@@ -216,6 +223,23 @@ class ScopeMainWindow(QMainWindow):
         self.resource_hint.setWordWrap(True)
         connection_layout.addWidget(self.resource_hint, 1, 0, 1, 6)
         left_panel.addWidget(connection_box)
+
+        acquire_box = self._group_box("采集控制")
+        acquire_layout = QHBoxLayout(acquire_box)
+        acquire_layout.setContentsMargins(12, 10, 12, 10)
+        acquire_layout.setSpacing(8)
+        self.acquire_type_combo = QComboBox()
+        for acquire_type in SUPPORTED_ACQUIRE_TYPES:
+            self.acquire_type_combo.addItem(ACQUIRE_TYPE_LABELS.get(acquire_type, acquire_type), acquire_type)
+        self.run_button = QPushButton("RUN")
+        self.stop_button = QPushButton("STOP")
+        acquire_layout.addWidget(QLabel("采集类型"))
+        acquire_layout.addWidget(self.acquire_type_combo)
+        acquire_layout.addSpacing(16)
+        acquire_layout.addWidget(self.run_button)
+        acquire_layout.addWidget(self.stop_button)
+        acquire_layout.addStretch(1)
+        left_panel.addWidget(acquire_box)
 
         trigger_box = self._group_box("触发设置")
         trigger_layout = QGridLayout(trigger_box)
@@ -298,6 +322,9 @@ class ScopeMainWindow(QMainWindow):
         self.interval_input.setRange(0.2, 10.0)
         self.interval_input.setSingleStep(0.2)
         self.interval_input.setValue(1.0)
+        self.single_button = QPushButton("单次测量")
+        self.auto_measure_button = QPushButton("启动自动测量")
+        self.auto_measure_button.setMinimumWidth(132)
         self.measurement_status = QLabel("自动测量：未启动")
         self.measurement_status.setFont(QFont(self.measurement_status.font().family(), self.measurement_status.font().pointSize(), QFont.Bold))
         self.last_update_value = QLabel("最近更新：-")
@@ -307,6 +334,9 @@ class ScopeMainWindow(QMainWindow):
         top_row.addSpacing(16)
         top_row.addWidget(QLabel("轮询间隔(s)"))
         top_row.addWidget(self.interval_input)
+        top_row.addSpacing(16)
+        top_row.addWidget(self.single_button)
+        top_row.addWidget(self.auto_measure_button)
         top_row.addSpacing(16)
         top_row.addWidget(self.measurement_status)
         top_row.addStretch(1)
@@ -345,23 +375,6 @@ class ScopeMainWindow(QMainWindow):
             template_row.addWidget(button)
         template_row.addStretch(1)
         measure_layout.addLayout(template_row)
-
-        action_row = QHBoxLayout()
-        self.single_button = QPushButton("单次测量")
-        self.auto_measure_button = QPushButton("启动自动测量")
-        self.auto_measure_button.setMinimumWidth(132)
-        self.autoscale_button = QPushButton("AUToscale")
-        self.run_button = QPushButton("RUN")
-        self.stop_button = QPushButton("STOP")
-        for button in (
-            self.single_button,
-            self.auto_measure_button,
-            self.autoscale_button,
-            self.run_button,
-            self.stop_button,
-        ):
-            action_row.addWidget(button)
-        measure_layout.addLayout(action_row)
 
         waveform_row = QHBoxLayout()
         self.waveform_mode_combo = QComboBox()
@@ -441,13 +454,20 @@ class ScopeMainWindow(QMainWindow):
 
         screenshot_box = self._group_box("截图")
         screenshot_layout = QVBoxLayout(screenshot_box)
+        screenshot_action_row = QHBoxLayout()
         self.capture_button = QPushButton("一键截图")
-        screenshot_layout.addWidget(self.capture_button)
+        self.copy_capture_button = QPushButton("复制截图")
+        self.copy_capture_button.setEnabled(False)
+        screenshot_action_row.addWidget(self.capture_button)
+        screenshot_action_row.addWidget(self.copy_capture_button)
+        screenshot_action_row.addStretch(1)
+        screenshot_layout.addLayout(screenshot_action_row)
         self.preview_label = QLabel("暂无截图预览")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setFrameShape(QFrame.StyledPanel)
         self.preview_label.setMinimumSize(240, 180)
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview_label.setContextMenuPolicy(Qt.CustomContextMenu)
         screenshot_layout.addWidget(self.preview_label, 1)
 
         result_splitter = QSplitter(Qt.Horizontal)
@@ -485,10 +505,11 @@ class ScopeMainWindow(QMainWindow):
         self.error_button.clicked.connect(self.query_system_error)
         self.single_button.clicked.connect(self.run_single_measurement)
         self.auto_measure_button.clicked.connect(self.toggle_auto_measurement)
-        self.autoscale_button.clicked.connect(self.autoscale)
         self.run_button.clicked.connect(self.run_scope)
         self.stop_button.clicked.connect(self.stop_scope)
         self.capture_button.clicked.connect(self.capture_screenshot)
+        self.copy_capture_button.clicked.connect(self.copy_screenshot_to_clipboard)
+        self.preview_label.customContextMenuRequested.connect(self._show_preview_context_menu)
         self.read_trigger_status_button.clicked.connect(self.read_trigger_status)
         self.single_trigger_button.clicked.connect(self.arm_single_trigger)
         self.standard_mode_button.clicked.connect(self.toggle_timebase_mode)
@@ -500,6 +521,7 @@ class ScopeMainWindow(QMainWindow):
         self.load_waveform_button.clicked.connect(self.load_waveform_csv)
         self.export_waveform_button.clicked.connect(self.export_waveform_csv)
         self.open_startup_brake_button.clicked.connect(self.show_startup_brake_dialog)
+        self.acquire_type_combo.currentIndexChanged.connect(self._on_acquire_type_changed)
         self.waveform_points_input.valueChanged.connect(lambda _: self._save_ui_state())
         self.trigger_source_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
         self.trigger_slope_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
@@ -524,6 +546,7 @@ class ScopeMainWindow(QMainWindow):
 
     def _current_ui_state(self) -> dict:
         return {
+            "acquire_type": str(self.acquire_type_combo.currentData()),
             "waveform_mode": self.waveform_mode_combo.currentText(),
             "waveform_points": int(self.waveform_points_input.value()),
             "trigger": {
@@ -549,6 +572,12 @@ class ScopeMainWindow(QMainWindow):
         except Exception as exc:
             self.log(f"界面设置加载失败: {exc}")
             return
+
+        acquire_type = payload.get("acquire_type")
+        if acquire_type in SUPPORTED_ACQUIRE_TYPES:
+            index = self.acquire_type_combo.findData(str(acquire_type))
+            if index >= 0:
+                self.acquire_type_combo.setCurrentIndex(index)
 
         waveform_mode = payload.get("waveform_mode")
         if waveform_mode in SUPPORTED_WAVEFORM_POINTS_MODES:
@@ -684,10 +713,18 @@ class ScopeMainWindow(QMainWindow):
         layout = QVBoxLayout(card)
         title_label = QLabel(title)
         title_label.setFont(QFont(title_label.font().family(), title_label.font().pointSize(), QFont.Bold))
-        value_label.setWordWrap(True)
+        if value_label is not self.idn_value:
+            value_label.setWordWrap(True)
         layout.addWidget(title_label)
         layout.addWidget(value_label)
         return card
+
+    def _set_idn_text(self, text: str) -> None:
+        self._full_idn_text = text
+        self.idn_value.setToolTip(text)
+        available_width = max(self.idn_value.width() - 4, 80)
+        elided = self.idn_value.fontMetrics().elidedText(text, Qt.ElideRight, available_width)
+        self.idn_value.setText(elided)
 
     def _stabilize_push_buttons(self, container: QWidget) -> None:
         for button in container.findChildren(QPushButton):
@@ -698,6 +735,25 @@ class ScopeMainWindow(QMainWindow):
     def _normalize_label_alignment(self, container: QWidget) -> None:
         for label in container.findChildren(QLabel):
             label.setAlignment(label.alignment() | Qt.AlignVCenter)
+
+    def _apply_initial_window_geometry(self) -> None:
+        self.adjustSize()
+        size_hint = self.sizeHint().expandedTo(self.minimumSizeHint())
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            max_width = max(available.width() - 40, 960)
+            max_height = max(available.height() - 60, 720)
+        else:
+            max_width = 1600
+            max_height = 1000
+
+        target_width = min(size_hint.width() + 180, max_width)
+        target_height = min(size_hint.height() + 24, max_height)
+        minimum_width = min(max(1280, size_hint.width()), target_width)
+        minimum_height = min(max(840, size_hint.height()), target_height)
+        self.setMinimumSize(minimum_width, minimum_height)
+        self.resize(target_width, target_height)
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -765,10 +821,11 @@ class ScopeMainWindow(QMainWindow):
                 pass
 
         self.scope, idn = result
+        self.acquire_type_combo.setEnabled(True)
         self._single_trigger_waiting = False
         self.resource_combo.setCurrentText(self.scope.resource_name)
         self.status_value.setText("已连接")
-        self.idn_value.setText(idn)
+        self._set_idn_text(idn)
         self.measurement_status.setText("自动测量：未启动")
         self._refresh_auto_measure_button()
         self._set_trigger_buttons_busy(False)
@@ -779,6 +836,13 @@ class ScopeMainWindow(QMainWindow):
             on_success=self._update_channel_units,
             success_message="通道单位识别完成。",
             ui_guard=self._scope_ui_guard(self.scope),
+        )
+        self._run_task(
+            self.scope.get_acquire_type,
+            on_success=self._apply_acquire_type_to_controls,
+            success_message="采集类型同步完成。",
+            ui_guard=self._scope_ui_guard(self.scope),
+            on_error=lambda error: self.log(f"采集类型同步失败: {error}"),
         )
         self._run_task(
             lambda: self._get_scope_display_context(self.scope),
@@ -798,6 +862,7 @@ class ScopeMainWindow(QMainWindow):
         self.scope = None
         self._single_trigger_waiting = False
         self._stop_trigger_status_polling()
+        self.acquire_type_combo.setEnabled(True)
         self._connect_request_id += 1
         self.last_waveform_data = None
         self.last_waveform_bundle = []
@@ -810,8 +875,9 @@ class ScopeMainWindow(QMainWindow):
         self._waveform_mode_max_points_hint = ""
         self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
         self._sync_channel_unit_controls()
+        self._apply_acquire_type_to_controls("NORMal")
         self.status_value.setText("未连接")
-        self.idn_value.setText("-")
+        self._set_idn_text("-")
         self.measurement_status.setText("自动测量：未启动")
         self.trigger_status_value.setText("边沿触发：未读取")
         self._set_trigger_event_unknown()
@@ -832,12 +898,6 @@ class ScopeMainWindow(QMainWindow):
             on_success=lambda error: self.log(f"SYST:ERR -> {error}"),
             ui_guard=self._scope_ui_guard(scope),
         )
-
-    def autoscale(self) -> None:
-        scope = self._get_scope_or_warn()
-        if scope is None:
-            return
-        self._run_task(scope.autoscale, success_message="AUToscale 已执行。", ui_guard=self._scope_ui_guard(scope))
 
     def run_scope(self) -> None:
         scope = self._get_scope_or_warn()
@@ -983,6 +1043,7 @@ class ScopeMainWindow(QMainWindow):
     def _on_screenshot_saved(self, image_path: Path) -> None:
         self.last_capture_path = image_path
         self.capture_value.setText(str(image_path))
+        self.copy_capture_button.setEnabled(True)
         self.log(f"截图已保存: {image_path}")
         self._update_preview(image_path)
 
@@ -996,7 +1057,7 @@ class ScopeMainWindow(QMainWindow):
 
         points_mode = self.waveform_mode_combo.currentText()
         points = int(self.waveform_points_input.value())
-        self.log(f"开始同步示波器当前显示通道并抓取波形: {points_mode}, {points} 点。")
+        self.log(f"开始同步示波器当前显示通道并抓取波形: 采集类型 {self.acquire_type_combo.currentText()} / {points_mode} / {points} 点。")
         self._run_task(
             lambda: self._fetch_waveforms_from_scope_display(scope, points_mode, points),
             on_success=self._on_scope_waveforms_fetched,
@@ -1048,6 +1109,55 @@ class ScopeMainWindow(QMainWindow):
             primary_channel = self._apply_scope_displayed_channels(supported_channels, log_prefix="抓取前已同步示波器显示通道")
             waveforms = self._reorder_waveforms_for_primary_channel(waveforms, primary_channel)
         self._on_waveforms_fetched(waveforms)
+
+    def _apply_acquire_type_to_controls(self, acquire_type: str) -> None:
+        index = self.acquire_type_combo.findData(acquire_type)
+        if index >= 0:
+            self._updating_acquire_type_combo = True
+            try:
+                self.acquire_type_combo.setCurrentIndex(index)
+            finally:
+                self._updating_acquire_type_combo = False
+            self._last_applied_acquire_type = acquire_type
+            self._save_ui_state()
+
+    def _on_acquire_type_changed(self, index: int) -> None:
+        if self._updating_acquire_type_combo:
+            return
+        self._save_ui_state()
+        scope = self.scope
+        if scope is None or not scope.is_connected or index < 0:
+            return
+        acquire_type = str(self.acquire_type_combo.itemData(index))
+        acquire_label = self.acquire_type_combo.itemText(index)
+        self.acquire_type_combo.setEnabled(False)
+        self.log(f"正在切换采集类型: {acquire_label}")
+        self._run_task(
+            lambda captured_scope=scope, captured_type=acquire_type: captured_scope.set_acquire_type(captured_type),
+            on_success=lambda captured_type=acquire_type: self._on_acquire_type_applied(captured_type),
+            success_message=f"采集类型已切换为 {acquire_label}。",
+            ui_guard=self._scope_ui_guard(scope),
+            on_error=lambda error, captured_scope=scope, previous_type=self._last_applied_acquire_type: self._handle_acquire_type_change_error(
+                error,
+                captured_scope,
+                previous_type,
+            ),
+        )
+
+    def _on_acquire_type_applied(self, acquire_type: str) -> None:
+        self.acquire_type_combo.setEnabled(True)
+        self._last_applied_acquire_type = acquire_type
+
+    def _handle_acquire_type_change_error(
+        self,
+        error: Exception,
+        scope: KeysightOscilloscope,
+        previous_type: str,
+    ) -> None:
+        self.acquire_type_combo.setEnabled(True)
+        if self.scope is scope and scope.is_connected:
+            self._apply_acquire_type_to_controls(previous_type)
+        self._handle_error(error)
 
     def sync_scope_displayed_channels(self) -> None:
         scope = self._get_scope_or_warn()
@@ -1132,6 +1242,25 @@ class ScopeMainWindow(QMainWindow):
         )
         self.preview_label.setText("")
         self.preview_label.setPixmap(scaled)
+
+    def copy_screenshot_to_clipboard(self) -> None:
+        if self.last_capture_path is None or not self.last_capture_path.exists():
+            self._show_warning("当前没有可复制的截图。")
+            return
+        pixmap = QPixmap(str(self.last_capture_path))
+        if pixmap.isNull():
+            self._show_warning("截图文件无法读取，不能复制。")
+            return
+        QApplication.clipboard().setPixmap(pixmap)
+        self.log("截图已复制到剪贴板。")
+
+    def _show_preview_context_menu(self, position) -> None:
+        menu = QMenu(self)
+        copy_action = menu.addAction("复制截图")
+        copy_action.setEnabled(self.last_capture_path is not None and self.last_capture_path.exists())
+        chosen = menu.exec(self.preview_label.mapToGlobal(position))
+        if chosen is copy_action:
+            self.copy_screenshot_to_clipboard()
 
     def _on_waveforms_fetched(self, waveforms: list[WaveformData]) -> None:
         self._apply_fetched_waveforms(
@@ -1702,6 +1831,7 @@ class ScopeMainWindow(QMainWindow):
         super().closeEvent(event)
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
+        self._set_idn_text(self._full_idn_text)
         super().resizeEvent(event)
         if self.last_capture_path and self.last_capture_path.exists():
             self._update_preview(self.last_capture_path)

@@ -256,6 +256,16 @@ class WaveformDetailDialog(QDialog):
         toolbar.addWidget(self.measurement_scope_combo)
         layout.addLayout(toolbar)
 
+        self.operation_hint_label = QLabel(
+            "左键框选放大时间轴，Shift+左键拖动平移，滚轮双轴缩放，Shift+滚轮缩放时间轴，Ctrl+滚轮缩放幅值，右键管理游标。"
+        )
+        self.operation_hint_label.setWordWrap(True)
+        self.operation_hint_label.setStyleSheet("color: #5f6b76;")
+        hint_font = self.operation_hint_label.font()
+        hint_font.setPointSize(max(hint_font.pointSize() - 1, 9))
+        self.operation_hint_label.setFont(hint_font)
+        layout.addWidget(self.operation_hint_label)
+
         self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
         self.analysis_panel.channel_unit_resolver = self._channel_unit
         self.analysis_panel.cursor_readout_changed = self._handle_cursor_measurements_changed

@@ -88,6 +88,7 @@ MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
 
 SUPPORTED_CHANNELS = ("CHANnel1", "CHANnel2", "CHANnel3", "CHANnel4")
 SUPPORTED_WAVEFORM_POINTS_MODES = ("NORMal", "MAXimum", "RAW")
+SUPPORTED_ACQUIRE_TYPES = ("NORMal", "AVERage", "HRESolution", "PEAK")
 SUPPORTED_TRIGGER_SLOPES = ("POSitive", "NEGative", "EITHer")
 SUPPORTED_TRIGGER_SWEEPS = ("AUTO", "NORMal")
 KNOWN_KEYSIGHT_VENDORS = ("KEYSIGHT", "AGILENT")
@@ -177,9 +178,6 @@ class KeysightOscilloscope:
                 self._invalidate_session()
                 raise RuntimeError("示波器会话已失效，请重新连接设备。") from exc
 
-    def autoscale(self) -> None:
-        self.write(":AUToscale")
-
     def single(self) -> None:
         self.write(":SINGle")
 
@@ -268,6 +266,14 @@ class KeysightOscilloscope:
     def set_timebase_mode(self, mode: str) -> None:
         normalized = mode.strip().upper()
         self.write(f":TIMebase:MODE {normalized}")
+
+    def get_acquire_type(self) -> str:
+        response = self.query(":ACQuire:TYPE?")
+        return _normalize_acquire_type(response)
+
+    def set_acquire_type(self, acquire_type: str) -> None:
+        normalized = _normalize_acquire_type(acquire_type)
+        self.write(f":ACQuire:TYPE {normalized}")
 
     def get_trigger_event_status(self) -> bool:
         response = self.query(":TER?")
@@ -527,6 +533,31 @@ def _normalize_trigger_sweep(value: str) -> str:
     if normalized.startswith("NORM") or normalized.startswith("TRIG"):
         return "NORMal"
     raise ValueError(f"不支持的触发扫描模式: {value}")
+
+
+def _normalize_acquire_type(value: str) -> str:
+    normalized = value.strip().upper()
+    aliases = {
+        "NORMAL": "NORMal",
+        "NORM": "NORMal",
+        "NORMALIZED": "NORMal",
+        "AVERAGE": "AVERage",
+        "AVER": "AVERage",
+        "AVERAGES": "AVERage",
+        "HRES": "HRESolution",
+        "HRESOLUTION": "HRESolution",
+        "HIGHRESOLUTION": "HRESolution",
+        "HIGH RESOLUTION": "HRESolution",
+        "PEAK": "PEAK",
+        "PEAKDETECT": "PEAK",
+        "PEAK DETECT": "PEAK",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    for supported in SUPPORTED_ACQUIRE_TYPES:
+        if normalized == supported.upper():
+            return supported
+    raise ValueError(f"不支持的采集类型: {value}")
 
 
 def _parse_preamble(values: list[float]) -> WaveformPreamble:

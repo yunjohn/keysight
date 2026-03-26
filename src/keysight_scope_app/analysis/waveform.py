@@ -557,7 +557,7 @@ class WaveformData:
             abs_threshold=effective_zero_threshold,
             flat_threshold=flat_threshold,
             hold_time_s=hold_time_s,
-            relaxed_mean_abs_limit=max(flat_threshold * 2.0, zero_threshold * 0.25),
+            relaxed_mean_abs_limit=effective_zero_threshold,
             relaxed_std_limit=max(flat_threshold, zero_threshold * 0.5),
         )
 

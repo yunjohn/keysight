@@ -7,6 +7,8 @@ from keysight_scope_app.analysis.waveform import (
     SpeedTargetMatch,
     WaveformData,
     ZeroStableWindow,
+    _edge_threshold,
+    _find_crossings,
     _find_stable_window,
 )
 
@@ -26,9 +28,14 @@ class StartupBrakeTestConfig:
     control_threshold_ratio: float = 0.02
     startup_min_voltage_step: float = 1.0
     startup_hold_s: float = 0.001
+    startup_min_rise_s: float = 0.0
+    startup_max_rise_s: float = 0.0
     zero_current_threshold_a: float = 0.5
     zero_current_flat_threshold_a: float = 0.03
     zero_current_hold_s: float = 0.002
+    brake_low_hold_s: float = 0.002
+    brake_min_fall_s: float = 0.0
+    brake_max_fall_s: float = 0.0
     brake_mode: str = "current_zero"
     brake_backtrack_pulses: int = 8
     brake_backtrack_min_step: float = 0.0
@@ -102,6 +109,8 @@ def analyze_startup_brake_test(
             threshold_ratio=config.control_threshold_ratio,
             min_voltage_step=config.startup_min_voltage_step,
             hold_time_s=config.startup_hold_s,
+            min_rise_s=config.startup_min_rise_s,
+            max_rise_s=config.startup_max_rise_s,
         )
         if startup_start is None:
             raise ValueError("未检测到满足跳变与保持条件的控制器启动上升沿。")
@@ -146,12 +155,31 @@ def analyze_startup_brake_test(
         if speed_zero_window is None:
             raise ValueError("未检测到转速归零稳定区间。")
 
-        brake_start = control_waveform.find_previous_edge(
-            speed_zero_window.start_time_s,
-            count=1,
-            edge_type="falling",
-            threshold_ratio=config.control_threshold_ratio,
+        slowdown_onset_time = _find_speed_slowdown_onset(
+            speed_waveform,
+            start_time=startup_start[0] if startup_start is not None else speed_waveform.x_values[0],
+            tolerance_ratio=max(config.speed_tolerance_ratio, 0.01),
+            consecutive_periods=max(config.speed_consecutive_periods, 2),
         )
+
+        primary_reference_time = slowdown_onset_time if slowdown_onset_time is not None else speed_zero_window.start_time_s
+        brake_start = _find_brake_start_edge(
+            control_waveform,
+            reference_time=primary_reference_time,
+            threshold_ratio=config.control_threshold_ratio,
+            low_hold_s=config.brake_low_hold_s,
+            min_fall_s=config.brake_min_fall_s,
+            max_fall_s=config.brake_max_fall_s,
+        )
+        if brake_start is None and primary_reference_time != speed_zero_window.start_time_s:
+            brake_start = _find_brake_start_edge(
+                control_waveform,
+                reference_time=speed_zero_window.start_time_s,
+                threshold_ratio=config.control_threshold_ratio,
+                low_hold_s=config.brake_low_hold_s,
+                min_fall_s=config.brake_min_fall_s,
+                max_fall_s=config.brake_max_fall_s,
+            )
         if brake_start is None:
             raise ValueError("未检测到转速归零前的控制器下降沿。")
 
@@ -209,6 +237,8 @@ def _find_startup_edge(
     threshold_ratio: float,
     min_voltage_step: float,
     hold_time_s: float,
+    min_rise_s: float,
+    max_rise_s: float,
 ) -> tuple[float, float] | None:
     if not waveform.x_values or not waveform.y_values:
         return None
@@ -216,6 +246,10 @@ def _find_startup_edge(
         raise ValueError("启动最小跳变不能为负数。")
     if hold_time_s < 0:
         raise ValueError("启动保持时间不能为负数。")
+    if min_rise_s < 0 or max_rise_s < 0:
+        raise ValueError("启动上升时间门限不能为负数。")
+    if max_rise_s and min_rise_s > max_rise_s:
+        raise ValueError("启动最小上升时间不能大于最大上升时间。")
 
     threshold_edge = waveform.find_first_edge("rising", threshold_ratio=threshold_ratio)
     if threshold_edge is None:
@@ -243,15 +277,195 @@ def _find_startup_edge(
 
         if valid and (hold_time_s == 0 or (probe_index < point_count or waveform.x_values[-1] >= hold_end_time)):
             if index == 0:
-                return time_value, required_level
-            previous_time = waveform.x_values[index - 1]
-            previous_value = waveform.y_values[index - 1]
-            delta_value = signal_value - previous_value
-            if delta_value == 0:
-                return time_value, required_level
-            ratio = (required_level - previous_value) / delta_value
-            crossing_time = previous_time + ratio * (time_value - previous_time)
-            return crossing_time, required_level
+                crossing_time = time_value
+            else:
+                previous_time = waveform.x_values[index - 1]
+                previous_value = waveform.y_values[index - 1]
+                delta_value = signal_value - previous_value
+                if delta_value == 0:
+                    crossing_time = time_value
+                else:
+                    ratio = (required_level - previous_value) / delta_value
+                    crossing_time = previous_time + ratio * (time_value - previous_time)
+            rise_duration_s = _transition_duration_around_time(waveform, edge_type="rising", anchor_time=crossing_time)
+            if _duration_within_limits(rise_duration_s, minimum_s=min_rise_s, maximum_s=max_rise_s):
+                return crossing_time, required_level
+    return None
+
+
+def _find_brake_start_edge(
+    waveform: WaveformData,
+    *,
+    reference_time: float,
+    threshold_ratio: float,
+    low_hold_s: float,
+    min_fall_s: float,
+    max_fall_s: float,
+) -> tuple[float, float] | None:
+    if not waveform.x_values or not waveform.y_values:
+        return None
+    if low_hold_s < 0:
+        raise ValueError("刹车低电平保持时间不能为负数。")
+
+    preview_threshold = _logic_edge_threshold(waveform, edge_type="falling", threshold_ratio=threshold_ratio)
+    stats = waveform.analyze()
+    amplitude = max(stats.logic_high_v - stats.logic_low_v, 0.0)
+    confirm_threshold = stats.logic_low_v + amplitude * 0.2
+    confirm_rebound_threshold = confirm_threshold + amplitude * 0.05
+    confirm_hold_s = max(low_hold_s, waveform.preamble.x_increment * 2.0, 0.0001)
+    max_confirm_delay_s = max(waveform.preamble.x_increment * 80.0, 0.03)
+
+    falling_edges = [
+        crossing
+        for crossing in _find_crossings(waveform.x_values, waveform.y_values, preview_threshold, "falling")
+        if crossing <= reference_time
+    ]
+    if not falling_edges or amplitude <= 0:
+        return None
+    for crossing in reversed(falling_edges):
+        fall_duration_s = _transition_duration_around_time(waveform, edge_type="falling", anchor_time=crossing)
+        if not _duration_within_limits(fall_duration_s, minimum_s=min_fall_s, maximum_s=max_fall_s):
+            continue
+        if _falling_edge_reaches_low_region(
+            waveform,
+            crossing_time=crossing,
+            confirm_threshold=confirm_threshold,
+            confirm_rebound_threshold=confirm_rebound_threshold,
+            confirm_hold_s=confirm_hold_s,
+            max_confirm_delay_s=max_confirm_delay_s,
+        ):
+            return crossing, preview_threshold
+    return None
+
+
+def _logic_edge_threshold(
+    waveform: WaveformData,
+    *,
+    edge_type: str,
+    threshold_ratio: float,
+) -> float:
+    stats = waveform.analyze()
+    logic_low = stats.logic_low_v
+    logic_high = stats.logic_high_v
+    amplitude = logic_high - logic_low
+    if edge_type == "rising":
+        return logic_low + amplitude * threshold_ratio
+    if edge_type == "falling":
+        return logic_high - amplitude * threshold_ratio
+    raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+
+def _duration_within_limits(duration_s: float | None, *, minimum_s: float, maximum_s: float) -> bool:
+    if minimum_s <= 0 and maximum_s <= 0:
+        return True
+    if duration_s is None:
+        return False
+    if minimum_s > 0 and duration_s < minimum_s:
+        return False
+    if maximum_s > 0 and duration_s > maximum_s:
+        return False
+    return True
+
+
+def _transition_duration_around_time(
+    waveform: WaveformData,
+    *,
+    edge_type: str,
+    anchor_time: float,
+) -> float | None:
+    stats = waveform.analyze()
+    amplitude = max(stats.logic_high_v - stats.logic_low_v, 0.0)
+    if amplitude <= 0:
+        return None
+
+    low_threshold = stats.logic_low_v + amplitude * 0.1
+    high_threshold = stats.logic_low_v + amplitude * 0.9
+    if edge_type == "rising":
+        start_crossings = _find_crossings(waveform.x_values, waveform.y_values, low_threshold, "rising")
+        end_crossings = _find_crossings(waveform.x_values, waveform.y_values, high_threshold, "rising")
+    elif edge_type == "falling":
+        start_crossings = _find_crossings(waveform.x_values, waveform.y_values, high_threshold, "falling")
+        end_crossings = _find_crossings(waveform.x_values, waveform.y_values, low_threshold, "falling")
+    else:
+        raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+    end_index = 0
+    for start_time in start_crossings:
+        while end_index < len(end_crossings) and end_crossings[end_index] < start_time:
+            end_index += 1
+        if end_index >= len(end_crossings):
+            break
+        end_time = end_crossings[end_index]
+        if start_time <= anchor_time <= end_time:
+            return end_time - start_time
+    return None
+
+
+def _falling_edge_reaches_low_region(
+    waveform: WaveformData,
+    *,
+    crossing_time: float,
+    confirm_threshold: float,
+    confirm_rebound_threshold: float,
+    confirm_hold_s: float,
+    max_confirm_delay_s: float,
+) -> bool:
+    point_count = min(len(waveform.x_values), len(waveform.y_values))
+    start_index = 0
+    while start_index < point_count and waveform.x_values[start_index] < crossing_time:
+        start_index += 1
+
+    low_entry_index: int | None = None
+    for index in range(start_index, point_count):
+        time_value = waveform.x_values[index]
+        if time_value - crossing_time > max_confirm_delay_s:
+            return False
+        if waveform.y_values[index] <= confirm_threshold:
+            low_entry_index = index
+            break
+
+    if low_entry_index is None:
+        return False
+
+    hold_until = waveform.x_values[low_entry_index] + confirm_hold_s
+    probe_index = low_entry_index
+    while probe_index < point_count and waveform.x_values[probe_index] <= hold_until:
+        if waveform.y_values[probe_index] > confirm_rebound_threshold:
+            return False
+        probe_index += 1
+    return probe_index > low_entry_index
+
+
+def _find_speed_slowdown_onset(
+    waveform: WaveformData,
+    *,
+    start_time: float,
+    tolerance_ratio: float,
+    consecutive_periods: int,
+) -> float | None:
+    if not waveform.x_values or not waveform.y_values:
+        return None
+
+    threshold = _edge_threshold(waveform.y_values, edge_type="rising", threshold_ratio=0.5)
+    crossings = [crossing for crossing in _find_crossings(waveform.x_values, waveform.y_values, threshold, "rising") if crossing >= start_time]
+    if len(crossings) < consecutive_periods + 3:
+        return None
+
+    periods = [
+        (crossings[index], crossings[index + 1] - crossings[index])
+        for index in range(len(crossings) - 1)
+    ]
+    for index in range(3, len(periods) - consecutive_periods + 1):
+        baseline_samples = [period for _, period in periods[max(0, index - 5):index]]
+        if len(baseline_samples) < 3:
+            continue
+        sorted_baseline = sorted(baseline_samples)
+        baseline = sorted_baseline[len(sorted_baseline) // 2]
+        if baseline <= 0:
+            continue
+        slowdown_window = periods[index:index + consecutive_periods]
+        if all(period >= baseline * (1.0 + tolerance_ratio) for _, period in slowdown_window):
+            return slowdown_window[0][0]
     return None
 
 

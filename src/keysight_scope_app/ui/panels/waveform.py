@@ -66,6 +66,8 @@ class InteractiveChartView(QChartView):
         self._drag_callback_active = False
         self._selection_origin: QPoint | None = None
         self._selection_active = False
+        self._pan_active = False
+        self._pan_last_position: QPointF | None = None
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setMouseTracking(True)
         self.setRubberBand(QChartView.NoRubberBand)
@@ -89,6 +91,11 @@ class InteractiveChartView(QChartView):
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
         if self.hover_cursor_callback is not None:
             self.setCursor(self.hover_cursor_callback(event.position()))
+        if self._pan_active:
+            self._pan_horizontally(event.position())
+            self._update_crosshair(event.position())
+            event.accept()
+            return
         if self._drag_callback_active and self.drag_move_callback is not None:
             value, _ = self._map_position_to_plot_value(event.position())
             if self.drag_move_callback(value.x(), value.y(), event.position()):
@@ -132,6 +139,11 @@ class InteractiveChartView(QChartView):
         if event.button() == Qt.LeftButton:
             position = event.position()
             value, inside_plot = self._map_position_to_plot_value(position)
+            if inside_plot and event.modifiers() & Qt.ShiftModifier:
+                self._pan_active = True
+                self._pan_last_position = QPointF(position)
+                event.accept()
+                return
             if inside_plot and self.point_click_callback is not None:
                 if self.point_click_callback(value.x(), value.y(), position, event.modifiers(), event.button()):
                     event.accept()
@@ -159,6 +171,11 @@ class InteractiveChartView(QChartView):
             if self.drag_end_callback is not None:
                 value, _ = self._map_position_to_plot_value(event.position())
                 self.drag_end_callback(value.x(), value.y(), event.position())
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self._pan_active:
+            self._pan_active = False
+            self._pan_last_position = None
             event.accept()
             return
         if event.button() == Qt.LeftButton and self._selection_active:
@@ -303,6 +320,25 @@ class InteractiveChartView(QChartView):
         if right_value - left_value <= 0:
             return
         axis_x.setRange(left_value, right_value)
+
+    def _pan_horizontally(self, position) -> None:
+        axis_x = self._x_axis()
+        if axis_x is None or self._pan_last_position is None:
+            return
+        plot_area = self.chart().plotArea()
+        if plot_area.width() <= 0:
+            return
+        delta_pixels = position.x() - self._pan_last_position.x()
+        if abs(delta_pixels) < 0.5:
+            return
+        current_min = axis_x.min()
+        current_max = axis_x.max()
+        span = current_max - current_min
+        if span <= 0:
+            return
+        delta_value = (delta_pixels / plot_area.width()) * span
+        axis_x.setRange(current_min - delta_value, current_max - delta_value)
+        self._pan_last_position = QPointF(position)
 
 
 class WaveformAnalysisPanel(QWidget):
