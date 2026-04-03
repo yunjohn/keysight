@@ -59,12 +59,6 @@
 
 ## 打包 EXE
 
-目录版：
-
-```powershell
-.venv\Scripts\python -m PyInstaller --noconfirm --clean --windowed --name KeysightScopeApp --icon assets\app.ico --paths src main.py
-```
-
 单文件版：
 
 ```powershell
@@ -73,9 +67,32 @@
 
 打包后产物位于：
 
-- `dist\KeysightScopeApp\KeysightScopeApp.exe`
 - `dist\KeysightScopeApp-OneFile.exe`
 
+## 自动发布 Releases
+
+仓库已支持通过 GitHub Actions 自动发布 Release。
+
+触发方式：
+
+1. 提交并推送代码
+2. 创建版本标签，例如：
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+触发后，GitHub Actions 会自动：
+
+- 在 Windows 环境打包单文件版
+- 自动创建 GitHub Release
+- 上传以下产物到 Release Assets：
+  - `KeysightScopeApp-OneFile.exe`
+
+说明：
+
+- 只有推送 `v*` 标签时才会触发自动 Release
 ## 使用流程
 
 1. 点击 `刷新资源`，选择示波器资源地址。
