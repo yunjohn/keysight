@@ -794,6 +794,28 @@ def test_analyze_startup_brake_test_brake_only_mode() -> None:
     assert result.current_zero_window is not None
 
 
+def test_analyze_startup_brake_test_speed_zero_mode_does_not_require_zero_current() -> None:
+    waveforms = _build_startup_brake_waveforms()
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            test_scope_mode="brake_only",
+            brake_mode="speed_zero",
+        ),
+    )
+
+    assert result.brake_start_point is not None
+    assert result.current_zero_window is None
+    assert result.brake_end_point is not None
+    assert abs(result.brake_end_point[0] - 0.093) < 1e-9
+
+
 def test_analyze_startup_brake_test_ignores_small_control_voltage_fluctuation() -> None:
     waveforms = _build_startup_brake_waveforms()
     control_waveform = next(waveform for waveform in waveforms if waveform.channel == "CHANnel1")

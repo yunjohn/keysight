@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -33,6 +35,7 @@ from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestConfig,
     StartupBrakeTestResult,
     analyze_startup_brake_test,
+    diagnose_startup_brake_failure,
 )
 from keysight_scope_app.analysis.waveform import SignalPeak, SpeedTargetMatch, WaveformData, ZeroStableWindow
 from keysight_scope_app.ui.helpers import (
@@ -46,8 +49,11 @@ if TYPE_CHECKING:
 
 STARTUP_BRAKE_DIR = Path("captures") / "startup_brake_tests"
 STARTUP_BRAKE_HISTORY_PATH = STARTUP_BRAKE_DIR / "history.json"
+STARTUP_BRAKE_SCREENSHOT_DIR = STARTUP_BRAKE_DIR / "snapshots"
 STARTUP_BRAKE_MIN_CAPTURE_POINTS = 20000
 STARTUP_BRAKE_DISPLAY_TIMEBASE_S = 0.04
+STARTUP_BRAKE_EXPORT_MARGIN_RATIO = 0.15
+STARTUP_BRAKE_EXPORT_MIN_MARGIN_S = 0.01
 
 @dataclass(frozen=True)
 class StartupBrakeHistoryEntry:
@@ -59,7 +65,7 @@ class StartupBrakeHistoryEntry:
 class StartupBrakeTestDialog(QDialog):
     DEFAULT_SUMMARY_TEXT = (
         f"提示：执行测试时会优先抓取示波器当前最新波形，且固定至少使用 {STARTUP_BRAKE_MIN_CAPTURE_POINTS} 点；"
-        "未连接示波器时可退回使用已加载波形。"
+        "未连接示波器时可退回使用已加载波形，也可手动加载已保存波形做模拟测试。"
         "启动段建议主要调整“高电平保持时间”；刹车段真假下降沿建议优先调整“低电平保持时间”，"
         "而“零电流波动阈值”只影响电流归零稳定区间判定。"
     )
@@ -73,6 +79,8 @@ class StartupBrakeTestDialog(QDialog):
         self.channel_previous: dict[int, str] = {}
         self._test_running = False
         self._last_analysis_waveforms: list[WaveformData] = []
+        self._summary_full_text = self.DEFAULT_SUMMARY_TEXT
+        self._failure_diagnostics_full_text = "当前无失败诊断。"
 
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
@@ -92,6 +100,10 @@ class StartupBrakeTestDialog(QDialog):
         self.test_scope_mode_combo.currentIndexChanged.connect(lambda _: self._refresh_mode_fields())
         self.brake_mode_combo.currentIndexChanged.connect(lambda _: self._refresh_mode_fields())
         self.run_button.clicked.connect(self.run_test)
+        self.simulate_button.clicked.connect(self.run_simulation_test)
+        self.export_startup_waveform_button.clicked.connect(self._export_startup_segment_waveforms)
+        self.export_brake_waveform_button.clicked.connect(self._export_brake_segment_waveforms)
+        self.export_report_button.clicked.connect(self._export_test_report)
         self.apply_startup_cursor_button.clicked.connect(self._apply_startup_cursors)
         self.apply_brake_cursor_button.clicked.connect(self._apply_brake_cursors)
         self.export_stats_button.clicked.connect(self._export_history_csv)
@@ -110,6 +122,10 @@ class StartupBrakeTestDialog(QDialog):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._update_footer_texts()
 
     def handle_waveforms_updated(self) -> None:
         self.last_result = None
@@ -266,6 +282,7 @@ class StartupBrakeTestDialog(QDialog):
 
         self.brake_mode_combo = QComboBox()
         self.brake_mode_combo.addItem("电流归零", "current_zero")
+        self.brake_mode_combo.addItem("转速归零", "speed_zero")
         self.brake_mode_combo.addItem("A相回溯", "encoder_backtrack")
         self.zero_threshold_input = QDoubleSpinBox()
         self.zero_threshold_input.setDecimals(3)
@@ -348,13 +365,30 @@ class StartupBrakeTestDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
         self.run_button = QPushButton("执行测试")
+        self.simulate_button = QPushButton("加载波形模拟测试")
+        self.export_startup_waveform_button = QPushButton("导出启动段波形")
+        self.export_brake_waveform_button = QPushButton("导出刹车段波形")
+        self.export_report_button = QPushButton("导出测试报告")
         self.apply_startup_cursor_button = QPushButton("定位启动游标")
         self.apply_brake_cursor_button = QPushButton("定位刹车游标")
         self.export_stats_button = QPushButton("导出统计 CSV")
         self.clear_stats_button = QPushButton("清空统计")
         self.apply_startup_cursor_button.setEnabled(False)
         self.apply_brake_cursor_button.setEnabled(False)
+        self.export_startup_waveform_button.setEnabled(False)
+        self.export_brake_waveform_button.setEnabled(False)
+        self.export_report_button.setEnabled(False)
+        self.archive_snapshots_check = QCheckBox("自动截图归档")
+        self.archive_snapshots_check.setChecked(False)
+        self.archive_snapshots_check.setToolTip("开启后，测试完成会自动导出启动段/刹车段/全流程标准化截图。关闭可减少执行测试耗时。")
         button_row.addWidget(self.run_button)
+        button_row.addWidget(self.simulate_button)
+        button_row.addSpacing(12)
+        button_row.addWidget(self.export_startup_waveform_button)
+        button_row.addWidget(self.export_brake_waveform_button)
+        button_row.addWidget(self.export_report_button)
+        button_row.addSpacing(12)
+        button_row.addWidget(self.archive_snapshots_check)
         button_row.addSpacing(12)
         button_row.addWidget(self.apply_startup_cursor_button)
         button_row.addWidget(self.apply_brake_cursor_button)
@@ -457,7 +491,7 @@ class StartupBrakeTestDialog(QDialog):
         self.history_table.setHorizontalHeaderLabels(
             ["#", "时间", "启动(ms)", "刹车(ms)", "启动峰值(A)", "刹车峰值(A)", "命中频率(Hz)", "命中周期(ms)"]
         )
-        self.history_table.setMinimumHeight(220)
+        self.history_table.setMinimumHeight(192)
         self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.history_table.setSelectionMode(QTableWidget.NoSelection)
         self.history_table.verticalHeader().setVisible(False)
@@ -477,9 +511,24 @@ class StartupBrakeTestDialog(QDialog):
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
         layout.addWidget(self.history_table, 1)
 
-        self.summary_label = QLabel(self.DEFAULT_SUMMARY_TEXT)
-        self.summary_label.setWordWrap(True)
+        self.summary_label = QLabel()
+        self.summary_label.setWordWrap(False)
+        self.summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.summary_label.setFixedHeight(QFontMetrics(self.summary_label.font()).height() + 6)
         layout.addWidget(self.summary_label)
+
+        diagnostics_box = self._group_box("失败诊断")
+        diagnostics_layout = QVBoxLayout(diagnostics_box)
+        diagnostics_layout.setContentsMargins(10, 8, 10, 8)
+        self.failure_diagnostics_label = QLabel()
+        self.failure_diagnostics_label.setWordWrap(False)
+        self.failure_diagnostics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.failure_diagnostics_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.failure_diagnostics_label.setFixedHeight(QFontMetrics(self.failure_diagnostics_label.font()).height() + 6)
+        diagnostics_layout.addWidget(self.failure_diagnostics_label)
+        layout.addWidget(diagnostics_box)
+        self._update_footer_texts()
         return box
 
     def _inline_form_field(self, text: str, widget: QWidget) -> QWidget:
@@ -574,6 +623,7 @@ class StartupBrakeTestDialog(QDialog):
         startup_enabled = test_scope_mode in {"full", "startup_only"}
         brake_enabled = test_scope_mode in {"full", "brake_only"}
         encoder_enabled = brake_enabled and brake_mode == "encoder_backtrack"
+        current_zero_enabled = brake_enabled and brake_mode == "current_zero"
         self.target_mode_combo.setEnabled(startup_enabled)
         self.target_value_input.setEnabled(startup_enabled)
         self.tolerance_input.setEnabled(startup_enabled)
@@ -584,9 +634,9 @@ class StartupBrakeTestDialog(QDialog):
         self.startup_min_rise_ms_input.setEnabled(startup_enabled)
         self.startup_max_rise_ms_input.setEnabled(startup_enabled)
         self.brake_mode_combo.setEnabled(brake_enabled)
-        self.zero_threshold_input.setEnabled(brake_enabled)
-        self.flat_threshold_input.setEnabled(brake_enabled)
-        self.hold_ms_input.setEnabled(brake_enabled)
+        self.zero_threshold_input.setEnabled(current_zero_enabled)
+        self.flat_threshold_input.setEnabled(current_zero_enabled)
+        self.hold_ms_input.setEnabled(current_zero_enabled)
         self.brake_low_hold_ms_input.setEnabled(brake_enabled)
         self.brake_min_fall_ms_input.setEnabled(brake_enabled)
         self.brake_max_fall_ms_input.setEnabled(brake_enabled)
@@ -629,6 +679,16 @@ class StartupBrakeTestDialog(QDialog):
         item.setTextAlignment(int(Qt.AlignCenter))
         return item
 
+    def _set_single_line_text(self, label: QLabel, text: str) -> None:
+        metrics = QFontMetrics(label.font())
+        available_width = max(label.width() - 6, 24)
+        label.setText(metrics.elidedText(text, Qt.ElideRight, available_width))
+        label.setToolTip(text)
+
+    def _update_footer_texts(self) -> None:
+        self._set_single_line_text(self.summary_label, self._summary_full_text)
+        self._set_single_line_text(self.failure_diagnostics_label, self._failure_diagnostics_full_text)
+
     def _refresh_result_emphasis(self, test_scope_mode: str | None = None, brake_mode: str | None = None) -> None:
         if test_scope_mode is None:
             test_scope_mode = str(self.test_scope_mode_combo.currentData())
@@ -644,6 +704,8 @@ class StartupBrakeTestDialog(QDialog):
         if test_scope_mode != "startup_only":
             if brake_mode == "current_zero":
                 muted_keys.add("brake_end")
+            elif brake_mode == "speed_zero":
+                muted_keys.add("current_zero")
             elif brake_mode == "encoder_backtrack":
                 muted_keys.add("current_zero")
 
@@ -721,7 +783,8 @@ class StartupBrakeTestDialog(QDialog):
         if scope is not None and scope.is_connected:
             points_mode = self.main_window.waveform_mode_combo.currentText()
             points = max(int(self.main_window.waveform_points_input.value()), STARTUP_BRAKE_MIN_CAPTURE_POINTS)
-            self.summary_label.setText("正在抓取启动刹车测试所需最新波形...")
+            self._summary_full_text = "正在抓取启动刹车测试所需最新波形..."
+            self._update_footer_texts()
             self._set_test_running(True)
             self.main_window.log(
                 "启动刹车测试抓取最新波形: "
@@ -738,12 +801,81 @@ class StartupBrakeTestDialog(QDialog):
 
         available_channels = {waveform.channel for waveform in self.main_window.last_waveform_bundle}
         if required_channels and set(required_channels).issubset(available_channels):
-            self.summary_label.setText("示波器未连接，已使用当前已加载波形执行测试。")
+            self._summary_full_text = "示波器未连接，已使用当前已加载波形执行测试。"
+            self._update_footer_texts()
             self._set_test_running(True)
             self._start_background_analysis(self.main_window.last_waveform_bundle, config)
             return
 
         self.main_window._show_warning("未连接示波器，且当前已加载波形缺少测试所需通道。请先连接示波器或加载完整波形文件。")
+
+    def run_simulation_test(self) -> None:
+        if self._test_running:
+            return
+
+        start_candidates = [
+            Path("captures") / "waveforms",
+            STARTUP_BRAKE_DIR,
+        ]
+        start_dir = next((path for path in start_candidates if path.exists()), Path.cwd())
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择用于模拟测试的波形 CSV",
+            str(start_dir),
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        source_path = Path(file_path)
+        config = self._config_from_ui()
+        self._summary_full_text = "正在加载模拟测试波形..."
+        self._update_footer_texts()
+        self._set_test_running(True)
+        self.main_window.log(f"启动刹车模拟测试加载波形: {source_path}")
+        self.main_window.task_runner.run(
+            lambda: WaveformData.load_csv_bundle(source_path),
+            on_success=lambda waveforms, captured_config=config, captured_path=source_path: self._on_simulation_waveforms_ready(
+                waveforms,
+                captured_config,
+                captured_path,
+            ),
+            on_error=self._handle_test_error,
+            on_finally=None,
+        )
+
+    def _on_simulation_waveforms_ready(
+        self,
+        waveforms: list[WaveformData],
+        config: StartupBrakeTestConfig,
+        source_path: Path,
+    ) -> None:
+        required_channels = self._required_channels(config)
+        available_channels = {waveform.channel for waveform in waveforms}
+        missing_channels = [channel for channel in required_channels if channel not in available_channels]
+        if missing_channels:
+            self._set_test_running(False)
+            missing_text = "、".join(display_channel_name(channel) for channel in missing_channels)
+            self._summary_full_text = f"模拟测试失败：缺少通道 {missing_text}"
+            self._update_footer_texts()
+            self.main_window.log(
+                "启动刹车模拟测试失败，波形缺少所需通道: "
+                + missing_text
+                + f"；来源 {source_path}"
+            )
+            self.main_window._show_warning(f"所选波形缺少测试所需通道：{missing_text}")
+            return
+
+        self.main_window._apply_fetched_waveforms(
+            waveforms,
+            sync_detail_dialog=False,
+            notify_startup_dialog=False,
+            preserve_main_panel_view=False,
+        )
+        self._summary_full_text = "正在分析模拟启动刹车波形..."
+        self._update_footer_texts()
+        self.main_window.log(f"启动刹车模拟测试波形加载完成: {source_path}")
+        self._start_background_analysis(waveforms, config)
 
     def _on_waveforms_ready(
         self,
@@ -757,7 +889,8 @@ class StartupBrakeTestDialog(QDialog):
             notify_startup_dialog=False,
             preserve_main_panel_view=True,
         )
-        self.summary_label.setText("正在分析启动刹车波形...")
+        self._summary_full_text = "正在分析启动刹车波形..."
+        self._update_footer_texts()
         self._start_background_analysis(waveforms, config)
 
     def _start_background_analysis(
@@ -799,6 +932,8 @@ class StartupBrakeTestDialog(QDialog):
             f"刹车 {self._format_optional_seconds(result.brake_delay_s)}, "
             f"命中频率 {self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)}"
         )
+        if self.archive_snapshots_check.isChecked():
+            self._archive_result_snapshots(result, config, entry.timestamp)
 
     def _handle_test_error(self, exc: Exception) -> None:
         self._set_test_running(False)
@@ -806,11 +941,19 @@ class StartupBrakeTestDialog(QDialog):
         self.last_config = None
         self.clear_results(reset_summary=False)
         exported_failure_path = self._export_failure_waveforms()
-        self.summary_label.setText(f"测试失败：{exc}")
+        self._summary_full_text = f"测试失败：{exc}"
         self.main_window.log(f"启动刹车性能测试失败: {exc}")
+        diagnostic_text = (
+            diagnose_startup_brake_failure(self._last_analysis_waveforms, self._config_from_ui(), exc)
+            if self._last_analysis_waveforms
+            else str(exc)
+        )
+        self._failure_diagnostics_full_text = diagnostic_text
+        self._update_footer_texts()
+        self.main_window.log(diagnostic_text)
         if exported_failure_path is not None:
             self.main_window.log(f"失败波形已导出: {exported_failure_path}")
-        self.main_window._show_warning(str(exc))
+        self.main_window._show_warning(diagnostic_text)
 
     def _export_failure_waveforms(self) -> Path | None:
         if not self._last_analysis_waveforms:
@@ -825,11 +968,91 @@ class StartupBrakeTestDialog(QDialog):
             self.main_window.log(f"失败波形导出失败: {export_exc}")
             return None
 
+    def _archive_result_snapshots(
+        self,
+        result: StartupBrakeTestResult,
+        config: StartupBrakeTestConfig,
+        timestamp_text: str,
+    ) -> None:
+        if not self._last_analysis_waveforms:
+            return
+        try:
+            screenshot_dir = STARTUP_BRAKE_SCREENSHOT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.main_window.sync_waveform_detail_dialog(show_window=False, activate_window=False)
+            dialog = self.main_window.waveform_detail_dialog
+            relevant_channels = [
+                config.control_channel,
+                config.speed_channel,
+                config.current_channel,
+            ]
+            if config.encoder_a_channel:
+                relevant_channels.append(config.encoder_a_channel)
+
+            exports: list[tuple[str, list[str], tuple[float, float], tuple[float, float], str]] = []
+            if result.startup_start_point is not None and result.speed_reached_point is not None:
+                exports.append(
+                    (
+                        "startup",
+                        [config.control_channel, config.speed_channel, config.current_channel],
+                        result.startup_start_point,
+                        result.speed_reached_point,
+                        "Startup Window",
+                    )
+                )
+            if result.brake_start_point is not None and result.brake_end_point is not None:
+                brake_channels = [config.control_channel, config.speed_channel]
+                if result.brake_mode == "encoder_backtrack" and config.encoder_a_channel:
+                    brake_channels.append(config.encoder_a_channel)
+                else:
+                    brake_channels.append(config.current_channel)
+                exports.append(
+                    (
+                        "brake",
+                        brake_channels,
+                        result.brake_start_point,
+                        result.brake_end_point,
+                        "Brake Window",
+                    )
+                )
+            if result.test_scope_mode == "full" and result.startup_start_point is not None and result.brake_end_point is not None:
+                exports.append(
+                    (
+                        "overview",
+                        relevant_channels,
+                        result.startup_start_point,
+                        result.brake_end_point,
+                        "Full Test Window",
+                    )
+                )
+
+            exported_paths: list[Path] = []
+            for name, channels, point_a, point_b, annotation in exports:
+                output_path = screenshot_dir / f"{name}.png"
+                if dialog.export_standardized_snapshot(
+                    output_path,
+                    visible_channels=[channel for channel in channels if channel],
+                    point_a=point_a,
+                    point_b=point_b,
+                    annotation_text=annotation,
+                    padding_ratio=0.18,
+                ):
+                    exported_paths.append(output_path)
+            if exported_paths:
+                self.main_window.log(
+                    f"启动刹车结果截图已归档({timestamp_text}): " + ", ".join(str(path) for path in exported_paths)
+                )
+        except Exception as exc:
+            self.main_window.log(f"启动刹车结果截图归档失败: {exc}")
+
     def _set_test_running(self, running: bool) -> None:
         self._test_running = running
         self.run_button.setEnabled(not running)
+        self.simulate_button.setEnabled(not running)
+        self.export_startup_waveform_button.setEnabled((not running) and self.last_result is not None and self.last_result.startup_start_point is not None and self.last_result.speed_reached_point is not None)
+        self.export_brake_waveform_button.setEnabled((not running) and self.last_result is not None and self.last_result.brake_start_point is not None and self.last_result.brake_end_point is not None)
 
     def _update_results(self, result: StartupBrakeTestResult) -> None:
+        self._failure_diagnostics_full_text = "当前无失败诊断。"
         self.result_labels["startup_start"].setText(self._format_optional_point_time(result.startup_start_point))
         self.result_labels["startup_reach"].setText(self._format_optional_point_time(result.speed_reached_point))
         self.result_labels["startup_delay"].setText(self._format_optional_seconds(result.startup_delay_s))
@@ -848,32 +1071,43 @@ class StartupBrakeTestDialog(QDialog):
         )
         self.apply_startup_cursor_button.setEnabled(result.startup_start_point is not None and result.speed_reached_point is not None)
         self.apply_brake_cursor_button.setEnabled(result.brake_start_point is not None and result.brake_end_point is not None)
-        brake_mode_label = "电流归零" if result.brake_mode == "current_zero" else "A相回溯"
-        self.summary_label.setText(
+        self.export_startup_waveform_button.setEnabled(result.startup_start_point is not None and result.speed_reached_point is not None)
+        self.export_brake_waveform_button.setEnabled(result.brake_start_point is not None and result.brake_end_point is not None)
+        self.export_report_button.setEnabled(True)
+        brake_mode_label = self._brake_mode_display_text(result.brake_mode)
+        self._summary_full_text = (
             "启动刹车性能测试完成："
             f"第 {len(self.history)} 次样本，"
             f"范围 {self._test_scope_mode_display_text(result.test_scope_mode)}，"
             f"启动 {self._format_optional_seconds(result.startup_delay_s)}，"
             f"刹车 {self._format_optional_seconds(result.brake_delay_s)}，"
             f"模式 {brake_mode_label}。"
+            + (f"\n{result.brake_end_note}" if result.brake_end_note else "")
         )
+        self._update_footer_texts()
         self._refresh_marker_table(result)
 
     def clear_results(self, *, reset_summary: bool = True) -> None:
         for label in self.result_labels.values():
             label.setText("-")
         self.marker_table.setRowCount(0)
+        self._failure_diagnostics_full_text = "当前无失败诊断。"
         self._refresh_result_emphasis()
         self.apply_startup_cursor_button.setEnabled(False)
         self.apply_brake_cursor_button.setEnabled(False)
+        self.export_startup_waveform_button.setEnabled(False)
+        self.export_brake_waveform_button.setEnabled(False)
+        self.export_report_button.setEnabled(False)
         if reset_summary:
-            self.summary_label.setText(self.DEFAULT_SUMMARY_TEXT)
+            self._summary_full_text = self.DEFAULT_SUMMARY_TEXT
+        self._update_footer_texts()
 
     def clear_history(self) -> None:
         self.history = []
         self._save_history()
         self._refresh_history()
-        self.summary_label.setText("统计已清空。可继续执行测试重新累计范围。")
+        self._summary_full_text = "统计已清空。可继续执行测试重新累计范围。"
+        self._update_footer_texts()
 
     def _show_history_context_menu(self, position) -> None:
         row = self.history_table.rowAt(position.y())
@@ -893,9 +1127,11 @@ class StartupBrakeTestDialog(QDialog):
         self._save_history()
         self._refresh_history()
         if self.last_result is not None and not self.history:
-            self.summary_label.setText("测试记录已清空。可继续执行测试重新累计范围。")
+            self._summary_full_text = "测试记录已清空。可继续执行测试重新累计范围。"
+            self._update_footer_texts()
             return
-        self.summary_label.setText(f"已删除第 {row + 1} 条测试记录。")
+        self._summary_full_text = f"已删除第 {row + 1} 条测试记录。"
+        self._update_footer_texts()
 
     def _apply_result_markers(self, result: StartupBrakeTestResult) -> None:
         point_a: tuple[float, float] | None = None
@@ -1027,6 +1263,7 @@ class StartupBrakeTestDialog(QDialog):
             brake_peak_current=SignalPeak(**brake_peak_data) if brake_peak_data else None,
             brake_mode=str(data.get("brake_mode", "current_zero")),
             test_scope_mode=str(data.get("test_scope_mode", "full")),
+            brake_end_note=data.get("brake_end_note"),
         )
 
     def _point_from_value(self, value) -> tuple[float, float] | None:
@@ -1130,6 +1367,7 @@ class StartupBrakeTestDialog(QDialog):
                     "每转脉冲数",
                     "刹车模式",
                     "测试模式",
+                    "A相回溯说明",
                 ]
             )
             for index, entry in enumerate(self.history, start=1):
@@ -1155,10 +1393,12 @@ class StartupBrakeTestDialog(QDialog):
                         str(config.pulses_per_revolution) if config is not None else "",
                         self._brake_mode_display_text(result.brake_mode),
                         self._test_scope_mode_display_text(result.test_scope_mode),
+                        result.brake_end_note or "",
                     ]
                 )
 
-        self.summary_label.setText(f"统计 CSV 已导出：{output_path}")
+        self._summary_full_text = f"统计 CSV 已导出：{output_path}"
+        self._update_footer_texts()
         self.main_window.log(f"启动刹车统计已导出: {output_path}")
 
     def _apply_startup_cursors(self) -> None:
@@ -1187,6 +1427,209 @@ class StartupBrakeTestDialog(QDialog):
             self.last_result.brake_start_point,
             self.last_result.brake_end_point,
             annotation_text="Brake Window",
+        )
+
+    def _export_startup_segment_waveforms(self) -> None:
+        if self.last_result is None or self.last_result.startup_start_point is None or self.last_result.speed_reached_point is None:
+            self.main_window._show_warning("当前结果不包含可导出的启动段波形。")
+            return
+        self._export_segment_waveforms(
+            "startup",
+            self.last_result.startup_start_point,
+            self.last_result.speed_reached_point,
+            annotation_text="Startup Window",
+        )
+
+    def _export_brake_segment_waveforms(self) -> None:
+        if self.last_result is None or self.last_result.brake_start_point is None or self.last_result.brake_end_point is None:
+            self.main_window._show_warning("当前结果不包含可导出的刹车段波形。")
+            return
+        self._export_segment_waveforms(
+            "brake",
+            self.last_result.brake_start_point,
+            self.last_result.brake_end_point,
+            annotation_text="Brake Window",
+        )
+
+    def _export_segment_waveforms(
+        self,
+        segment_name: str,
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        *,
+        annotation_text: str,
+    ) -> None:
+        if not self._last_analysis_waveforms:
+            self.main_window._show_warning("当前没有可导出的分析波形。")
+            return
+        STARTUP_BRAKE_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = STARTUP_BRAKE_DIR / f"{segment_name}_{timestamp}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"导出{'启动段' if segment_name == 'startup' else '刹车段'}波形 CSV",
+            str(default_path),
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        left_time, right_time = self._expand_export_time_range(point_a[0], point_b[0])
+        clipped_waveforms = [
+            clipped
+            for clipped in (
+                self._clip_waveform_to_time_range(waveform, left_time, right_time)
+                for waveform in self._last_analysis_waveforms
+            )
+            if clipped is not None
+        ]
+        if not clipped_waveforms:
+            self.main_window._show_warning("选定时间范围内没有可导出的波形数据。")
+            return
+
+        output_path = Path(file_path)
+        WaveformData.export_csv_bundle(clipped_waveforms, output_path)
+        self._write_segment_marker_file(output_path, point_a, point_b, annotation_text)
+        segment_label = "启动段" if segment_name == "startup" else "刹车段"
+        self._summary_full_text = f"{segment_label}波形已导出：{output_path}"
+        self._update_footer_texts()
+        self.main_window.log(
+            f"启动刹车局部波形已导出: {output_path}，时间窗 {left_time:.6f} s ~ {right_time:.6f} s"
+        )
+
+    def _write_segment_marker_file(
+        self,
+        csv_path: Path,
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        annotation_text: str,
+    ) -> None:
+        marker_path = csv_path.with_suffix(".markers.json")
+        payload = {
+            "annotation_text": annotation_text,
+            "point_a": [point_a[0], point_a[1]],
+            "point_b": [point_b[0], point_b[1]],
+        }
+        marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _expand_export_time_range(self, start_time_s: float, end_time_s: float) -> tuple[float, float]:
+        left = min(start_time_s, end_time_s)
+        right = max(start_time_s, end_time_s)
+        span = max(right - left, 0.0)
+        margin = max(span * STARTUP_BRAKE_EXPORT_MARGIN_RATIO, STARTUP_BRAKE_EXPORT_MIN_MARGIN_S)
+        source_waveform = self._last_analysis_waveforms[0] if self._last_analysis_waveforms else None
+        if source_waveform is None or not source_waveform.x_values:
+            return left - margin, right + margin
+        full_start = min(waveform.x_values[0] for waveform in self._last_analysis_waveforms if waveform.x_values)
+        full_end = max(waveform.x_values[-1] for waveform in self._last_analysis_waveforms if waveform.x_values)
+        return max(left - margin, full_start), min(right + margin, full_end)
+
+    def _export_test_report(self) -> None:
+        if self.last_result is None or self.last_config is None:
+            self.main_window._show_warning("请先执行一次启动刹车性能测试。")
+            return
+        STARTUP_BRAKE_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = STARTUP_BRAKE_DIR / f"startup_brake_report_{timestamp}.html"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出启动刹车测试报告",
+            str(default_path),
+            "HTML Files (*.html)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path)
+        report_html = self._build_test_report_html(self.last_result, self.last_config)
+        output_path.write_text(report_html, encoding="utf-8")
+        self._summary_full_text = f"测试报告已导出：{output_path}"
+        self._update_footer_texts()
+        self.main_window.log(f"启动刹车测试报告已导出: {output_path}")
+
+    def _clip_waveform_to_time_range(
+        self,
+        waveform: WaveformData,
+        start_time_s: float,
+        end_time_s: float,
+    ) -> WaveformData | None:
+        left = min(start_time_s, end_time_s)
+        right = max(start_time_s, end_time_s)
+        clipped_x: list[float] = []
+        clipped_y: list[float] = []
+        for time_value, signal_value in zip(waveform.x_values, waveform.y_values):
+            if left <= time_value <= right:
+                clipped_x.append(time_value)
+                clipped_y.append(signal_value)
+        if not clipped_x:
+            return None
+        preamble = waveform.preamble
+        return WaveformData(
+            channel=waveform.channel,
+            points_mode=waveform.points_mode,
+            preamble=type(preamble)(
+                format_code=preamble.format_code,
+                acquire_type=preamble.acquire_type,
+                points=len(clipped_x),
+                count=preamble.count,
+                x_increment=preamble.x_increment,
+                x_origin=clipped_x[0],
+                x_reference=preamble.x_reference,
+                y_increment=preamble.y_increment,
+                y_origin=preamble.y_origin,
+                y_reference=preamble.y_reference,
+            ),
+            x_values=clipped_x,
+            y_values=clipped_y,
+        )
+
+    def _build_test_report_html(
+        self,
+        result: StartupBrakeTestResult,
+        config: StartupBrakeTestConfig,
+    ) -> str:
+        history_count = len(self.history)
+        rows = [
+            ("测试范围", self._test_scope_mode_display_text(result.test_scope_mode)),
+            ("刹车模式", self._brake_mode_display_text(result.brake_mode)),
+            ("控制输入通道", display_channel_name(config.control_channel)),
+            ("转速反馈通道", display_channel_name(config.speed_channel)),
+            ("电流通道", display_channel_name(config.current_channel)),
+            ("编码器A相通道", display_channel_name(config.encoder_a_channel or "-")),
+            ("启动起点", self._format_optional_point_time(result.startup_start_point)),
+            ("达速时刻", self._format_optional_point_time(result.speed_reached_point)),
+            ("启动时长", self._format_optional_seconds(result.startup_delay_s)),
+            ("启动峰值电流", self._format_peak_current_display(result.startup_peak_current)),
+            ("刹车起点", self._format_optional_point_time(result.brake_start_point)),
+            ("刹车终点", self._format_optional_point_time(result.brake_end_point)),
+            ("刹车时长", self._format_optional_seconds(result.brake_delay_s)),
+            ("刹车峰值电流", self._format_peak_current_display(result.brake_peak_current)),
+            ("命中频率", self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)),
+            ("命中周期", self._format_optional_period_ms(result.speed_match.period_s if result.speed_match is not None else None)),
+            ("终点可信度说明", result.brake_end_note or "-"),
+            ("样本累计数", str(history_count)),
+        ]
+        summary_rows = "".join(
+            f"<tr><th>{label}</th><td>{value}</td></tr>"
+            for label, value in rows
+        )
+        diagnostics = self._failure_diagnostics_full_text if self._failure_diagnostics_full_text != "当前无失败诊断。" else "-"
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<title>启动刹车测试报告</title>"
+            "<style>"
+            "body{font-family:'Microsoft YaHei',sans-serif;margin:24px;color:#1f2937;}"
+            "h1{font-size:22px;margin-bottom:12px;}"
+            "table{border-collapse:collapse;width:100%;margin-top:12px;}"
+            "th,td{border:1px solid #d1d5db;padding:8px 10px;text-align:left;vertical-align:top;}"
+            "th{background:#f3f4f6;width:220px;}"
+            ".note{margin-top:18px;white-space:pre-wrap;background:#f9fafb;border:1px solid #e5e7eb;padding:12px;}"
+            "</style></head><body>"
+            f"<h1>启动刹车测试报告</h1>"
+            f"<div>导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>"
+            f"<table>{summary_rows}</table>"
+            f"<div class='note'><strong>失败诊断/备注</strong>\n{diagnostics}</div>"
+            "</body></html>"
         )
 
     def _refresh_history(self) -> None:
@@ -1260,6 +1703,8 @@ class StartupBrakeTestDialog(QDialog):
             return "电流归零"
         if brake_mode == "encoder_backtrack":
             return "A相回溯"
+        if brake_mode == "speed_zero":
+            return "转速归零"
         return brake_mode
 
     def _test_scope_mode_display_text(self, test_scope_mode: str) -> str:

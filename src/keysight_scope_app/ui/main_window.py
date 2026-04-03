@@ -60,6 +60,7 @@ CAPTURE_DIR = Path("captures")
 WAVEFORM_DIR = Path("captures") / "waveforms"
 UI_STATE_PATH = CAPTURE_DIR / "ui_state.json"
 MAX_LOG_LINES = 300
+MAX_RECENT_WAVEFORMS = 8
 DEFAULT_MEASUREMENT_SET = {"频率", "峰峰值", "均方根"}
 MEASUREMENT_TEMPLATES = {
     "基础模板": {"频率", "周期", "峰峰值", "均方根"},
@@ -149,6 +150,7 @@ class ScopeMainWindow(QMainWindow):
         self._current_timebase_mode = "UNKNOWN"
         self._trigger_status_poll_inflight = False
         self._full_idn_text = "-"
+        self.recent_waveform_paths: list[str] = []
         self.last_capture_path: Path | None = None
         self.last_waveform_bundle: list[WaveformData] = []
         self.last_waveform_data: WaveformData | None = None
@@ -387,6 +389,9 @@ class ScopeMainWindow(QMainWindow):
         self.waveform_points_input.setValue(2000)
         self.fetch_waveform_button = QPushButton("抓取波形")
         self.load_waveform_button = QPushButton("加载 CSV")
+        self.recent_waveform_button = QPushButton("最近打开")
+        self.recent_waveform_menu = QMenu(self)
+        self.recent_waveform_button.setMenu(self.recent_waveform_menu)
         self.export_waveform_button = QPushButton("导出 CSV")
         self.export_waveform_button.setEnabled(False)
         waveform_row.addWidget(QLabel("波形模式"))
@@ -397,6 +402,7 @@ class ScopeMainWindow(QMainWindow):
         waveform_row.addSpacing(16)
         waveform_row.addWidget(self.fetch_waveform_button)
         waveform_row.addWidget(self.load_waveform_button)
+        waveform_row.addWidget(self.recent_waveform_button)
         waveform_row.addWidget(self.export_waveform_button)
         waveform_row.addStretch(1)
         measure_layout.addLayout(waveform_row)
@@ -404,6 +410,9 @@ class ScopeMainWindow(QMainWindow):
         self.waveform_mode_hint_label = QLabel("")
         self.waveform_mode_hint_label.setWordWrap(True)
         measure_layout.addWidget(self.waveform_mode_hint_label)
+        self.waveform_points_status_label = QLabel("波形数据完整性：未抓取")
+        self.waveform_points_status_label.setWordWrap(True)
+        measure_layout.addWidget(self.waveform_points_status_label)
 
         scope_display_row = QHBoxLayout()
         scope_display_row.addWidget(QLabel("示波器通道"))
@@ -528,6 +537,7 @@ class ScopeMainWindow(QMainWindow):
         self.trigger_level_input.valueChanged.connect(lambda _: self._save_ui_state())
         self.trigger_sweep_combo.currentIndexChanged.connect(lambda _: self._save_ui_state())
         self._refresh_waveform_mode_hint(self.waveform_mode_combo.currentText())
+        self._refresh_recent_waveform_menu()
         self._stabilize_push_buttons(self)
         self._normalize_label_alignment(self)
         self._load_ui_state()
@@ -549,6 +559,7 @@ class ScopeMainWindow(QMainWindow):
             "acquire_type": str(self.acquire_type_combo.currentData()),
             "waveform_mode": self.waveform_mode_combo.currentText(),
             "waveform_points": int(self.waveform_points_input.value()),
+            "recent_waveforms": list(self.recent_waveform_paths),
             "trigger": {
                 "source": str(self.trigger_source_combo.currentData()),
                 "slope": str(self.trigger_slope_combo.currentData()),
@@ -585,6 +596,14 @@ class ScopeMainWindow(QMainWindow):
         waveform_points = payload.get("waveform_points")
         if isinstance(waveform_points, (int, float)):
             self.waveform_points_input.setValue(int(waveform_points))
+        recent_waveforms = payload.get("recent_waveforms")
+        if isinstance(recent_waveforms, list):
+            self.recent_waveform_paths = [
+                str(item)
+                for item in recent_waveforms
+                if isinstance(item, str) and item.strip()
+            ][:MAX_RECENT_WAVEFORMS]
+            self._refresh_recent_waveform_menu()
 
         trigger_payload = payload.get("trigger")
         if isinstance(trigger_payload, dict):
@@ -595,7 +614,6 @@ class ScopeMainWindow(QMainWindow):
                 sweep=str(trigger_payload.get("sweep", self.trigger_sweep_combo.currentData())),
             )
             self._apply_trigger_settings_to_controls(settings)
-
     def _apply_trigger_settings_to_controls(self, settings: EdgeTriggerSettings) -> None:
         source_index = self.trigger_source_combo.findData(settings.source)
         slope_index = self.trigger_slope_combo.findData(settings.slope)
@@ -1057,7 +1075,11 @@ class ScopeMainWindow(QMainWindow):
 
         points_mode = self.waveform_mode_combo.currentText()
         points = int(self.waveform_points_input.value())
-        self.log(f"开始同步示波器当前显示通道并抓取波形: 采集类型 {self.acquire_type_combo.currentText()} / {points_mode} / {points} 点。")
+        self.log(
+            "开始同步示波器当前显示通道并抓取波形: "
+            f"采集类型 {self.acquire_type_combo.currentText()} / "
+            f"波形模式 {points_mode} / 点数 {points}。"
+        )
         self._run_task(
             lambda: self._fetch_waveforms_from_scope_display(scope, points_mode, points),
             on_success=self._on_scope_waveforms_fetched,
@@ -1076,29 +1098,64 @@ class ScopeMainWindow(QMainWindow):
         scope: KeysightOscilloscope,
         points_mode: str,
         points: int,
-    ) -> tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData]]:
+    ) -> tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData], list[str]]:
+        acquire_type = scope.get_acquire_type()
+        timebase_mode = scope.get_timebase_mode()
         channels, channel_units, channel_vertical_layouts = self._get_scope_display_context(scope)
         if not channels:
             raise RuntimeError("示波器当前没有打开的通道，无法抓取波形。")
+        waveforms: list[WaveformData] = []
+        skipped_channels: list[str] = []
         try:
-            waveforms = [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels]
+            for channel in channels:
+                try:
+                    waveform = scope.fetch_waveform(channel, points_mode=points_mode, points=points)
+                except VisaIOError as exc:
+                    error_code = getattr(exc, "error_code", None)
+                    if error_code != -1073807339:
+                        raise
+                    skipped_channels.append(channel)
+                    continue
+                waveforms.append(waveform)
         except VisaIOError as exc:
             error_code = getattr(exc, "error_code", None)
             if error_code != -1073807339:
-                raise
-            scope.stop()
-            channels, channel_units, channel_vertical_layouts = self._get_scope_display_context(scope)
-            waveforms = [scope.fetch_waveform(channel, points_mode=points_mode, points=points) for channel in channels]
-        return channels, channel_units, channel_vertical_layouts, waveforms
+                raise RuntimeError(
+                    "抓取波形失败: "
+                    f"acquire_type={acquire_type}, timebase_mode={timebase_mode}, "
+                    f"channels={','.join(channels)}, points_mode={points_mode}, points={points}; {exc}"
+                ) from exc
+            raise RuntimeError(
+                "抓取波形失败: "
+                f"acquire_type={acquire_type}, timebase_mode={timebase_mode}, "
+                f"channels={','.join(channels)}, points_mode={points_mode}, points={points}; {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                "抓取波形失败: "
+                f"acquire_type={acquire_type}, timebase_mode={timebase_mode}, "
+                f"channels={','.join(channels)}, points_mode={points_mode}, points={points}; {exc}"
+            ) from exc
+        if not waveforms:
+            skipped_text = ",".join(skipped_channels) if skipped_channels else ",".join(channels)
+            raise RuntimeError(
+                "抓取波形失败: "
+                f"acquire_type={acquire_type}, timebase_mode={timebase_mode}, "
+                f"channels={','.join(channels)}, points_mode={points_mode}, points={points}; "
+                f"所有通道均无有效波形或读取超时: {skipped_text}"
+            )
+        return channels, channel_units, channel_vertical_layouts, waveforms, skipped_channels
 
-    def _on_scope_waveforms_fetched(self, result: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData]]) -> None:
+    def _on_scope_waveforms_fetched(self, result: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData], list[str]]) -> None:
         self._single_trigger_waiting = False
         self._stop_trigger_status_polling()
         self._set_trigger_buttons_busy(False)
-        channels, channel_units, channel_vertical_layouts, waveforms = result
+        channels, channel_units, channel_vertical_layouts, waveforms, skipped_channels = result
         supported_channels = [channel for channel in channels if channel in SUPPORTED_CHANNELS]
         self._update_channel_units(channel_units, log_message=False)
         self._update_channel_vertical_layouts(channel_vertical_layouts)
+        if skipped_channels:
+            self.log("以下通道当前无有效波形，已跳过: " + ",".join(skipped_channels))
         requested_points = int(self.waveform_points_input.value())
         returned_points = ", ".join(
             f"{display_channel_name(waveform.channel)}={len(waveform.y_values)}"
@@ -1225,7 +1282,46 @@ class ScopeMainWindow(QMainWindow):
         self.log(f"正在加载波形 CSV: {source_path}")
         self._run_task(
             lambda: WaveformData.load_csv_bundle(source_path),
-            on_success=self._on_waveforms_fetched,
+            on_success=lambda waveforms, captured_path=source_path: self._on_waveforms_fetched(waveforms, source_path=captured_path),
+            success_message="波形 CSV 加载完成。",
+        )
+
+    def _add_recent_waveform_path(self, source_path: Path) -> None:
+        normalized = str(source_path)
+        self.recent_waveform_paths = [item for item in self.recent_waveform_paths if item != normalized]
+        self.recent_waveform_paths.insert(0, normalized)
+        self.recent_waveform_paths = self.recent_waveform_paths[:MAX_RECENT_WAVEFORMS]
+        self._refresh_recent_waveform_menu()
+        self._save_ui_state()
+
+    def _remove_recent_waveform_path(self, source_path: str) -> None:
+        self.recent_waveform_paths = [item for item in self.recent_waveform_paths if item != source_path]
+        self._refresh_recent_waveform_menu()
+        self._save_ui_state()
+
+    def _refresh_recent_waveform_menu(self) -> None:
+        self.recent_waveform_menu.clear()
+        if not self.recent_waveform_paths:
+            action = self.recent_waveform_menu.addAction("暂无记录")
+            action.setEnabled(False)
+            self.recent_waveform_button.setEnabled(False)
+            return
+        self.recent_waveform_button.setEnabled(True)
+        for source_path in self.recent_waveform_paths:
+            action = self.recent_waveform_menu.addAction(source_path)
+            action.triggered.connect(lambda checked=False, captured_path=source_path: self._open_recent_waveform(captured_path))
+
+    def _open_recent_waveform(self, source_path: str) -> None:
+        target_path = Path(source_path)
+        if not target_path.exists():
+            self.log(f"最近打开的波形文件不存在，已移除: {target_path}")
+            self._remove_recent_waveform_path(source_path)
+            self._show_warning(f"波形文件不存在：{target_path}")
+            return
+        self.log(f"正在加载最近波形 CSV: {target_path}")
+        self._run_task(
+            lambda: WaveformData.load_csv_bundle(target_path),
+            on_success=lambda waveforms, captured_path=target_path: self._on_waveforms_fetched(waveforms, source_path=captured_path),
             success_message="波形 CSV 加载完成。",
         )
 
@@ -1262,13 +1358,16 @@ class ScopeMainWindow(QMainWindow):
         if chosen is copy_action:
             self.copy_screenshot_to_clipboard()
 
-    def _on_waveforms_fetched(self, waveforms: list[WaveformData]) -> None:
+    def _on_waveforms_fetched(self, waveforms: list[WaveformData], *, source_path: Path | None = None) -> None:
         self._apply_fetched_waveforms(
             waveforms,
             sync_detail_dialog=True,
             notify_startup_dialog=True,
             preserve_main_panel_view=False,
         )
+        if source_path is not None:
+            self._add_recent_waveform_path(source_path)
+            self._apply_waveform_marker_sidecar(source_path)
 
     def _apply_fetched_waveforms(
         self,
@@ -1291,6 +1390,7 @@ class ScopeMainWindow(QMainWindow):
         self.last_waveform_bundle = list(waveforms)
         self.last_waveform_data = primary_waveform
         self.last_waveform_stats = primary_waveform.analyze()
+        self._update_waveform_points_status(waveforms)
         if notify_startup_dialog:
             self.startup_brake_dialog.handle_waveforms_updated()
         if preserve_main_panel_view and preferred_primary_channel is not None:
@@ -1304,8 +1404,27 @@ class ScopeMainWindow(QMainWindow):
     def _on_waveform_exported(self, csv_path: Path) -> None:
         self.log(f"波形 CSV 已保存: {csv_path}")
 
+    def _apply_waveform_marker_sidecar(self, source_path: Path) -> None:
+        marker_path = source_path.with_suffix(".markers.json")
+        if not marker_path.exists():
+            return
+        try:
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            point_a_raw = payload.get("point_a")
+            point_b_raw = payload.get("point_b")
+            if not isinstance(point_a_raw, list) or not isinstance(point_b_raw, list) or len(point_a_raw) < 2 or len(point_b_raw) < 2:
+                return
+            point_a = (float(point_a_raw[0]), float(point_a_raw[1]))
+            point_b = (float(point_b_raw[0]), float(point_b_raw[1]))
+            annotation_text = str(payload.get("annotation_text") or "Segment Window")
+            self.waveform_detail_dialog.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
+            self.log(f"已从标记文件恢复游标: {marker_path}")
+        except Exception as exc:
+            self.log(f"波形标记文件加载失败: {exc}")
+
     def _reset_waveform_visuals(self) -> None:
         self.waveform_detail_dialog.clear()
+        self.waveform_points_status_label.setText("波形数据完整性：未抓取")
 
     def show_startup_brake_dialog(self) -> None:
         self.startup_brake_dialog.show_dialog()
@@ -1378,6 +1497,21 @@ class ScopeMainWindow(QMainWindow):
             hint = f"{hint}\n{self._waveform_mode_max_points_hint}" if hint else self._waveform_mode_max_points_hint
         self.waveform_mode_combo.setToolTip(hint)
         self.waveform_mode_hint_label.setText(hint)
+
+    def _update_waveform_points_status(self, waveforms: list[WaveformData]) -> None:
+        if not waveforms:
+            self.waveform_points_status_label.setText("波形数据完整性：未抓取")
+            return
+        requested_points = int(self.waveform_points_input.value())
+        returned_points = ", ".join(
+            f"{display_channel_name(waveform.channel)}={len(waveform.y_values)}"
+            for waveform in waveforms
+        )
+        primary_points = max(len(waveforms[0].y_values), 1)
+        ratio = (primary_points / requested_points) if requested_points > 0 else 0.0
+        self.waveform_points_status_label.setText(
+            f"波形数据完整性：请求 {requested_points} 点；返回 {returned_points}；主通道完成度 {ratio * 100.0:.1f}%"
+        )
 
     def _on_waveform_mode_changed(self, mode: str) -> None:
         default_points = WAVEFORM_MODE_DEFAULT_POINTS.get(mode)

@@ -5,8 +5,9 @@ from pathlib import Path
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
 from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -25,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats, compare_waveform_edges
+from keysight_scope_app.analysis.waveform import EdgeComparison, WaveformData, WaveformStats, compare_waveform_edges
 from keysight_scope_app.ui.helpers import display_channel_name
 from keysight_scope_app.utils import format_engineering_value
 
@@ -377,6 +378,8 @@ class WaveformAnalysisPanel(QWidget):
         self.channel_unit_resolver = None
         self.cursor_readout_changed = None
         self.view_window_changed = None
+        self.channel_comparison_changed = None
+        self.current_edge_comparison: EdgeComparison | None = None
         self._axis_updates_suspended = False
         self._pending_axis_refresh = False
         self._axis_refresh_timer = QTimer(self)
@@ -1145,11 +1148,21 @@ class WaveformAnalysisPanel(QWidget):
             self.view_window_changed()
 
     def _populate_compare_channels(self) -> None:
+        previous_channel = self.compare_channel_combo.currentData()
         self.compare_channel_combo.blockSignals(True)
         self.compare_channel_combo.clear()
-        secondary_channels = [waveform.channel for waveform in self.current_waveforms[1:] if waveform.channel in self.visible_channels]
+        active_channel = self.active_waveform_channel
+        secondary_channels = [
+            waveform.channel
+            for waveform in self.current_waveforms
+            if waveform.channel in self.visible_channels and waveform.channel != active_channel
+        ]
         for channel in secondary_channels:
             self.compare_channel_combo.addItem(display_channel_name(channel), channel)
+        if previous_channel in secondary_channels:
+            index = self.compare_channel_combo.findData(previous_channel)
+            if index >= 0:
+                self.compare_channel_combo.setCurrentIndex(index)
         self.compare_channel_combo.blockSignals(False)
         self.compare_channel_combo.setEnabled(bool(secondary_channels))
         self._update_channel_comparison()
@@ -1157,20 +1170,26 @@ class WaveformAnalysisPanel(QWidget):
     def _update_channel_comparison(self) -> None:
         active_waveform = self._active_waveform()
         if len(self.current_waveforms) < 2 or active_waveform is None:
+            self.current_edge_comparison = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._emit_channel_comparison_changed()
             return
 
         secondary_channel = self.compare_channel_combo.currentData()
         if not secondary_channel:
+            self.current_edge_comparison = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._emit_channel_comparison_changed()
             return
 
         secondary_waveform = next((waveform for waveform in self.current_waveforms if waveform.channel == secondary_channel), None)
         if secondary_waveform is None:
+            self.current_edge_comparison = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._emit_channel_comparison_changed()
             return
 
         visible_stats = self._primary_visible_stats() or self.current_stats
@@ -1184,13 +1203,16 @@ class WaveformAnalysisPanel(QWidget):
             frequency_hz=frequency_hz,
         )
         if comparison is None:
+            self.current_edge_comparison = None
             for label in self.compare_labels.values():
                 label.setText("无法估算")
             self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
             self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
             self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
+            self._emit_channel_comparison_changed()
             return
 
+        self.current_edge_comparison = comparison
         self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
         self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
@@ -1199,6 +1221,41 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_labels["phase"].setText(_format_optional_phase(comparison.phase_deg))
         self.compare_labels["frequency"].setText(_format_optional_hz(comparison.frequency_hz))
         self.compare_labels["edge_type"].setText("上升沿" if comparison.edge_type == "rising" else "下降沿")
+        self._emit_channel_comparison_changed()
+        return
+
+    def _emit_channel_comparison_changed(self) -> None:
+        if self.channel_comparison_changed is not None:
+            self.channel_comparison_changed()
+
+    def comparison_target_options(self) -> list[str]:
+        return [
+            waveform.channel
+            for waveform in self.current_waveforms
+            if waveform.channel in self.visible_channels and waveform.channel != self.active_waveform_channel
+        ]
+
+    def channel_comparison_state(self) -> tuple[str | None, str, EdgeComparison | None]:
+        target_channel = self.compare_channel_combo.currentData()
+        edge_type = str(self.compare_edge_combo.currentData() or "rising")
+        return (str(target_channel) if target_channel else None, edge_type, self.current_edge_comparison)
+
+    def set_channel_comparison(self, target_channel: str | None, edge_type: str = "rising") -> None:
+        edge_index = self.compare_edge_combo.findData(edge_type)
+        if edge_index >= 0:
+            self.compare_edge_combo.blockSignals(True)
+            self.compare_edge_combo.setCurrentIndex(edge_index)
+            self.compare_edge_combo.blockSignals(False)
+
+        self.compare_channel_combo.blockSignals(True)
+        if target_channel:
+            channel_index = self.compare_channel_combo.findData(target_channel)
+            if channel_index >= 0:
+                self.compare_channel_combo.setCurrentIndex(channel_index)
+        else:
+            self.compare_channel_combo.setCurrentIndex(-1)
+        self.compare_channel_combo.blockSignals(False)
+        self._update_channel_comparison()
 
     def _primary_visible_stats(self) -> WaveformStats | None:
         active_waveform = self._active_waveform()
@@ -1232,6 +1289,12 @@ class WaveformAnalysisPanel(QWidget):
         if point_a[0] == point_b[0]:
             return None
         return (min(point_a[0], point_b[0]), max(point_a[0], point_b[0]))
+
+    def current_time_window(self) -> tuple[float, float] | None:
+        x_axis = self._x_axis()
+        if x_axis is None:
+            return None
+        return (x_axis.min(), x_axis.max())
 
     def cursor_window_stats_for_channel(self, channel: str) -> WaveformStats | None:
         waveform = next((item for item in self.current_waveforms if item.channel == channel), None)
@@ -1884,6 +1947,49 @@ class WaveformAnalysisPanel(QWidget):
         self.scope_vertical_layouts = dict(layouts)
         self._apply_scope_vertical_layouts()
 
+    def frame_time_window(self, start_time_s: float, end_time_s: float, *, padding_ratio: float = 0.12) -> None:
+        if self.current_waveform is None or not self.current_waveform.x_values:
+            return
+        x_axis = self._x_axis()
+        if x_axis is None:
+            return
+        full_start = self.current_waveform.x_values[0]
+        full_end = self.current_waveform.x_values[-1]
+        left = min(start_time_s, end_time_s)
+        right = max(start_time_s, end_time_s)
+        span = max(right - left, self.current_waveform.preamble.x_increment * 20.0, 1e-9)
+        padding = span * max(padding_ratio, 0.0)
+        next_min = max(left - padding, full_start)
+        next_max = min(right + padding, full_end)
+        if next_max <= next_min:
+            next_min = full_start
+            next_max = full_end
+        x_axis.setRange(next_min, next_max)
+        self._update_view_stats_from_axes()
+        self._refresh_cursor_graphics()
+
+    def stack_visible_channels_for_export(self) -> None:
+        if not self.current_waveforms:
+            return
+        ordered_channels = [waveform.channel for waveform in self.current_waveforms if waveform.channel in self.visible_channels]
+        if len(ordered_channels) <= 1:
+            return
+        max_pp = 0.0
+        for waveform in self.current_waveforms:
+            if waveform.channel not in ordered_channels:
+                continue
+            try:
+                max_pp = max(max_pp, waveform.analyze().voltage_pp)
+            except Exception:
+                continue
+        gap = max(max_pp * 1.6, 1.0)
+        center_index = (len(ordered_channels) - 1) / 2.0
+        for index, channel in enumerate(ordered_channels):
+            self.waveform_offsets[channel] = (center_index - index) * gap
+        self._render_all_waveform_series()
+        self._ensure_waveform_offsets_visible()
+        self._refresh_cursor_graphics()
+
     def focus_on_point(self, point: tuple[float, float], *, annotation_text: str | None = None) -> None:
         self.focus_on_channel_point(point, channel=None, annotation_text=annotation_text)
 
@@ -2399,11 +2505,23 @@ class WaveformAnalysisPanel(QWidget):
             return
 
         output_path = Path(file_path)
-        image = self.chart_view.grab()
+        image = self.render_chart_image()
         if image.save(str(output_path), "PNG"):
             self.cursor_hint_label.setText(f"波形图已导出: {output_path}")
         else:
             QMessageBox.critical(self, "导出失败", f"无法保存波形图到 {output_path}")
+
+    def render_chart_image(self):
+        self.chart_view.updateGeometry()
+        self.chart_view.repaint()
+        QApplication.processEvents()
+        QApplication.processEvents()
+        pixmap = QPixmap(self.chart_view.size())
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        self.chart_view.render(painter)
+        painter.end()
+        return pixmap
 
 def _decimate_xy_envelope(x_values: list[float], y_values: list[float], max_points: int) -> tuple[list[float], list[float]]:
     point_count = min(len(x_values), len(y_values))

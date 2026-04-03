@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -240,6 +243,7 @@ class WaveformDetailDialog(QDialog):
         self.measurement_config: dict[str, set[str]] = {}
         self.cursor_measurements: dict[str, str] = {}
         self._updating_channel_checks = False
+        self._link_scope_channels = False
         self._load_measurement_config()
 
         toolbar = QHBoxLayout()
@@ -247,6 +251,10 @@ class WaveformDetailDialog(QDialog):
         self.refresh_waveform_button.clicked.connect(self._request_waveform_refresh)
         self.reset_waveform_button = QPushButton("重置波形")
         self.reset_waveform_button.clicked.connect(self._reset_waveform_view)
+        self.export_current_view_button = QPushButton("导出当前视图")
+        self.export_current_view_button.clicked.connect(self._export_current_view_bundle)
+        self.export_cursor_ab_button = QPushButton("导出游标A-B")
+        self.export_cursor_ab_button.clicked.connect(self._export_cursor_ab_bundle)
         self.measurement_scope_combo = QComboBox()
         self.measurement_scope_combo.addItem("当前视图", "view")
         self.measurement_scope_combo.addItem("游标 A-B", "cursor")
@@ -256,7 +264,21 @@ class WaveformDetailDialog(QDialog):
         self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
         toolbar.addWidget(self.refresh_waveform_button)
         toolbar.addWidget(self.reset_waveform_button)
+        toolbar.addWidget(self.export_current_view_button)
+        toolbar.addWidget(self.export_cursor_ab_button)
         toolbar.addWidget(self.measurement_settings_button)
+        toolbar.addSpacing(12)
+        toolbar.addWidget(QLabel("相位差通道"))
+        self.phase_channel_combo = QComboBox()
+        self.phase_channel_combo.addItem("关闭", "")
+        self.phase_channel_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
+        toolbar.addWidget(self.phase_channel_combo)
+        toolbar.addWidget(QLabel("边沿"))
+        self.phase_edge_combo = QComboBox()
+        self.phase_edge_combo.addItem("上升沿", "rising")
+        self.phase_edge_combo.addItem("下降沿", "falling")
+        self.phase_edge_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
+        toolbar.addWidget(self.phase_edge_combo)
         toolbar.addStretch(1)
         toolbar.addWidget(QLabel("测量范围"))
         toolbar.addWidget(self.measurement_scope_combo)
@@ -276,6 +298,7 @@ class WaveformDetailDialog(QDialog):
         self.analysis_panel.channel_unit_resolver = self._channel_unit
         self.analysis_panel.cursor_readout_changed = self._handle_cursor_measurements_changed
         self.analysis_panel.view_window_changed = self._refresh_measurement_footer
+        self.analysis_panel.channel_comparison_changed = self._refresh_phase_compare_toolbar
         self.analysis_panel.set_waveform_only_mode(True)
         layout.addWidget(self.analysis_panel)
 
@@ -339,11 +362,15 @@ class WaveformDetailDialog(QDialog):
         cursor_layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
         self.cursor_overlay.hide()
         self.analysis_panel.chart_view.installEventFilter(self)
+        self.phase_result_label = QLabel("相位差: --")
+        self.phase_result_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self.phase_result_label)
 
     def set_waveform(self, waveform: WaveformData, stats: WaveformStats) -> None:
         self.current_waveforms = [waveform]
         self.analysis_panel.set_waveform(waveform, stats)
         self._ensure_measurement_defaults([waveform])
+        self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks([waveform])
 
@@ -351,6 +378,7 @@ class WaveformDetailDialog(QDialog):
         self.current_waveforms = list(waveforms)
         self.analysis_panel.set_waveforms(waveforms, primary_stats)
         self._ensure_measurement_defaults(waveforms)
+        self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks(waveforms)
 
@@ -376,6 +404,7 @@ class WaveformDetailDialog(QDialog):
         self.current_waveforms = []
         self.cursor_measurements = {}
         self.analysis_panel.clear()
+        self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks([])
 
@@ -388,8 +417,60 @@ class WaveformDetailDialog(QDialog):
     ) -> None:
         self.analysis_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
 
+    def export_standardized_snapshot(
+        self,
+        output_path: Path,
+        *,
+        visible_channels: list[str],
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        annotation_text: str,
+        padding_ratio: float = 0.15,
+    ) -> bool:
+        if not self.current_waveforms:
+            return False
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        saved_view_state = self.analysis_panel.capture_view_state()
+        saved_cursor_points = dict(self.analysis_panel.cursor_points)
+        saved_cursor_channels = dict(self.analysis_panel.cursor_channels)
+        saved_annotation = self.analysis_panel.lock_annotation_text
+        measurement_visible = self.measurement_overlay.isVisible()
+        cursor_overlay_visible = self.cursor_overlay.isVisible()
+
+        try:
+            self.analysis_panel.set_visible_channels(set(visible_channels))
+            self.analysis_panel.reset_view()
+            self.analysis_panel.stack_visible_channels_for_export()
+            self.analysis_panel.set_cursor_points(point_a, point_b, annotation_text=annotation_text)
+            self.analysis_panel.frame_time_window(point_a[0], point_b[0], padding_ratio=padding_ratio)
+            self._refresh_measurement_footer()
+            self.measurement_overlay.hide()
+            if self.cursor_measurements:
+                self.cursor_overlay_hint.setText("游标测量")
+                self.cursor_text_label.setText(self._build_cursor_measurement_section_html())
+                self.cursor_overlay.show()
+                self._reposition_measurement_overlay()
+            else:
+                self.cursor_overlay.hide()
+            self.analysis_panel.chart_view.repaint()
+            QApplication.processEvents()
+            QApplication.processEvents()
+            image = self.analysis_panel.render_chart_image()
+            return image.save(str(output_path), "PNG")
+        finally:
+            self.analysis_panel.restore_view_state(saved_view_state)
+            self.analysis_panel.cursor_points = saved_cursor_points
+            self.analysis_panel.cursor_channels = saved_cursor_channels
+            self.analysis_panel.lock_annotation_text = saved_annotation
+            self.analysis_panel._refresh_cursor_graphics()
+            self._refresh_measurement_footer()
+            if measurement_visible:
+                self.measurement_overlay.show()
+            if cursor_overlay_visible:
+                self.cursor_overlay.show()
+
     def _rebuild_channel_visibility_checks(self, waveforms: list[WaveformData]) -> None:
-        parent = self.parent()
         previous_states = {
             channel: checkbox.isChecked()
             for channel, checkbox in self.channel_visibility_checks.items()
@@ -402,16 +483,16 @@ class WaveformDetailDialog(QDialog):
 
         self.channel_toggle_layout.addStretch(1)
         self.channel_toggle_layout.addWidget(QLabel("显示通道"))
+        self.link_scope_channels_check = QCheckBox("联动示波器通道")
+        self.link_scope_channels_check.setChecked(self._link_scope_channels)
+        self.link_scope_channels_check.setToolTip("勾选后，这里的通道开关会同时控制示波器通道显示；不勾选时只影响当前独立波形窗口。")
+        self.link_scope_channels_check.toggled.connect(self._set_link_scope_channels_enabled)
+        self.channel_toggle_layout.addWidget(self.link_scope_channels_check)
         self.channel_visibility_checks = {}
         active_waveform_channels = {waveform.channel for waveform in waveforms}
         for channel in SUPPORTED_CHANNELS:
             checkbox = QCheckBox(display_channel_name(channel))
-            if parent is not None and hasattr(parent, "scope_display_checks"):
-                parent_checks = getattr(parent, "scope_display_checks", {})
-                parent_checkbox = parent_checks.get(channel)
-                checked = parent_checkbox.isChecked() if parent_checkbox is not None else previous_states.get(channel, channel in active_waveform_channels)
-            else:
-                checked = previous_states.get(channel, channel in active_waveform_channels)
+            checked = previous_states.get(channel, channel in active_waveform_channels)
             checkbox.setChecked(checked)
             checkbox.toggled.connect(
                 lambda checked=False, target_channel=channel: self._handle_channel_checkbox_toggled(target_channel, checked)
@@ -428,6 +509,7 @@ class WaveformDetailDialog(QDialog):
             if checkbox.isChecked()
         }
         self.analysis_panel.set_visible_channels(visible_channels)
+        self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
 
     def _channel_unit(self, channel: str) -> str:
@@ -445,24 +527,160 @@ class WaveformDetailDialog(QDialog):
         if self._updating_channel_checks:
             self._apply_channel_visibility()
             return
-        parent = self.parent()
-        if parent is not None and hasattr(parent, "request_scope_channel_display_from_detail_dialog"):
-            parent.request_scope_channel_display_from_detail_dialog(channel, checked)
-            return
+        if self._link_scope_channels:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "request_scope_channel_display_from_detail_dialog"):
+                parent.request_scope_channel_display_from_detail_dialog(channel, checked)
+                return
         self._apply_channel_visibility()
 
     def sync_scope_channel_checks(self, channels: list[str]) -> None:
         active_channels = set(channels)
-        self._updating_channel_checks = True
-        try:
+        if self._link_scope_channels:
+            self._updating_channel_checks = True
+            try:
+                for channel, checkbox in self.channel_visibility_checks.items():
+                    checkbox.setEnabled(True)
+                    checkbox.setChecked(channel in active_channels)
+            finally:
+                self._updating_channel_checks = False
+        else:
             for channel, checkbox in self.channel_visibility_checks.items():
-                checkbox.setChecked(channel in active_channels)
-        finally:
-            self._updating_channel_checks = False
+                checkbox.setEnabled(True)
+                if channel in active_channels and channel not in self.analysis_panel.visible_channels:
+                    checkbox.setChecked(True)
         self._apply_channel_visibility()
+
+    def _set_link_scope_channels_enabled(self, enabled: bool) -> None:
+        self._link_scope_channels = enabled
+        if not enabled:
+            return
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "scope_display_checks"):
+            parent_checks = getattr(parent, "scope_display_checks", {})
+            active_channels = [
+                channel
+                for channel, checkbox in parent_checks.items()
+                if checkbox.isChecked()
+            ]
+            self.sync_scope_channel_checks(active_channels)
 
     def _reset_waveform_view(self) -> None:
         self.analysis_panel.reset_view()
+
+    def _export_current_view_bundle(self) -> None:
+        if not self.current_waveforms:
+            self._log_message("当前没有可导出的波形。")
+            return
+        time_window = self.analysis_panel.current_time_window()
+        if time_window is None:
+            self._log_message("当前视图没有有效时间窗，无法导出。")
+            return
+        self._export_waveform_segment("view", time_window, write_markers=False)
+
+    def _export_cursor_ab_bundle(self) -> None:
+        if not self.current_waveforms:
+            self._log_message("当前没有可导出的波形。")
+            return
+        time_window = self.analysis_panel.cursor_time_window()
+        if time_window is None:
+            self._log_message("请先放置 A/B 游标，再导出游标区间。")
+            return
+        self._export_waveform_segment("cursor_ab", time_window, write_markers=True)
+
+    def _export_waveform_segment(
+        self,
+        segment_name: str,
+        time_window: tuple[float, float],
+        *,
+        write_markers: bool,
+    ) -> None:
+        left_time, right_time = time_window
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = WAVEFORM_CONFIG_DIR / f"{segment_name}_{timestamp}.csv"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出波形 CSV",
+            str(default_path),
+            "CSV Files (*.csv)",
+        )
+        if not file_path:
+            return
+
+        visible_channels = list(self.analysis_panel.visible_channels or {waveform.channel for waveform in self.current_waveforms})
+        clipped_waveforms = [
+            clipped
+            for clipped in (
+                self._clip_waveform_to_time_range(waveform, left_time, right_time)
+                for waveform in self.current_waveforms
+                if waveform.channel in visible_channels
+            )
+            if clipped is not None
+        ]
+        if not clipped_waveforms:
+            self._log_message("选定时间范围内没有可导出的波形数据。")
+            return
+
+        output_path = Path(file_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        WaveformData.export_csv_bundle(clipped_waveforms, output_path)
+        if write_markers:
+            point_a = self.analysis_panel.cursor_points.get("a")
+            point_b = self.analysis_panel.cursor_points.get("b")
+            if point_a is not None and point_b is not None:
+                self._write_marker_sidecar(output_path, point_a, point_b, "Cursor Window")
+        self._log_message(f"波形局部已导出: {output_path}")
+
+    def _clip_waveform_to_time_range(
+        self,
+        waveform: WaveformData,
+        start_time_s: float,
+        end_time_s: float,
+    ) -> WaveformData | None:
+        left = min(start_time_s, end_time_s)
+        right = max(start_time_s, end_time_s)
+        clipped_x: list[float] = []
+        clipped_y: list[float] = []
+        for time_value, signal_value in zip(waveform.x_values, waveform.y_values):
+            if left <= time_value <= right:
+                clipped_x.append(time_value)
+                clipped_y.append(signal_value)
+        if not clipped_x:
+            return None
+        preamble = waveform.preamble
+        return WaveformData(
+            channel=waveform.channel,
+            points_mode=waveform.points_mode,
+            preamble=type(preamble)(
+                format_code=preamble.format_code,
+                acquire_type=preamble.acquire_type,
+                points=len(clipped_x),
+                count=preamble.count,
+                x_increment=preamble.x_increment,
+                x_origin=clipped_x[0],
+                x_reference=preamble.x_reference,
+                y_increment=preamble.y_increment,
+                y_origin=preamble.y_origin,
+                y_reference=preamble.y_reference,
+            ),
+            x_values=clipped_x,
+            y_values=clipped_y,
+        )
+
+    def _write_marker_sidecar(
+        self,
+        csv_path: Path,
+        point_a: tuple[float, float],
+        point_b: tuple[float, float],
+        annotation_text: str,
+    ) -> None:
+        marker_path = csv_path.with_suffix(".markers.json")
+        payload = {
+            "annotation_text": annotation_text,
+            "point_a": [point_a[0], point_a[1]],
+            "point_b": [point_b[0], point_b[1]],
+        }
+        marker_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _show_measurement_settings(self) -> None:
         if not self.current_waveforms:
@@ -582,6 +800,51 @@ class WaveformDetailDialog(QDialog):
     def _selected_measurement_scope(self) -> str:
         return str(self.measurement_scope_combo.currentData())
 
+    def _sync_phase_compare_toolbar_from_panel(self) -> None:
+        options = self.analysis_panel.comparison_target_options()
+        target_channel, edge_type, _comparison = self.analysis_panel.channel_comparison_state()
+
+        self.phase_channel_combo.blockSignals(True)
+        self.phase_channel_combo.clear()
+        self.phase_channel_combo.addItem("关闭", "")
+        for channel in options:
+            self.phase_channel_combo.addItem(display_channel_name(channel), channel)
+        if target_channel and target_channel in options:
+            index = self.phase_channel_combo.findData(target_channel)
+            if index >= 0:
+                self.phase_channel_combo.setCurrentIndex(index)
+        self.phase_channel_combo.setEnabled(bool(options))
+        self.phase_channel_combo.blockSignals(False)
+
+        self.phase_edge_combo.blockSignals(True)
+        edge_index = self.phase_edge_combo.findData(edge_type)
+        if edge_index >= 0:
+            self.phase_edge_combo.setCurrentIndex(edge_index)
+        self.phase_edge_combo.setEnabled(bool(options))
+        self.phase_edge_combo.blockSignals(False)
+        self._refresh_phase_compare_toolbar()
+
+    def _sync_phase_compare_controls_to_panel(self) -> None:
+        target_channel = self.phase_channel_combo.currentData()
+        edge_type = str(self.phase_edge_combo.currentData() or "rising")
+        self.analysis_panel.set_channel_comparison(str(target_channel) if target_channel else None, edge_type)
+
+    def _refresh_phase_compare_toolbar(self) -> None:
+        target_channel, edge_type, comparison = self.analysis_panel.channel_comparison_state()
+        if not target_channel:
+            self.phase_result_label.setText("相位差: --")
+            return
+        if comparison is None:
+            self.phase_result_label.setText(
+                f"{display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'}: 无法估算"
+            )
+            return
+        dt_text = format_engineering_value(comparison.delta_t_s, "s")
+        phase_text = f"{comparison.phase_deg:.2f}°" if comparison.phase_deg is not None else "--"
+        self.phase_result_label.setText(
+            f"{display_channel_name(target_channel)}  Δt {dt_text}  相位差 {phase_text}"
+        )
+
     def _measurement_stats_for_channel(self, channel: str, measurement_scope: str) -> WaveformStats | None:
         if measurement_scope == "cursor":
             return self.analysis_panel.cursor_window_stats_for_channel(channel)
@@ -663,13 +926,29 @@ class WaveformDetailDialog(QDialog):
         )
 
     def _build_cursor_measurement_section_html(self) -> str:
-        if not self.cursor_measurements:
-            return ""
         visible_items = [
             (label, value)
             for label, value in self.cursor_measurements.items()
             if value and value != "-"
         ]
+        target_channel, edge_type, comparison = self.analysis_panel.channel_comparison_state()
+        if target_channel:
+            if comparison is None:
+                visible_items.append(
+                    (
+                        f"相位差({display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        "无法估算",
+                    )
+                )
+            else:
+                phase_text = f"{comparison.phase_deg:.2f}°" if comparison.phase_deg is not None else "--"
+                dt_text = format_engineering_value(comparison.delta_t_s, "s")
+                visible_items.append(
+                    (
+                        f"相位差({display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        f"{phase_text} / Δt {dt_text}",
+                    )
+                )
         if not visible_items:
             return ""
 

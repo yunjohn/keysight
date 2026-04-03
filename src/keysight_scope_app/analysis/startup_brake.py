@@ -62,6 +62,7 @@ class StartupBrakeTestResult:
     brake_peak_current: SignalPeak | None
     brake_mode: str
     test_scope_mode: str
+    brake_end_note: str | None = None
 
 
 def analyze_startup_brake_test(
@@ -89,7 +90,7 @@ def analyze_startup_brake_test(
         raise ValueError("目标转速/频率/周期必须大于 0。")
     if config.test_scope_mode not in {"full", "startup_only", "brake_only"}:
         raise ValueError(f"不支持的测试模式: {config.test_scope_mode}")
-    if config.brake_mode not in {"current_zero", "encoder_backtrack"}:
+    if config.brake_mode not in {"current_zero", "encoder_backtrack", "speed_zero"}:
         raise ValueError(f"不支持的刹车模式: {config.brake_mode}")
     if config.brake_backtrack_min_step < 0:
         raise ValueError("回溯脉冲最小跳变不能为负数。")
@@ -146,6 +147,7 @@ def analyze_startup_brake_test(
     brake_end_point: tuple[float, float] | None = None
     brake_delay_s: float | None = None
     brake_peak_current: SignalPeak | None = None
+    brake_end_note: str | None = None
     if requires_brake:
         if speed_waveform is None:
             raise ValueError("缺少刹车测试所需转速通道波形。")
@@ -204,11 +206,21 @@ def analyze_startup_brake_test(
             if current_zero_window is None:
                 raise ValueError("未检测到满足阈值条件的零电流稳定区间。")
             brake_end_point = (current_zero_window.start_time_s, 0.0)
+            brake_end_note = (
+                f"电流归零可信度：高（归零窗口起点 {current_zero_window.start_time_s:.6f} s，"
+                f"确认时刻 {current_zero_window.confirmed_time_s:.6f} s）。"
+            )
+        elif config.brake_mode == "speed_zero":
+            brake_end_point = (speed_zero_window.start_time_s, speed_zero_window.max_abs_value)
+            brake_end_note = (
+                f"转速归零可信度：高（零速窗口起点 {speed_zero_window.start_time_s:.6f} s，"
+                f"窗口最大绝对值 {speed_zero_window.max_abs_value:.6f}）。"
+            )
         else:
             if not encoder_channel:
                 raise ValueError("A 相回溯模式需要选择编码器 A 相通道。")
             encoder_waveform = waveform_map[encoder_channel]
-            brake_end_point = _find_encoder_backtrack_end(
+            brake_end_result = _find_encoder_backtrack_end(
                 encoder_waveform,
                 start_time=brake_start[0],
                 count=config.brake_backtrack_pulses,
@@ -216,8 +228,9 @@ def analyze_startup_brake_test(
                 min_step=config.brake_backtrack_min_step,
                 min_interval_s=config.brake_backtrack_min_interval_s,
             )
-            if brake_end_point is None:
+            if brake_end_result is None:
                 raise ValueError(f"在 A 相停止点之前不足 {config.brake_backtrack_pulses} 个有效脉冲。")
+            brake_end_point, brake_end_note = brake_end_result
 
         brake_delay_s = brake_end_point[0] - brake_start[0]
         if brake_delay_s < 0:
@@ -237,7 +250,94 @@ def analyze_startup_brake_test(
         brake_peak_current=brake_peak_current,
         brake_mode=config.brake_mode,
         test_scope_mode=config.test_scope_mode,
+        brake_end_note=brake_end_note,
     )
+
+
+def diagnose_startup_brake_failure(
+    waveforms: list[WaveformData],
+    config: StartupBrakeTestConfig,
+    exc: Exception,
+) -> str:
+    waveform_map = {waveform.channel: waveform for waveform in waveforms}
+    lines = [f"失败原因：{exc}"]
+
+    control = waveform_map.get(config.control_channel)
+    speed = waveform_map.get(config.speed_channel)
+    current = waveform_map.get(config.current_channel)
+    encoder = waveform_map.get(config.encoder_a_channel) if config.encoder_a_channel else None
+
+    if control is not None:
+        lines.append(
+            f"控制通道 {config.control_channel}: {len(control.x_values)} 点，范围 {min(control.y_values):.3f}~{max(control.y_values):.3f}。"
+        )
+    if speed is not None:
+        lines.append(
+            f"转速通道 {config.speed_channel}: {len(speed.x_values)} 点，范围 {min(speed.y_values):.3f}~{max(speed.y_values):.3f}。"
+        )
+    if current is not None:
+        min_abs = min(abs(value) for value in current.y_values) if current.y_values else 0.0
+        lines.append(
+            f"电流通道 {config.current_channel}: 最小绝对值 {min_abs:.3f} A，范围 {min(current.y_values):.3f}~{max(current.y_values):.3f} A。"
+        )
+    if encoder is not None:
+        lines.append(
+            f"A相通道 {config.encoder_a_channel}: {len(encoder.x_values)} 点，范围 {min(encoder.y_values):.3f}~{max(encoder.y_values):.3f}。"
+        )
+
+    message = str(exc)
+    if "启动上升沿" in message and control is not None:
+        edge = control.find_first_edge("rising", threshold_ratio=config.control_threshold_ratio)
+        lines.append(f"控制上升沿候选：{'已找到' if edge is not None else '未找到'}。")
+    elif "达到目标转速" in message and speed is not None:
+        stats = speed.analyze()
+        if stats.estimated_frequency_hz is not None:
+            lines.append(
+                f"转速通道全局估计：频率 {stats.estimated_frequency_hz:.3f} Hz，周期 {1.0 / stats.estimated_frequency_hz * 1000.0:.3f} ms。"
+            )
+    elif "控制器下降沿" in message and control is not None and speed is not None:
+        speed_zero_window = _find_speed_zero_window(
+            speed,
+            start_time=speed.x_values[0],
+        )
+        lines.append(
+            "刹车起点诊断："
+            + (
+                f"已找到转速归零窗口 {speed_zero_window.start_time_s:.6f} s。"
+                if speed_zero_window is not None
+                else "未找到转速归零窗口。"
+            )
+        )
+        edge = _find_brake_start_edge(
+            control,
+            reference_time=speed_zero_window.start_time_s if speed_zero_window is not None else control.x_values[-1],
+            threshold_ratio=config.control_threshold_ratio,
+            low_hold_s=config.brake_low_hold_s,
+            min_fall_s=config.brake_min_fall_s,
+            max_fall_s=config.brake_max_fall_s,
+        )
+        lines.append(f"控制下降沿候选：{'已找到' if edge is not None else '未找到'}。")
+    elif "零电流稳定区间" in message and current is not None:
+        zero_window = current.find_zero_stable_window(
+            start_time=current.x_values[0],
+            zero_threshold=config.zero_current_threshold_a,
+            flat_threshold=config.zero_current_flat_threshold_a,
+            hold_time_s=config.zero_current_hold_s,
+        )
+        lines.append(
+            "零电流诊断："
+            + (
+                f"存在候选窗口 {zero_window.start_time_s:.6f} s。"
+                if zero_window is not None
+                else "未找到候选窗口。"
+            )
+        )
+    elif "有效脉冲" in message and encoder is not None:
+        threshold = (max(encoder.y_values) + min(encoder.y_values)) / 2.0
+        rising_crossings = _find_crossings(encoder.x_values, encoder.y_values, threshold, "rising")
+        lines.append(f"A相边沿诊断：检测到 {len(rising_crossings)} 个上升沿交点。")
+
+    return "\n".join(lines)
 
 
 def _find_confirmed_zero_current_window(
@@ -654,7 +754,7 @@ def _find_encoder_backtrack_end(
     edge_type: str,
     min_step: float,
     min_interval_s: float,
-) -> tuple[float, float] | None:
+) -> tuple[tuple[float, float], str] | None:
     if not waveform.x_values or not waveform.y_values:
         return None
     if count <= 0:
@@ -677,6 +777,7 @@ def _find_encoder_backtrack_end(
         min_interval_s=min_interval_s,
         minimum_pulse_width_s=minimum_pulse_width_s,
     )
+    confidence_note = "A相回溯可信度：高（末尾有效脉冲簇完整）。"
     if len(effective_edges) < count:
         effective_edges = _collect_raw_crossing_edges(
             waveform,
@@ -687,6 +788,7 @@ def _find_encoder_backtrack_end(
             min_step=min_step,
             min_interval_s=min_interval_s,
         )
+        confidence_note = "A相回溯可信度：低（有效脉冲不足，已回退到原始边沿）。"
     if len(effective_edges) < count:
         return None
 
@@ -698,7 +800,9 @@ def _find_encoder_backtrack_end(
     target_edges = clustered_edges if len(clustered_edges) >= count else effective_edges
     if len(target_edges) < count:
         return None
-    return target_edges[-count], threshold
+    if confidence_note.startswith("A相回溯可信度：高") and len(clustered_edges) < max(count, 3):
+        confidence_note = "A相回溯可信度：中（末尾有效脉冲较少，请结合波形确认）。"
+    return (target_edges[-count], threshold), confidence_note
 
 
 def _select_last_edge_cluster(

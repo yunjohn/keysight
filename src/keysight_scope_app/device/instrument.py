@@ -405,15 +405,8 @@ class KeysightOscilloscope:
             self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
             self._instrument.write(f":WAVeform:POINts {points}")
             preamble_values = self._instrument.query_ascii_values(":WAVeform:PREamble?")
-            payload = list(
-                self._instrument.query_binary_values(
-                    ":WAVeform:DATA?",
-                    datatype="B",
-                    container=list,
-                    header_fmt="ieee",
-                    expect_termination=False,
-                )
-            )
+            self._instrument.write(":WAVeform:DATA?")
+            payload = list(strip_ieee4882_block(self._instrument.read_raw()))
 
         preamble = _parse_preamble(preamble_values)
         x_values = [
