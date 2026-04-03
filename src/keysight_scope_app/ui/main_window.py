@@ -1808,8 +1808,28 @@ class ScopeMainWindow(QMainWindow):
 
         self.task_runner.run(task, on_success=handle_success, on_error=handle_error)
 
+    def _is_invalid_scope_session_error(self, error: Exception) -> bool:
+        if isinstance(error, VisaIOError) and getattr(error, "error_code", None) == -1073807346:
+            return True
+        message = str(error)
+        return any(
+            token in message
+            for token in (
+                "VI_ERROR_INV_OBJECT",
+                "Invalid session handle",
+                "The given session or object reference is invalid",
+                "会话已失效",
+            )
+        )
+
     def _handle_error(self, error: Exception) -> None:
         self._set_trigger_buttons_busy(False)
+        if self._is_invalid_scope_session_error(error):
+            self.log("示波器连接已失效，请重新连接设备。")
+            if self.scope is not None:
+                self.disconnect_scope()
+            QMessageBox.warning(self, "连接失效", "示波器连接已失效，请重新连接设备。")
+            return
         self.log(f"操作失败: {error}")
         QMessageBox.critical(self, "操作失败", str(error))
 

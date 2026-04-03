@@ -72,6 +72,7 @@ class StartupBrakeTestDialog(QDialog):
         self.history: list[StartupBrakeHistoryEntry] = []
         self.channel_previous: dict[int, str] = {}
         self._test_running = False
+        self._last_analysis_waveforms: list[WaveformData] = []
 
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
@@ -764,6 +765,7 @@ class StartupBrakeTestDialog(QDialog):
         waveforms: list[WaveformData],
         config: StartupBrakeTestConfig,
     ) -> None:
+        self._last_analysis_waveforms = list(waveforms)
         self.main_window.task_runner.run(
             lambda: analyze_startup_brake_test(waveforms, config),
             on_success=lambda result, captured_config=config: self._complete_test(result, captured_config),
@@ -785,10 +787,11 @@ class StartupBrakeTestDialog(QDialog):
                 config=config,
             )
         )
+        entry = self.history[-1]
         self._save_history()
         self._update_results(result)
-        self._apply_result_markers(result)
-        self._refresh_history()
+        self._append_history_entry(entry)
+        self._update_history_stats()
         self.main_window.log(
             "启动刹车性能测试完成: "
             f"范围 {self._test_scope_mode_display_text(result.test_scope_mode)}, "
@@ -802,9 +805,25 @@ class StartupBrakeTestDialog(QDialog):
         self.last_result = None
         self.last_config = None
         self.clear_results(reset_summary=False)
+        exported_failure_path = self._export_failure_waveforms()
         self.summary_label.setText(f"测试失败：{exc}")
         self.main_window.log(f"启动刹车性能测试失败: {exc}")
+        if exported_failure_path is not None:
+            self.main_window.log(f"失败波形已导出: {exported_failure_path}")
         self.main_window._show_warning(str(exc))
+
+    def _export_failure_waveforms(self) -> Path | None:
+        if not self._last_analysis_waveforms:
+            return None
+        try:
+            STARTUP_BRAKE_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = STARTUP_BRAKE_DIR / f"failure_{timestamp}.csv"
+            WaveformData.export_csv_bundle(self._last_analysis_waveforms, output_path)
+            return output_path
+        except Exception as export_exc:
+            self.main_window.log(f"失败波形导出失败: {export_exc}")
+            return None
 
     def _set_test_running(self, running: bool) -> None:
         self._test_running = running
@@ -1062,16 +1081,16 @@ class StartupBrakeTestDialog(QDialog):
 
             writer.writerow(["统计", "样本数", str(len(self.history))])
             writer.writerow(
-                ["统计", "启动时长范围(ms)", format_range_ms([entry.result.startup_delay_s * 1000.0 for entry in self.history if entry.result.startup_delay_s is not None])]
+                ["统计", "启动时长范围(ms)", self._format_range_ms_display([entry.result.startup_delay_s * 1000.0 for entry in self.history if entry.result.startup_delay_s is not None])]
             )
             writer.writerow(
-                ["统计", "刹车时长范围(ms)", format_range_ms([entry.result.brake_delay_s * 1000.0 for entry in self.history if entry.result.brake_delay_s is not None])]
+                ["统计", "刹车时长范围(ms)", self._format_range_ms_display([entry.result.brake_delay_s * 1000.0 for entry in self.history if entry.result.brake_delay_s is not None])]
             )
             writer.writerow(
                 [
                     "统计",
                     "启动峰值电流范围(A)",
-                    format_range_amp(
+                    self._format_range_amp_display(
                         [entry.result.startup_peak_current.value for entry in self.history if entry.result.startup_peak_current is not None]
                     ),
                 ]
@@ -1080,15 +1099,16 @@ class StartupBrakeTestDialog(QDialog):
                 [
                     "统计",
                     "刹车峰值电流范围(A)",
-                    format_range_amp(
+                    self._format_range_amp_display(
                         [entry.result.brake_peak_current.value for entry in self.history if entry.result.brake_peak_current is not None]
                     ),
                 ]
             )
             writer.writerow(
-                ["统计", "命中频率范围(Hz)", format_range_hz([entry.result.speed_match.frequency_hz for entry in self.history])]
+                ["统计", "命中频率范围(Hz)", self._format_range_hz_display([entry.result.speed_match.frequency_hz for entry in self.history])]
             )
             writer.writerow([])
+            writer.writerow(["测试记录", "", ""])
 
             writer.writerow(
                 [
@@ -1172,16 +1192,29 @@ class StartupBrakeTestDialog(QDialog):
     def _refresh_history(self) -> None:
         self.history_table.setRowCount(len(self.history))
         for row, entry in enumerate(self.history):
-            result = entry.result
-            self.history_table.setItem(row, 0, self._centered_table_item(str(row + 1)))
-            self.history_table.setItem(row, 1, self._centered_table_item(entry.timestamp))
-            self.history_table.setItem(row, 2, self._centered_table_item(self._format_optional_ms(result.startup_delay_s)))
-            self.history_table.setItem(row, 3, self._centered_table_item(self._format_optional_ms(result.brake_delay_s)))
-            self.history_table.setItem(row, 4, self._centered_table_item(self._format_peak_current_display(result.startup_peak_current)))
-            self.history_table.setItem(row, 5, self._centered_table_item(self._format_peak_current_display(result.brake_peak_current)))
-            self.history_table.setItem(row, 6, self._centered_table_item(self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)))
-            self.history_table.setItem(row, 7, self._centered_table_item(self._format_optional_period_ms(result.speed_match.period_s if result.speed_match is not None else None)))
+            self._set_history_row(row, entry)
+        self._update_history_stats()
 
+    def _append_history_entry(self, entry: StartupBrakeHistoryEntry) -> None:
+        row = len(self.history) - 1
+        if row < 0:
+            self.history_table.setRowCount(0)
+            return
+        self.history_table.setRowCount(len(self.history))
+        self._set_history_row(row, entry)
+
+    def _set_history_row(self, row: int, entry: StartupBrakeHistoryEntry) -> None:
+        result = entry.result
+        self.history_table.setItem(row, 0, self._centered_table_item(str(row + 1)))
+        self.history_table.setItem(row, 1, self._centered_table_item(entry.timestamp))
+        self.history_table.setItem(row, 2, self._centered_table_item(self._format_optional_ms(result.startup_delay_s)))
+        self.history_table.setItem(row, 3, self._centered_table_item(self._format_optional_ms(result.brake_delay_s)))
+        self.history_table.setItem(row, 4, self._centered_table_item(self._format_peak_current_display(result.startup_peak_current)))
+        self.history_table.setItem(row, 5, self._centered_table_item(self._format_peak_current_display(result.brake_peak_current)))
+        self.history_table.setItem(row, 6, self._centered_table_item(self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)))
+        self.history_table.setItem(row, 7, self._centered_table_item(self._format_optional_period_ms(result.speed_match.period_s if result.speed_match is not None else None)))
+
+    def _update_history_stats(self) -> None:
         if not self.history:
             for label in self.stats_labels.values():
                 label.setText("-")

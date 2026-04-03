@@ -30,6 +30,7 @@ WAVEFORM_MEASUREMENT_SETTINGS_PATH = WAVEFORM_CONFIG_DIR / "waveform_measurement
 WAVEFORM_MEASUREMENT_ORDER = [
     "频率",
     "周期",
+    "脉冲计数",
     "峰峰值",
     "均方根",
     "最大值",
@@ -92,6 +93,7 @@ def _measurement_value_from_stats(stats: WaveformStats, measurement_name: str) -
     values = {
         "频率": stats.estimated_frequency_hz,
         "周期": _period_from_stats(stats),
+        "脉冲计数": float(stats.pulse_count),
         "峰峰值": stats.voltage_pp,
         "均方根": stats.voltage_rms,
         "最大值": stats.voltage_max,
@@ -112,6 +114,8 @@ def _measurement_value_from_stats(stats: WaveformStats, measurement_name: str) -
 
 
 def _measurement_unit(channel_unit: str, measurement_name: str) -> str:
+    if measurement_name == "脉冲计数":
+        return "个"
     if measurement_name in CURRENT_LIKE_MEASUREMENTS:
         return channel_unit
     if measurement_name == "占空比":
@@ -126,6 +130,8 @@ def _measurement_unit(channel_unit: str, measurement_name: str) -> str:
 def _format_measurement_display(value: float | None, unit: str) -> str:
     if value is None:
         return "--"
+    if unit == "个":
+        return f"{int(round(value))} {unit}"
     return format_engineering_value(value, unit)
 
 

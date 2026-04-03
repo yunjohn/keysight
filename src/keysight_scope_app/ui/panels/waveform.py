@@ -1019,7 +1019,7 @@ class WaveformAnalysisPanel(QWidget):
         if channel == self.active_waveform_channel:
             return
         self.active_waveform_channel = channel
-        self._render_all_waveform_series()
+        self._refresh_waveform_series_styles()
         self._update_view_stats_from_axes()
         self._update_channel_comparison()
         self._refresh_cursor_graphics()
@@ -1245,6 +1245,12 @@ class WaveformAnalysisPanel(QWidget):
     def _render_all_waveform_series(self) -> None:
         for channel in self.waveform_series_map:
             self._render_waveform_series(channel)
+        self.chart.legend().setVisible(len(self.visible_channels) > 1)
+        self._refresh_chart_title()
+
+    def _refresh_waveform_series_styles(self) -> None:
+        for channel, series in self.waveform_series_map.items():
+            series.setPen(self._waveform_series_pen(channel))
         self.chart.legend().setVisible(len(self.visible_channels) > 1)
         self._refresh_chart_title()
 

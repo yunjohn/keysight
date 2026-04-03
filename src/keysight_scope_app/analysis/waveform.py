@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import csv
 import math
 import statistics
@@ -98,6 +99,7 @@ class WaveformStats:
     logic_high_v: float
     amplitude_v: float
     estimated_frequency_hz: float | None
+    pulse_count: int
     pulse_width_s: float | None
     duty_cycle: float | None
     rise_time_s: float | None
@@ -271,7 +273,9 @@ class WaveformData:
 
         rising_mid_crossings = _find_crossings(x_values, y_values, mid_threshold, "rising")
         falling_mid_crossings = _find_crossings(x_values, y_values, mid_threshold, "falling")
+        pulses = _find_pulses(rising_mid_crossings, falling_mid_crossings, mid_threshold)
         estimated_frequency_hz = _estimate_frequency_from_crossings(rising_mid_crossings)
+        pulse_count = len(pulses)
         pulse_width_s = _estimate_pulse_width(rising_mid_crossings, falling_mid_crossings)
         duty_cycle = _estimate_duty_cycle(pulse_width_s, estimated_frequency_hz)
         rise_time_s = _estimate_transition_time(
@@ -295,6 +299,7 @@ class WaveformData:
             logic_high_v=logic_high_v,
             amplitude_v=amplitude_v,
             estimated_frequency_hz=estimated_frequency_hz,
+            pulse_count=pulse_count,
             pulse_width_s=pulse_width_s,
             duty_cycle=duty_cycle,
             rise_time_s=rise_time_s,
@@ -545,9 +550,7 @@ class WaveformData:
         threshold_margin = min(flat_threshold, zero_threshold * 0.1) if zero_threshold >= 0.2 else 0.0
         effective_zero_threshold = zero_threshold + threshold_margin
         point_count = min(len(self.x_values), len(self.y_values))
-        start_index = 0
-        while start_index < point_count and self.x_values[start_index] < start_time:
-            start_index += 1
+        start_index = bisect.bisect_left(self.x_values[:point_count], start_time)
 
         return _find_stable_window(
             self.x_values,
@@ -855,19 +858,19 @@ def _matches_target_cycle(
     tolerance_ratio: float,
 ) -> bool:
     if target_mode == "frequency_hz":
-        target_measure = target_value
         actual_measure = frequency_hz
+        minimum_measure = target_value * max(0.0, 1.0 - tolerance_ratio)
+        return actual_measure >= minimum_measure
     elif target_mode == "period_s":
-        target_measure = target_value
         actual_measure = period_s
+        maximum_measure = target_value * (1.0 + tolerance_ratio)
+        return actual_measure <= maximum_measure
     elif target_mode == "rpm":
-        target_measure = target_value
         actual_measure = rpm
+        minimum_measure = target_value * max(0.0, 1.0 - tolerance_ratio)
+        return actual_measure >= minimum_measure
     else:
         raise ValueError(f"不支持的目标类型: {target_mode}")
-
-    tolerance = abs(target_measure) * tolerance_ratio
-    return abs(actual_measure - target_measure) <= tolerance
 
 
 def compare_waveform_edges(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 
 from keysight_scope_app.analysis.waveform import (
@@ -9,6 +10,7 @@ from keysight_scope_app.analysis.waveform import (
     ZeroStableWindow,
     _edge_threshold,
     _find_crossings,
+    _find_pulses,
     _find_stable_window,
 )
 
@@ -183,24 +185,31 @@ def analyze_startup_brake_test(
         if brake_start is None:
             raise ValueError("未检测到转速归零前的控制器下降沿。")
 
-        current_zero_window = current_waveform.find_zero_stable_window(
-            start_time=brake_start[0],
-            zero_threshold=config.zero_current_threshold_a,
-            flat_threshold=config.zero_current_flat_threshold_a,
-            hold_time_s=config.zero_current_hold_s,
-        )
-        if current_zero_window is None:
-            raise ValueError("未检测到满足阈值条件的零电流稳定区间。")
-
         if config.brake_mode == "current_zero":
+            current_zero_window = current_waveform.find_zero_stable_window(
+                start_time=brake_start[0],
+                zero_threshold=config.zero_current_threshold_a,
+                flat_threshold=config.zero_current_flat_threshold_a,
+                hold_time_s=config.zero_current_hold_s,
+            )
+            if current_zero_window is not None:
+                current_zero_window = _find_confirmed_zero_current_window(
+                    current_waveform,
+                    current_zero_window,
+                    brake_start_time_s=brake_start[0],
+                    zero_threshold=config.zero_current_threshold_a,
+                    flat_threshold=config.zero_current_flat_threshold_a,
+                    hold_time_s=config.zero_current_hold_s,
+                )
+            if current_zero_window is None:
+                raise ValueError("未检测到满足阈值条件的零电流稳定区间。")
             brake_end_point = (current_zero_window.start_time_s, 0.0)
         else:
             if not encoder_channel:
                 raise ValueError("A 相回溯模式需要选择编码器 A 相通道。")
             encoder_waveform = waveform_map[encoder_channel]
-            brake_end_point = _find_previous_filtered_edge(
+            brake_end_point = _find_encoder_backtrack_end(
                 encoder_waveform,
-                reference_time=current_zero_window.confirmed_time_s,
                 start_time=brake_start[0],
                 count=config.brake_backtrack_pulses,
                 edge_type="rising",
@@ -208,7 +217,7 @@ def analyze_startup_brake_test(
                 min_interval_s=config.brake_backtrack_min_interval_s,
             )
             if brake_end_point is None:
-                raise ValueError(f"在电流归零确认点之前不足 {config.brake_backtrack_pulses} 个 A 相上升沿。")
+                raise ValueError(f"在 A 相停止点之前不足 {config.brake_backtrack_pulses} 个有效脉冲。")
 
         brake_delay_s = brake_end_point[0] - brake_start[0]
         if brake_delay_s < 0:
@@ -229,6 +238,57 @@ def analyze_startup_brake_test(
         brake_mode=config.brake_mode,
         test_scope_mode=config.test_scope_mode,
     )
+
+
+def _find_confirmed_zero_current_window(
+    waveform: WaveformData,
+    initial_window: ZeroStableWindow,
+    *,
+    brake_start_time_s: float,
+    zero_threshold: float,
+    flat_threshold: float,
+    hold_time_s: float,
+) -> ZeroStableWindow | None:
+    candidate = initial_window
+    guard_time_s = max(hold_time_s * 3.0, waveform.preamble.x_increment * 40.0, 0.05)
+    max_iterations = 12
+
+    for _ in range(max_iterations):
+        rebound_time = _find_rebound_after_zero_candidate(
+            waveform,
+            candidate.confirmed_time_s,
+            zero_threshold=zero_threshold,
+            guard_time_s=guard_time_s,
+        )
+        if rebound_time is None:
+            return candidate
+
+        candidate = waveform.find_zero_stable_window(
+            start_time=max(rebound_time, brake_start_time_s),
+            zero_threshold=zero_threshold,
+            flat_threshold=flat_threshold,
+            hold_time_s=hold_time_s,
+        )
+        if candidate is None:
+            return None
+    return candidate
+
+
+def _find_rebound_after_zero_candidate(
+    waveform: WaveformData,
+    confirmed_time_s: float,
+    *,
+    zero_threshold: float,
+    guard_time_s: float,
+) -> float | None:
+    guard_end_time_s = confirmed_time_s + guard_time_s
+    start_index = bisect.bisect_right(waveform.x_values, confirmed_time_s)
+    for time_value, signal_value in zip(waveform.x_values[start_index:], waveform.y_values[start_index:]):
+        if time_value > guard_end_time_s:
+            break
+        if abs(signal_value) > zero_threshold:
+            return time_value
+    return None
 
 
 def _find_startup_edge(
@@ -322,10 +382,12 @@ def _find_brake_start_edge(
     ]
     if not falling_edges or amplitude <= 0:
         return None
+    require_fall_duration = min_fall_s > 0 or max_fall_s > 0
     for crossing in reversed(falling_edges):
-        fall_duration_s = _transition_duration_around_time(waveform, edge_type="falling", anchor_time=crossing)
-        if not _duration_within_limits(fall_duration_s, minimum_s=min_fall_s, maximum_s=max_fall_s):
-            continue
+        if require_fall_duration:
+            fall_duration_s = _transition_duration_around_time(waveform, edge_type="falling", anchor_time=crossing)
+            if not _duration_within_limits(fall_duration_s, minimum_s=min_fall_s, maximum_s=max_fall_s):
+                continue
         if _falling_edge_reaches_low_region(
             waveform,
             crossing_time=crossing,
@@ -429,11 +491,25 @@ def _falling_edge_reaches_low_region(
 
     hold_until = waveform.x_values[low_entry_index] + confirm_hold_s
     probe_index = low_entry_index
+    sample_count = 0
+    below_rebound_count = 0
+    consecutive_below_count = 0
+    longest_consecutive_below = 0
     while probe_index < point_count and waveform.x_values[probe_index] <= hold_until:
-        if waveform.y_values[probe_index] > confirm_rebound_threshold:
-            return False
+        sample_count += 1
+        if waveform.y_values[probe_index] <= confirm_rebound_threshold:
+            below_rebound_count += 1
+            consecutive_below_count += 1
+            longest_consecutive_below = max(longest_consecutive_below, consecutive_below_count)
+        else:
+            consecutive_below_count = 0
         probe_index += 1
-    return probe_index > low_entry_index
+    if probe_index <= low_entry_index or sample_count == 0:
+        return False
+
+    below_ratio = below_rebound_count / sample_count
+    minimum_consecutive_below = max(2, sample_count // 2)
+    return below_ratio >= (2.0 / 3.0) and longest_consecutive_below >= minimum_consecutive_below
 
 
 def _find_speed_slowdown_onset(
@@ -524,10 +600,221 @@ def _find_previous_filtered_edge(
         raise ValueError(f"不支持的边沿类型: {edge_type}")
 
     threshold = (max(waveform.y_values) + min(waveform.y_values)) / 2.0
+    rising_crossings = _find_crossings(waveform.x_values, waveform.y_values, threshold, "rising")
+    falling_crossings = _find_crossings(waveform.x_values, waveform.y_values, threshold, "falling")
+    pulses = _find_pulses(rising_crossings, falling_crossings, threshold)
+    minimum_pulse_width_s = max(min_interval_s * 0.25, waveform.preamble.x_increment * 4.0, 0.00005)
+    accepted_crossings = _collect_effective_pulse_edges(
+        waveform,
+        pulses,
+        edge_type=edge_type,
+        start_time=start_time,
+        reference_time=reference_time,
+        min_step=min_step,
+        min_interval_s=min_interval_s,
+        minimum_pulse_width_s=minimum_pulse_width_s,
+    )
+    if len(accepted_crossings) < count:
+        accepted_crossings = _collect_raw_crossing_edges(
+            waveform,
+            threshold=threshold,
+            edge_type=edge_type,
+            start_time=start_time,
+            reference_time=reference_time,
+            min_step=min_step,
+            min_interval_s=min_interval_s,
+        )
+
+    if len(accepted_crossings) < count:
+        return None
+
+    clustered_crossings = _select_last_edge_cluster(
+        accepted_crossings,
+        min_interval_s=min_interval_s,
+        sample_interval_s=waveform.preamble.x_increment,
+    )
+    if clustered_crossings:
+        stale_gap_s = _encoder_cluster_stale_gap_s(
+            clustered_crossings,
+            min_interval_s=min_interval_s,
+            sample_interval_s=waveform.preamble.x_increment,
+        )
+        if (reference_time - clustered_crossings[-1]) > stale_gap_s:
+            return clustered_crossings[-1], threshold
+    if len(clustered_crossings) >= count:
+        return clustered_crossings[-count], threshold
+    return accepted_crossings[-count], threshold
+
+
+def _find_encoder_backtrack_end(
+    waveform: WaveformData,
+    *,
+    start_time: float,
+    count: int,
+    edge_type: str,
+    min_step: float,
+    min_interval_s: float,
+) -> tuple[float, float] | None:
+    if not waveform.x_values or not waveform.y_values:
+        return None
+    if count <= 0:
+        raise ValueError("回溯脉冲数必须大于 0。")
+    if edge_type not in {"rising", "falling"}:
+        raise ValueError(f"不支持的边沿类型: {edge_type}")
+
+    threshold = (max(waveform.y_values) + min(waveform.y_values)) / 2.0
+    rising_crossings = _find_crossings(waveform.x_values, waveform.y_values, threshold, "rising")
+    falling_crossings = _find_crossings(waveform.x_values, waveform.y_values, threshold, "falling")
+    pulses = _find_pulses(rising_crossings, falling_crossings, threshold)
+    minimum_pulse_width_s = max(min_interval_s * 0.25, waveform.preamble.x_increment * 4.0, 0.00005)
+    effective_edges = _collect_effective_pulse_edges(
+        waveform,
+        pulses,
+        edge_type=edge_type,
+        start_time=start_time,
+        reference_time=waveform.x_values[-1] + waveform.preamble.x_increment,
+        min_step=min_step,
+        min_interval_s=min_interval_s,
+        minimum_pulse_width_s=minimum_pulse_width_s,
+    )
+    if len(effective_edges) < count:
+        effective_edges = _collect_raw_crossing_edges(
+            waveform,
+            threshold=threshold,
+            edge_type=edge_type,
+            start_time=start_time,
+            reference_time=waveform.x_values[-1] + waveform.preamble.x_increment,
+            min_step=min_step,
+            min_interval_s=min_interval_s,
+        )
+    if len(effective_edges) < count:
+        return None
+
+    clustered_edges = _select_last_edge_cluster(
+        effective_edges,
+        min_interval_s=min_interval_s,
+        sample_interval_s=waveform.preamble.x_increment,
+    )
+    target_edges = clustered_edges if len(clustered_edges) >= count else effective_edges
+    if len(target_edges) < count:
+        return None
+    return target_edges[-count], threshold
+
+
+def _select_last_edge_cluster(
+    accepted_crossings: list[float],
+    *,
+    min_interval_s: float,
+    sample_interval_s: float,
+) -> list[float]:
+    if len(accepted_crossings) <= 1:
+        return accepted_crossings
+
+    intervals = [
+        accepted_crossings[index + 1] - accepted_crossings[index]
+        for index in range(len(accepted_crossings) - 1)
+    ]
+    trailing_intervals = intervals[-min(len(intervals), 12):]
+    sorted_intervals = sorted(trailing_intervals)
+    median_interval_s = sorted_intervals[len(sorted_intervals) // 2]
+    cluster_gap_s = max(
+        min_interval_s * 4.0,
+        median_interval_s * 4.0,
+        sample_interval_s * 20.0,
+        0.005,
+    )
+
+    cluster_start_index = len(accepted_crossings) - 1
+    for index in range(len(accepted_crossings) - 2, -1, -1):
+        if accepted_crossings[index + 1] - accepted_crossings[index] > cluster_gap_s:
+            break
+        cluster_start_index = index
+    return accepted_crossings[cluster_start_index:]
+
+
+def _encoder_cluster_stale_gap_s(
+    clustered_crossings: list[float],
+    *,
+    min_interval_s: float,
+    sample_interval_s: float,
+) -> float:
+    if len(clustered_crossings) <= 1:
+        median_interval_s = 0.0
+    else:
+        intervals = [
+            clustered_crossings[index + 1] - clustered_crossings[index]
+            for index in range(len(clustered_crossings) - 1)
+        ]
+        sorted_intervals = sorted(intervals)
+        median_interval_s = sorted_intervals[len(sorted_intervals) // 2]
+    return max(
+        min_interval_s * 8.0,
+        median_interval_s * 8.0,
+        sample_interval_s * 50.0,
+        0.05,
+    )
+
+
+def _pulse_span_between_edges(
+    waveform: WaveformData,
+    start_time_s: float,
+    end_time_s: float,
+) -> float:
+    point_count = min(len(waveform.x_values), len(waveform.y_values))
+    start_index = bisect.bisect_left(waveform.x_values[:point_count], start_time_s)
+    end_index = bisect.bisect_right(waveform.x_values[:point_count], end_time_s)
+    if start_index >= end_index:
+        return 0.0
+    segment = waveform.y_values[start_index:end_index]
+    if not segment:
+        return 0.0
+    return max(segment) - min(segment)
+
+
+def _collect_effective_pulse_edges(
+    waveform: WaveformData,
+    pulses: list,
+    *,
+    edge_type: str,
+    start_time: float,
+    reference_time: float,
+    min_step: float,
+    min_interval_s: float,
+    minimum_pulse_width_s: float,
+) -> list[float]:
+    accepted_crossings: list[float] = []
+    previous_kept_crossing: float | None = None
+    for pulse in pulses:
+        crossing_time = pulse.rising_edge[0] if edge_type == "rising" else pulse.falling_edge[0]
+        if crossing_time < start_time or crossing_time >= reference_time:
+            continue
+        pulse_width_s = pulse.falling_edge[0] - pulse.rising_edge[0]
+        if pulse_width_s < minimum_pulse_width_s:
+            continue
+        if previous_kept_crossing is not None and (crossing_time - previous_kept_crossing) < min_interval_s:
+            continue
+        if min_step > 0:
+            pulse_span = _pulse_span_between_edges(waveform, pulse.rising_edge[0], pulse.falling_edge[0])
+            if pulse_span < min_step:
+                continue
+        accepted_crossings.append(crossing_time)
+        previous_kept_crossing = crossing_time
+    return accepted_crossings
+
+
+def _collect_raw_crossing_edges(
+    waveform: WaveformData,
+    *,
+    threshold: float,
+    edge_type: str,
+    start_time: float,
+    reference_time: float,
+    min_step: float,
+    min_interval_s: float,
+) -> list[float]:
     accepted_crossings: list[float] = []
     previous_kept_crossing: float | None = None
     point_count = min(len(waveform.x_values), len(waveform.y_values))
-
     for index in range(1, point_count):
         previous_value = waveform.y_values[index - 1]
         current_value = waveform.y_values[index]
@@ -549,10 +836,7 @@ def _find_previous_filtered_edge(
             continue
         accepted_crossings.append(crossing_time)
         previous_kept_crossing = crossing_time
-
-    if len(accepted_crossings) < count:
-        return None
-    return accepted_crossings[-count], threshold
+    return accepted_crossings
 
 
 def _crossing_time(

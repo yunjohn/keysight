@@ -237,11 +237,12 @@ def test_fetch_measurements_supports_derived_metrics_with_single_waveform_fetch(
             )
 
     scope = FakeScope()
-    results = scope.fetch_measurements("CHANnel1", ["频率", "占空比", "正脉宽", "负脉宽", "下降时间", "高电平估计"])
+    results = scope.fetch_measurements("CHANnel1", ["频率", "脉冲计数", "占空比", "正脉宽", "负脉宽", "下降时间", "高电平估计"])
     result_map = {result.label: result.raw_value for result in results}
 
     assert scope.waveform_fetch_count == 1
     assert result_map["频率"] == 1000.0
+    assert result_map["脉冲计数"] == 2.0
     assert result_map["占空比"] == 50.0
     assert result_map["正脉宽"] == 0.5
     assert result_map["负脉宽"] == 0.5
@@ -556,6 +557,26 @@ def test_waveform_dialog_formats_missing_measurement_as_dashdash() -> None:
         dialog.close()
 
 
+def test_waveform_dialog_formats_pulse_count_as_integer() -> None:
+    app = QApplication.instance() or QApplication([])
+    dialog = WaveformDetailDialog()
+    try:
+        waveform = WaveformData(
+            channel="CHANnel1",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, 9, 1, 0.25, 0.0, 0, 1.0, 0.0, 0),
+            x_values=[0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0],
+            y_values=[0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+        )
+        dialog.set_waveform(waveform, waveform.analyze())
+        dialog.measurement_config = {"CHANnel1": {"脉冲计数"}}
+        html = dialog._build_measurement_section_html(waveform, "full")
+        assert "脉冲计数" in html
+        assert "2 个" in html
+    finally:
+        dialog.close()
+
+
 def test_main_window_persists_waveform_mode_and_points(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     original_ui_state_path = main_window_module.UI_STATE_PATH
@@ -696,7 +717,7 @@ def test_analyze_startup_brake_test_encoder_backtrack_mode() -> None:
         ),
     )
 
-    assert abs(result.current_zero_window.confirmed_time_s - 0.089) < 1e-9
+    assert result.current_zero_window is None
     assert abs(result.brake_end_point[0] - 0.0849) < 1e-9
     assert abs(result.brake_delay_s - 0.00588) < 1e-9
 
@@ -725,6 +746,7 @@ def test_analyze_startup_brake_test_encoder_backtrack_ignores_small_noise_pulses
         ),
     )
 
+    assert result.current_zero_window is None
     assert result.brake_end_point is not None
     assert abs(result.brake_end_point[0] - 0.0853) < 1e-9
 
@@ -884,6 +906,28 @@ def test_analyze_startup_brake_test_brake_start_ignores_high_level_ripple_before
     assert abs(result.brake_start_point[0] - 0.07802360615521856) < 1e-9
 
 
+def test_analyze_startup_brake_test_brake_start_accepts_low_region_with_short_rebound() -> None:
+    waveforms = _build_brake_control_with_short_low_rebound_waveforms()
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="period_ms",
+            speed_target_value=3.0,
+            speed_tolerance_ratio=0.01,
+            speed_consecutive_periods=3,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert result.brake_start_point is not None
+    assert abs(result.brake_start_point[0] - 0.07802) < 1e-6
+
+
 def test_analyze_startup_brake_test_current_zero_mode_accepts_probe_jitter_near_zero() -> None:
     source_path = Path("captures/waveforms/test.csv")
     if not source_path.exists():
@@ -935,6 +979,96 @@ def test_analyze_startup_brake_test_current_zero_mode_accepts_small_zero_bias() 
     assert result.current_zero_window is not None
     assert result.brake_end_point is not None
     assert result.brake_delay_s is not None
+
+
+def test_analyze_startup_brake_test_current_zero_mode_delays_false_zero_segment() -> None:
+    source_path = Path("captures/waveforms/bundle_20260326_172459.csv")
+    if not source_path.exists():
+        pytest.skip("captures/waveforms/bundle_20260326_172459.csv 不存在。")
+    waveforms = WaveformData.load_csv_bundle(source_path)
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="period_ms",
+            speed_target_value=3.0,
+            speed_tolerance_ratio=0.01,
+            speed_consecutive_periods=3,
+            test_scope_mode="full",
+            brake_mode="current_zero",
+        ),
+    )
+
+    assert result.current_zero_window is not None
+    assert abs(result.current_zero_window.start_time_s - (-6.23258006)) < 1e-9
+
+
+def test_analyze_startup_brake_test_current_zero_mode_skips_rebounding_zero_candidate() -> None:
+    control_x = [index * 0.001 for index in range(121)]
+    control_y = [10.0 if time_value < 0.04 else 0.0 for time_value in control_x]
+
+    speed_x = control_x
+    speed_y = [5.0 if time_value < 0.085 else 0.0 for time_value in speed_x]
+
+    current_x = control_x
+    current_y: list[float] = []
+    for time_value in current_x:
+        if time_value < 0.05:
+            current_y.append(4.0)
+        elif time_value < 0.053:
+            current_y.append(0.0)
+        elif time_value < 0.058:
+            current_y.append(2.5)
+        elif time_value < 0.09:
+            current_y.append(0.0)
+        else:
+            current_y.append(0.0)
+
+    waveforms = [
+        WaveformData(
+            channel="CHANnel1",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(control_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=control_x,
+            y_values=control_y,
+        ),
+        WaveformData(
+            channel="CHANnel2",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(speed_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=speed_x,
+            y_values=speed_y,
+        ),
+        WaveformData(
+            channel="CHANnel3",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(current_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=current_x,
+            y_values=current_y,
+        ),
+    ]
+
+    result = analyze_startup_brake_test(
+        waveforms,
+        StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            speed_target_mode="period_ms",
+            speed_target_value=3.0,
+            speed_consecutive_periods=1,
+            test_scope_mode="brake_only",
+            brake_mode="current_zero",
+            zero_current_threshold_a=0.5,
+            zero_current_hold_s=0.002,
+        ),
+    )
+
+    assert result.current_zero_window is not None
+    assert result.current_zero_window.start_time_s >= 0.058
 
 
 def _build_startup_brake_waveforms() -> list[WaveformData]:
@@ -1141,6 +1275,91 @@ def _build_rippled_brake_control_waveforms() -> list[WaveformData]:
                 control_y.append(4.72)
             else:
                 control_y.append(4.94)
+        else:
+            control_y.append(1.9)
+
+    speed_x = [index * 0.001 for index in range(121)]
+    speed_y = []
+    for time_value in speed_x:
+        high = any(
+            start <= time_value < (start + width)
+            for start, width in (
+                (0.02, 0.004),
+                (0.03, 0.004),
+                (0.04, 0.004),
+                (0.05, 0.004),
+                (0.06, 0.004),
+                (0.07, 0.004),
+                (0.08, 0.002),
+                (0.085, 0.002),
+                (0.091, 0.002),
+            )
+        )
+        speed_y.append(5.0 if high else 0.0)
+
+    current_x = [index * 0.001 for index in range(121)]
+    current_y = []
+    for time_value in current_x:
+        if time_value < 0.02:
+            current_y.append(0.0)
+        elif time_value < 0.079:
+            current_y.append(0.8)
+        elif time_value == 0.08:
+            current_y.append(0.3)
+        elif time_value == 0.081:
+            current_y.append(0.2)
+        elif time_value == 0.082:
+            current_y.append(0.12)
+        elif time_value == 0.083:
+            current_y.append(0.07)
+        elif time_value == 0.084:
+            current_y.append(0.06)
+        elif time_value == 0.085:
+            current_y.append(0.051)
+        elif time_value == 0.086:
+            current_y.append(0.03)
+        elif time_value == 0.087:
+            current_y.append(0.01)
+        else:
+            current_y.append(0.0)
+
+    return [
+        WaveformData(
+            channel="CHANnel1",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(control_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=control_x,
+            y_values=control_y,
+        ),
+        WaveformData(
+            channel="CHANnel2",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(speed_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=speed_x,
+            y_values=speed_y,
+        ),
+        WaveformData(
+            channel="CHANnel3",
+            points_mode="NORMal",
+            preamble=WaveformPreamble(0, 0, len(current_x), 1, 0.001, 0.0, 0, 1.0, 0.0, 0),
+            x_values=current_x,
+            y_values=current_y,
+        ),
+    ]
+
+
+def _build_brake_control_with_short_low_rebound_waveforms() -> list[WaveformData]:
+    control_x = [index * 0.001 for index in range(121)]
+    control_y = []
+    for time_value in control_x:
+        if time_value < 0.02:
+            control_y.append(1.9)
+        elif time_value < 0.079:
+            control_y.append(4.94)
+        elif abs(time_value - 0.08) < 1e-12:
+            control_y.append(2.2)
+        elif abs(time_value - 0.081) < 1e-12:
+            control_y.append(2.7)
         else:
             control_y.append(1.9)
 

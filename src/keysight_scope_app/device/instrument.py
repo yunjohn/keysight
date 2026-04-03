@@ -68,6 +68,7 @@ class EdgeTriggerSettings:
 MEASUREMENT_DEFINITIONS: dict[str, MeasurementDefinition] = {
     "频率": MeasurementDefinition("频率", "Hz", lambda channel: f":MEASure:FREQuency? {channel}"),
     "周期": MeasurementDefinition("周期", "s", lambda channel: f":MEASure:PERiod? {channel}"),
+    "脉冲计数": MeasurementDefinition("脉冲计数", "个", stats_getter=lambda stats: float(stats.pulse_count)),
     "峰峰值": MeasurementDefinition("峰峰值", "V", lambda channel: f":MEASure:VPP? {channel}"),
     "均方根": MeasurementDefinition("均方根", "V", lambda channel: f":MEASure:VRMS? DISPlay,DC,{channel}"),
     "最大值": MeasurementDefinition("最大值", "V", lambda channel: f":MEASure:VMAX? {channel}"),
