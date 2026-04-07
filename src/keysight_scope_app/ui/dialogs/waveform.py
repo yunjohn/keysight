@@ -4,7 +4,8 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QPoint, Qt
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -244,6 +245,7 @@ class WaveformDetailDialog(QDialog):
         self.cursor_measurements: dict[str, str] = {}
         self._updating_channel_checks = False
         self._link_scope_channels = False
+        self._measurement_frozen = False
         self._load_measurement_config()
 
         toolbar = QHBoxLayout()
@@ -255,6 +257,11 @@ class WaveformDetailDialog(QDialog):
         self.export_current_view_button.clicked.connect(self._export_current_view_bundle)
         self.export_cursor_ab_button = QPushButton("导出游标A-B")
         self.export_cursor_ab_button.clicked.connect(self._export_cursor_ab_bundle)
+        self.capture_current_view_button = QPushButton("截图当前视图")
+        self.capture_current_view_button.clicked.connect(self._capture_current_view_image)
+        self.freeze_measurements_button = QPushButton("冻结测量")
+        self.freeze_measurements_button.setCheckable(True)
+        self.freeze_measurements_button.toggled.connect(self._toggle_measurement_freeze)
         self.measurement_scope_combo = QComboBox()
         self.measurement_scope_combo.addItem("当前视图", "view")
         self.measurement_scope_combo.addItem("游标 A-B", "cursor")
@@ -266,6 +273,8 @@ class WaveformDetailDialog(QDialog):
         toolbar.addWidget(self.reset_waveform_button)
         toolbar.addWidget(self.export_current_view_button)
         toolbar.addWidget(self.export_cursor_ab_button)
+        toolbar.addWidget(self.capture_current_view_button)
+        toolbar.addWidget(self.freeze_measurements_button)
         toolbar.addWidget(self.measurement_settings_button)
         toolbar.addSpacing(12)
         toolbar.addWidget(QLabel("相位差通道"))
@@ -403,6 +412,11 @@ class WaveformDetailDialog(QDialog):
     def clear(self) -> None:
         self.current_waveforms = []
         self.cursor_measurements = {}
+        self._measurement_frozen = False
+        self.freeze_measurements_button.blockSignals(True)
+        self.freeze_measurements_button.setChecked(False)
+        self.freeze_measurements_button.setText("冻结测量")
+        self.freeze_measurements_button.blockSignals(False)
         self.analysis_panel.clear()
         self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
@@ -631,6 +645,47 @@ class WaveformDetailDialog(QDialog):
                 self._write_marker_sidecar(output_path, point_a, point_b, "Cursor Window")
         self._log_message(f"波形局部已导出: {output_path}")
 
+    def _capture_current_view_image(self) -> None:
+        if not self.current_waveforms:
+            self._log_message("当前没有可截图的波形。")
+            return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_path = WAVEFORM_CONFIG_DIR / f"view_{timestamp}.png"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出当前视图截图",
+            str(default_path),
+            "PNG Files (*.png)",
+        )
+        if not file_path:
+            return
+        output_path = Path(file_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.analysis_panel.chart_view.repaint()
+        self._reposition_measurement_overlay()
+        QApplication.processEvents()
+        QApplication.processEvents()
+        image = self._render_current_view_image(scale=2.0)
+        if image.save(str(output_path), "PNG"):
+            self._log_message(f"当前视图截图已保存: {output_path}")
+        else:
+            self._log_message(f"当前视图截图保存失败: {output_path}")
+
+    def _render_current_view_image(self, *, scale: float = 2.0) -> QPixmap:
+        container = self
+        base_size = container.size()
+        target_width = max(int(base_size.width() * scale), 1)
+        target_height = max(int(base_size.height() * scale), 1)
+        pixmap = QPixmap(target_width, target_height)
+        pixmap.fill(Qt.white)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.scale(scale, scale)
+        container.render(painter, QPoint())
+        painter.end()
+        return pixmap
+
     def _clip_waveform_to_time_range(
         self,
         waveform: WaveformData,
@@ -698,6 +753,13 @@ class WaveformDetailDialog(QDialog):
         self.cursor_measurements = measurements
         self._refresh_measurement_footer()
 
+    def _toggle_measurement_freeze(self, checked: bool) -> None:
+        self._measurement_frozen = checked
+        self.freeze_measurements_button.setText("取消冻结" if checked else "冻结测量")
+        if not checked:
+            self._refresh_measurement_footer()
+            self._refresh_phase_compare_toolbar()
+
     def _ensure_measurement_defaults(self, waveforms: list[WaveformData]) -> None:
         for waveform in waveforms:
             self.measurement_config.setdefault(waveform.channel, set(WAVEFORM_DEFAULT_MEASUREMENTS))
@@ -747,6 +809,9 @@ class WaveformDetailDialog(QDialog):
             self.measurement_overlay.hide()
             self.cursor_text_label.clear()
             self.cursor_overlay.hide()
+            return
+        if self._measurement_frozen:
+            self._reposition_measurement_overlay()
             return
 
         channel_sections: list[str] = []
@@ -802,7 +867,7 @@ class WaveformDetailDialog(QDialog):
 
     def _sync_phase_compare_toolbar_from_panel(self) -> None:
         options = self.analysis_panel.comparison_target_options()
-        target_channel, edge_type, _comparison = self.analysis_panel.channel_comparison_state()
+        target_channel, edge_type, _comparison, _message = self.analysis_panel.channel_comparison_state()
 
         self.phase_channel_combo.blockSignals(True)
         self.phase_channel_combo.clear()
@@ -830,19 +895,27 @@ class WaveformDetailDialog(QDialog):
         self.analysis_panel.set_channel_comparison(str(target_channel) if target_channel else None, edge_type)
 
     def _refresh_phase_compare_toolbar(self) -> None:
-        target_channel, edge_type, comparison = self.analysis_panel.channel_comparison_state()
+        if self._measurement_frozen:
+            return
+        target_channel, edge_type, comparison, message = self.analysis_panel.channel_comparison_state()
+        reference_channel = self.analysis_panel.active_waveform_channel
         if not target_channel:
             self.phase_result_label.setText("相位差: --")
             return
+        relation_text = (
+            f"{display_channel_name(target_channel)} 相对 {display_channel_name(reference_channel)}"
+            if reference_channel
+            else display_channel_name(target_channel)
+        )
         if comparison is None:
             self.phase_result_label.setText(
-                f"{display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'}: 无法估算"
+                f"{relation_text} / {'上升沿' if edge_type == 'rising' else '下降沿'}: {message or '无法估算'}"
             )
             return
         dt_text = format_engineering_value(comparison.delta_t_s, "s")
         phase_text = f"{comparison.phase_deg:.2f}°" if comparison.phase_deg is not None else "--"
         self.phase_result_label.setText(
-            f"{display_channel_name(target_channel)}  Δt {dt_text}  相位差 {phase_text}"
+            f"{relation_text}  Δt {dt_text}  相位差 {phase_text}  {message or ''}".rstrip()
         )
 
     def _measurement_stats_for_channel(self, channel: str, measurement_scope: str) -> WaveformStats | None:
@@ -931,13 +1004,19 @@ class WaveformDetailDialog(QDialog):
             for label, value in self.cursor_measurements.items()
             if value and value != "-"
         ]
-        target_channel, edge_type, comparison = self.analysis_panel.channel_comparison_state()
+        target_channel, edge_type, comparison, message = self.analysis_panel.channel_comparison_state()
+        reference_channel = self.analysis_panel.active_waveform_channel
         if target_channel:
+            relation_label = (
+                f"{display_channel_name(target_channel)} 相对 {display_channel_name(reference_channel)}"
+                if reference_channel
+                else display_channel_name(target_channel)
+            )
             if comparison is None:
                 visible_items.append(
                     (
-                        f"相位差({display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
-                        "无法估算",
+                        f"相位差({relation_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        message or "无法估算",
                     )
                 )
             else:
@@ -945,8 +1024,8 @@ class WaveformDetailDialog(QDialog):
                 dt_text = format_engineering_value(comparison.delta_t_s, "s")
                 visible_items.append(
                     (
-                        f"相位差({display_channel_name(target_channel)} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
-                        f"{phase_text} / Δt {dt_text}",
+                        f"相位差({relation_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        f"{phase_text} / Δt {dt_text}" + (f" / {message}" if message else ""),
                     )
                 )
         if not visible_items:

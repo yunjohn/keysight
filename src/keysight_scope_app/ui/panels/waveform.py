@@ -380,6 +380,7 @@ class WaveformAnalysisPanel(QWidget):
         self.view_window_changed = None
         self.channel_comparison_changed = None
         self.current_edge_comparison: EdgeComparison | None = None
+        self.current_edge_comparison_message: str | None = None
         self._axis_updates_suspended = False
         self._pending_axis_refresh = False
         self._axis_refresh_timer = QTimer(self)
@@ -855,7 +856,13 @@ class WaveformAnalysisPanel(QWidget):
         self._apply_render_quality(waveforms)
         self._axis_updates_suspended = True
         if all_x_values:
-            axis_x.setRange(min(all_x_values), max(all_x_values))
+            x_min = min(all_x_values)
+            x_max = max(all_x_values)
+            if x_min == x_max:
+                x_padding = 0.001 if x_min == 0 else abs(x_min) * 0.05
+            else:
+                x_padding = (x_max - x_min) * 0.05
+            axis_x.setRange(x_min - x_padding, x_max + x_padding)
         if all_y_values:
             y_min = min(all_y_values)
             y_max = max(all_y_values)
@@ -1171,6 +1178,7 @@ class WaveformAnalysisPanel(QWidget):
         active_waveform = self._active_waveform()
         if len(self.current_waveforms) < 2 or active_waveform is None:
             self.current_edge_comparison = None
+            self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
             self._emit_channel_comparison_changed()
@@ -1179,6 +1187,7 @@ class WaveformAnalysisPanel(QWidget):
         secondary_channel = self.compare_channel_combo.currentData()
         if not secondary_channel:
             self.current_edge_comparison = None
+            self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
             self._emit_channel_comparison_changed()
@@ -1187,32 +1196,89 @@ class WaveformAnalysisPanel(QWidget):
         secondary_waveform = next((waveform for waveform in self.current_waveforms if waveform.channel == secondary_channel), None)
         if secondary_waveform is None:
             self.current_edge_comparison = None
+            self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
             self._emit_channel_comparison_changed()
             return
 
         visible_stats = self._primary_visible_stats() or self.current_stats
-        frequency_hz = visible_stats.estimated_frequency_hz if visible_stats is not None else None
+        secondary_stats = self.visible_stats_for_channel(secondary_waveform.channel)
         edge_type = str(self.compare_edge_combo.currentData())
-        comparison = compare_waveform_edges(
-            active_waveform,
-            secondary_waveform,
-            self._current_x_focus(),
-            edge_type,
-            frequency_hz=frequency_hz,
-        )
-        if comparison is None:
+        if visible_stats is None or secondary_stats is None:
             self.current_edge_comparison = None
+            self.current_edge_comparison_message = "当前视图数据不足"
             for label in self.compare_labels.values():
                 label.setText("无法估算")
             self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
             self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
             self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
+            self.compare_labels["frequency"].setText("视图不足")
+            self._emit_channel_comparison_changed()
+            return
+
+        primary_frequency_hz = visible_stats.estimated_frequency_hz
+        secondary_frequency_hz = secondary_stats.estimated_frequency_hz
+        if (
+            primary_frequency_hz is None
+            or secondary_frequency_hz is None
+            or primary_frequency_hz <= 0
+            or secondary_frequency_hz <= 0
+            or visible_stats.pulse_count < 2
+            or secondary_stats.pulse_count < 2
+        ):
+            self.current_edge_comparison = None
+            self.current_edge_comparison_message = "当前视图内有效周期不足"
+            for label in self.compare_labels.values():
+                label.setText("无法估算")
+            self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
+            self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
+            self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
+            self.compare_labels["frequency"].setText("周期不足")
+            self._emit_channel_comparison_changed()
+            return
+
+        average_frequency_hz = (primary_frequency_hz + secondary_frequency_hz) / 2.0
+        frequency_mismatch_ratio = abs(primary_frequency_hz - secondary_frequency_hz) / max(average_frequency_hz, 1e-12)
+        if frequency_mismatch_ratio > 0.10:
+            self.current_edge_comparison = None
+            self.current_edge_comparison_message = (
+                f"两通道局部频率不一致 ({primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz)"
+            )
+            for label in self.compare_labels.values():
+                label.setText("无法估算")
+            self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
+            self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
+            self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
+            self.compare_labels["frequency"].setText(
+                f"{primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz"
+            )
+            self._emit_channel_comparison_changed()
+            return
+
+        comparison = compare_waveform_edges(
+            active_waveform,
+            secondary_waveform,
+            self._current_x_focus(),
+            edge_type,
+            frequency_hz=average_frequency_hz,
+        )
+        if comparison is None:
+            self.current_edge_comparison = None
+            self.current_edge_comparison_message = "当前视图内未找到可对应的边沿"
+            for label in self.compare_labels.values():
+                label.setText("无法估算")
+            self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
+            self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
+            self.compare_labels["edge_type"].setText("上升沿" if edge_type == "rising" else "下降沿")
+            self.compare_labels["frequency"].setText(f"{average_frequency_hz:.3f} Hz")
             self._emit_channel_comparison_changed()
             return
 
         self.current_edge_comparison = comparison
+        self.current_edge_comparison_message = (
+            f"局部频率 {primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz"
+        )
         self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
         self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
@@ -1235,10 +1301,10 @@ class WaveformAnalysisPanel(QWidget):
             if waveform.channel in self.visible_channels and waveform.channel != self.active_waveform_channel
         ]
 
-    def channel_comparison_state(self) -> tuple[str | None, str, EdgeComparison | None]:
+    def channel_comparison_state(self) -> tuple[str | None, str, EdgeComparison | None, str | None]:
         target_channel = self.compare_channel_combo.currentData()
         edge_type = str(self.compare_edge_combo.currentData() or "rising")
-        return (str(target_channel) if target_channel else None, edge_type, self.current_edge_comparison)
+        return (str(target_channel) if target_channel else None, edge_type, self.current_edge_comparison, self.current_edge_comparison_message)
 
     def set_channel_comparison(self, target_channel: str | None, edge_type: str = "rising") -> None:
         edge_index = self.compare_edge_combo.findData(edge_type)

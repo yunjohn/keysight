@@ -51,6 +51,7 @@ from keysight_scope_app.device.instrument import (
 )
 from keysight_scope_app.infra.task_runner import BackgroundTaskRunner, RepeatingTaskHandle
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
+from keysight_scope_app import __version__
 from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
 from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
 from keysight_scope_app.ui.helpers import display_channel_name, normalize_channel_name
@@ -85,7 +86,7 @@ ACQUIRE_TYPE_LABELS = {
     "PEAK": "峰值检测",
 }
 AUTHOR_NAME = "徐"
-APP_TITLE = f"Keysight 示波器助手 | 作者：{AUTHOR_NAME}"
+APP_TITLE = f"Keysight 示波器助手 v{__version__} | 作者：{AUTHOR_NAME}"
 
 
 def build_app_icon() -> QIcon:
@@ -163,6 +164,7 @@ class ScopeMainWindow(QMainWindow):
         self._build_timer()
         self._apply_initial_window_geometry()
         self.log("界面已启动。请先点击“刷新资源”，确认示波器地址后再连接。")
+        self.log(f"当前程序版本: v{__version__}")
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -194,9 +196,11 @@ class ScopeMainWindow(QMainWindow):
         self.idn_value.setWordWrap(False)
         self.idn_value.setToolTip("-")
         self.capture_value = QLabel("-")
+        self.version_value = QLabel(f"v{__version__}")
         top_status.addWidget(self._build_status_card("连接状态", self.status_value), 0, 0)
         top_status.addWidget(self._build_status_card("设备标识", self.idn_value), 0, 1)
         top_status.addWidget(self._build_status_card("最近截图", self.capture_value), 0, 2)
+        top_status.addWidget(self._build_status_card("程序版本", self.version_value), 0, 3)
 
         connection_box = self._group_box("设备连接")
         connection_layout = QGridLayout(connection_box)
@@ -413,6 +417,9 @@ class ScopeMainWindow(QMainWindow):
         self.waveform_points_status_label = QLabel("波形数据完整性：未抓取")
         self.waveform_points_status_label.setWordWrap(True)
         measure_layout.addWidget(self.waveform_points_status_label)
+        self.waveform_fetch_status_label = QLabel("抓波状态：未抓取")
+        self.waveform_fetch_status_label.setWordWrap(True)
+        measure_layout.addWidget(self.waveform_fetch_status_label)
 
         scope_display_row = QHBoxLayout()
         scope_display_row.addWidget(QLabel("示波器通道"))
@@ -1104,10 +1111,28 @@ class ScopeMainWindow(QMainWindow):
         channels, channel_units, channel_vertical_layouts = self._get_scope_display_context(scope)
         if not channels:
             raise RuntimeError("示波器当前没有打开的通道，无法抓取波形。")
+        ready_channels, unavailable_channels = self._probe_scope_waveform_channels(scope, channels, points_mode)
+        self._set_waveform_fetch_status(
+            acquire_type=acquire_type,
+            timebase_mode=timebase_mode,
+            opened_channels=channels,
+            ready_channels=ready_channels,
+            points_mode=points_mode,
+            points=points,
+        )
+        if unavailable_channels:
+            self.log("抓波前预检查：以下通道当前无有效波形，已跳过: " + ",".join(unavailable_channels))
+        if not ready_channels:
+            raise RuntimeError(
+                "抓取波形失败: "
+                f"acquire_type={acquire_type}, timebase_mode={timebase_mode}, "
+                f"channels={','.join(channels)}, points_mode={points_mode}, points={points}; "
+                "预检查发现所有已打开通道当前都没有有效波形。"
+            )
         waveforms: list[WaveformData] = []
-        skipped_channels: list[str] = []
+        skipped_channels: list[str] = list(unavailable_channels)
         try:
-            for channel in channels:
+            for channel in ready_channels:
                 try:
                     waveform = scope.fetch_waveform(channel, points_mode=points_mode, points=points)
                 except VisaIOError as exc:
@@ -1145,6 +1170,21 @@ class ScopeMainWindow(QMainWindow):
                 f"所有通道均无有效波形或读取超时: {skipped_text}"
             )
         return channels, channel_units, channel_vertical_layouts, waveforms, skipped_channels
+
+    def _probe_scope_waveform_channels(
+        self,
+        scope: KeysightOscilloscope,
+        channels: list[str],
+        points_mode: str,
+    ) -> tuple[list[str], list[str]]:
+        ready_channels: list[str] = []
+        unavailable_channels: list[str] = []
+        for channel in channels:
+            if scope.probe_waveform_available(channel, points_mode=points_mode):
+                ready_channels.append(channel)
+            else:
+                unavailable_channels.append(channel)
+        return ready_channels, unavailable_channels
 
     def _on_scope_waveforms_fetched(self, result: tuple[list[str], dict[str, str], dict[str, ChannelVerticalLayout], list[WaveformData], list[str]]) -> None:
         self._single_trigger_waiting = False
@@ -1425,6 +1465,7 @@ class ScopeMainWindow(QMainWindow):
     def _reset_waveform_visuals(self) -> None:
         self.waveform_detail_dialog.clear()
         self.waveform_points_status_label.setText("波形数据完整性：未抓取")
+        self.waveform_fetch_status_label.setText("抓波状态：未抓取")
 
     def show_startup_brake_dialog(self) -> None:
         self.startup_brake_dialog.show_dialog()
@@ -1511,6 +1552,26 @@ class ScopeMainWindow(QMainWindow):
         ratio = (primary_points / requested_points) if requested_points > 0 else 0.0
         self.waveform_points_status_label.setText(
             f"波形数据完整性：请求 {requested_points} 点；返回 {returned_points}；主通道完成度 {ratio * 100.0:.1f}%"
+        )
+
+    def _set_waveform_fetch_status(
+        self,
+        *,
+        acquire_type: str,
+        timebase_mode: str,
+        opened_channels: list[str],
+        ready_channels: list[str],
+        points_mode: str,
+        points: int,
+    ) -> None:
+        opened_text = ",".join(display_channel_name(channel) for channel in opened_channels) if opened_channels else "-"
+        ready_text = ",".join(display_channel_name(channel) for channel in ready_channels) if ready_channels else "无"
+        acquire_label = ACQUIRE_TYPE_LABELS.get(acquire_type, acquire_type)
+        self.waveform_fetch_status_label.setText(
+            "抓波状态："
+            f"采集类型 {acquire_label}；时基模式 {timebase_mode}；"
+            f"已打开通道 {opened_text}；有效波形通道 {ready_text}；"
+            f"波形模式 {points_mode}；点数 {points}"
         )
 
     def _on_waveform_mode_changed(self, mode: str) -> None:

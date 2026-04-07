@@ -425,6 +425,38 @@ class KeysightOscilloscope:
             y_values=y_values,
         )
 
+    def probe_waveform_available(
+        self,
+        channel: str,
+        *,
+        points_mode: str = "NORMal",
+        timeout_ms: int = 1200,
+    ) -> bool:
+        if channel not in SUPPORTED_CHANNELS:
+            raise ValueError(f"不支持的通道: {channel}")
+        if points_mode not in SUPPORTED_WAVEFORM_POINTS_MODES:
+            raise ValueError(f"不支持的波形点模式: {points_mode}")
+
+        with self._lock:
+            self._ensure_connected()
+            previous_timeout = self._instrument.timeout
+            try:
+                self._instrument.timeout = timeout_ms
+                self._instrument.write(f":WAVeform:SOURce {channel}")
+                self._instrument.write(":WAVeform:FORMat BYTE")
+                self._instrument.write(":WAVeform:UNSigned ON")
+                self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
+                self._instrument.query_ascii_values(":WAVeform:PREamble?")
+                return True
+            except InvalidSession:
+                raise
+            except VisaIOError as exc:
+                if getattr(exc, "error_code", None) == -1073807346:
+                    raise
+                return False
+            finally:
+                self._instrument.timeout = previous_timeout
+
     def assert_keysight_vendor(self) -> str:
         idn = self.query("*IDN?")
         if not any(vendor in idn.upper() for vendor in KNOWN_KEYSIGHT_VENDORS):
