@@ -169,12 +169,14 @@ class WaveformMeasurementSettingsDialog(QDialog):
             tab_layout.setContentsMargins(8, 8, 8, 8)
             tab_layout.setSpacing(8)
 
-            top_row = QHBoxLayout()
-            top_row.addWidget(QLabel(f"{display_channel_name(channel)} 测量项"))
+            top_row = QGridLayout()
+            top_row.setHorizontalSpacing(8)
+            top_row.setVerticalSpacing(6)
+            top_row.addWidget(QLabel(f"{display_channel_name(channel)} 测量项"), 0, 0)
             sync_button = QPushButton("同步到其它通道")
             sync_button.clicked.connect(lambda checked=False, source=channel: self._sync_to_other_channels(source))
-            top_row.addStretch(1)
-            top_row.addWidget(sync_button)
+            top_row.addWidget(sync_button, 0, 1)
+            top_row.setColumnStretch(2, 1)
             tab_layout.addLayout(top_row)
 
             checks_layout = QGridLayout()
@@ -193,17 +195,19 @@ class WaveformMeasurementSettingsDialog(QDialog):
             self.tabs.addTab(tab, display_channel_name(channel))
         layout.addWidget(self.tabs, 1)
 
-        button_row = QHBoxLayout()
+        button_row = QGridLayout()
+        button_row.setHorizontalSpacing(8)
+        button_row.setVerticalSpacing(6)
         self.reset_button = QPushButton("恢复默认")
         self.cancel_button = QPushButton("取消")
         self.ok_button = QPushButton("确定")
         self.reset_button.clicked.connect(self._reset_current_channel)
         self.cancel_button.clicked.connect(self.reject)
         self.ok_button.clicked.connect(self.accept)
-        button_row.addWidget(self.reset_button)
-        button_row.addStretch(1)
-        button_row.addWidget(self.cancel_button)
-        button_row.addWidget(self.ok_button)
+        button_row.addWidget(self.reset_button, 0, 0)
+        button_row.addWidget(self.cancel_button, 0, 1)
+        button_row.addWidget(self.ok_button, 0, 2)
+        button_row.setColumnStretch(3, 1)
         layout.addLayout(button_row)
 
     def selected_measurements(self) -> dict[str, set[str]]:
@@ -349,9 +353,10 @@ class WaveformDetailDialog(QDialog):
         layout.addWidget(self.analysis_panel)
 
         self.channel_toggle_container = QWidget(self.analysis_panel)
-        self.channel_toggle_layout = QHBoxLayout(self.channel_toggle_container)
+        self.channel_toggle_layout = QGridLayout(self.channel_toggle_container)
         self.channel_toggle_layout.setContentsMargins(0, 0, 0, 0)
-        self.channel_toggle_layout.setSpacing(8)
+        self.channel_toggle_layout.setHorizontalSpacing(8)
+        self.channel_toggle_layout.setVerticalSpacing(6)
         self.analysis_panel.layout().insertWidget(2, self.channel_toggle_container)
 
         self.measurement_overlay = QFrame(self.analysis_panel.chart_view)
@@ -536,13 +541,15 @@ class WaveformDetailDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-        self.channel_toggle_layout.addStretch(1)
-        self.channel_toggle_layout.addWidget(QLabel("显示通道"))
+        column = 0
+        self.channel_toggle_layout.addWidget(QLabel("显示通道"), 0, column)
+        column += 1
         self.link_scope_channels_check = QCheckBox("联动示波器通道")
         self.link_scope_channels_check.setChecked(self._link_scope_channels)
         self.link_scope_channels_check.setToolTip("勾选后，这里的通道开关会同时控制示波器通道显示；不勾选时只影响当前独立波形窗口。")
         self.link_scope_channels_check.toggled.connect(self._set_link_scope_channels_enabled)
-        self.channel_toggle_layout.addWidget(self.link_scope_channels_check)
+        self.channel_toggle_layout.addWidget(self.link_scope_channels_check, 0, column)
+        column += 1
         self.channel_visibility_checks = {}
         active_waveform_channels = {waveform.channel for waveform in waveforms}
         for channel in SUPPORTED_CHANNELS:
@@ -553,8 +560,9 @@ class WaveformDetailDialog(QDialog):
                 lambda checked=False, target_channel=channel: self._handle_channel_checkbox_toggled(target_channel, checked)
             )
             self.channel_visibility_checks[channel] = checkbox
-            self.channel_toggle_layout.addWidget(checkbox)
-        self.channel_toggle_layout.addStretch(1)
+            self.channel_toggle_layout.addWidget(checkbox, 0, column)
+            column += 1
+        self.channel_toggle_layout.setColumnStretch(column, 1)
         self._apply_channel_visibility()
 
     def _apply_channel_visibility(self) -> None:
@@ -1379,11 +1387,13 @@ class WaveformOnlyDialog(QDialog):
         outer_layout.addWidget(create_scroll_area(self, content, minimum_px=960, minimum_chars=112))
         self.channel_visibility_checks: dict[str, QCheckBox] = {}
 
-        toolbar = QHBoxLayout()
+        toolbar = QGridLayout()
+        toolbar.setHorizontalSpacing(8)
+        toolbar.setVerticalSpacing(6)
         self.refresh_waveform_button = QPushButton("抓取波形")
         self.refresh_waveform_button.clicked.connect(self._request_waveform_refresh)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.refresh_waveform_button)
+        toolbar.addWidget(self.refresh_waveform_button, 0, 0)
+        toolbar.setColumnStretch(1, 1)
         layout.addLayout(toolbar)
 
         self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
@@ -1392,9 +1402,10 @@ class WaveformOnlyDialog(QDialog):
         layout.addWidget(self.analysis_panel)
 
         channel_bar = QWidget(self)
-        self.channel_toggle_layout = QHBoxLayout(channel_bar)
+        self.channel_toggle_layout = QGridLayout(channel_bar)
         self.channel_toggle_layout.setContentsMargins(0, 0, 0, 0)
-        self.channel_toggle_layout.setSpacing(8)
+        self.channel_toggle_layout.setHorizontalSpacing(8)
+        self.channel_toggle_layout.setVerticalSpacing(6)
         layout.addWidget(channel_bar)
 
     def set_waveforms(self, waveforms: list[WaveformData], primary_stats: WaveformStats | None = None) -> None:
@@ -1419,8 +1430,9 @@ class WaveformOnlyDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-        self.channel_toggle_layout.addStretch(1)
-        self.channel_toggle_layout.addWidget(QLabel("显示通道"))
+        column = 0
+        self.channel_toggle_layout.addWidget(QLabel("显示通道"), 0, column)
+        column += 1
         self.channel_visibility_checks = {}
         for waveform in waveforms:
             channel = waveform.channel
@@ -1428,8 +1440,9 @@ class WaveformOnlyDialog(QDialog):
             checkbox.setChecked(previous_states.get(channel, True))
             checkbox.toggled.connect(lambda checked=False: self._apply_channel_visibility())
             self.channel_visibility_checks[channel] = checkbox
-            self.channel_toggle_layout.addWidget(checkbox)
-        self.channel_toggle_layout.addStretch(1)
+            self.channel_toggle_layout.addWidget(checkbox, 0, column)
+            column += 1
+        self.channel_toggle_layout.setColumnStretch(column, 1)
         self._apply_channel_visibility()
 
     def _apply_channel_visibility(self) -> None:

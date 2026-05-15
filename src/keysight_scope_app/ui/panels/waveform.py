@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -626,18 +626,19 @@ class WaveformAnalysisPanel(QWidget):
         compare_layout = QVBoxLayout(compare_tab)
         compare_layout.setContentsMargins(8, 8, 8, 8)
         compare_layout.setSpacing(8)
-        compare_controls = QHBoxLayout()
-        compare_controls.addWidget(QLabel("对比通道"))
+        compare_controls = QGridLayout()
+        compare_controls.setHorizontalSpacing(8)
+        compare_controls.setVerticalSpacing(6)
+        compare_controls.addWidget(QLabel("对比通道"), 0, 0)
         self.compare_channel_combo = QComboBox()
         self.compare_channel_combo.setEnabled(False)
-        compare_controls.addWidget(self.compare_channel_combo)
-        compare_controls.addSpacing(12)
-        compare_controls.addWidget(QLabel("边沿类型"))
+        compare_controls.addWidget(self.compare_channel_combo, 0, 1)
+        compare_controls.addWidget(QLabel("边沿类型"), 0, 2)
         self.compare_edge_combo = QComboBox()
         self.compare_edge_combo.addItem("上升沿", "rising")
         self.compare_edge_combo.addItem("下降沿", "falling")
-        compare_controls.addWidget(self.compare_edge_combo)
-        compare_controls.addStretch(1)
+        compare_controls.addWidget(self.compare_edge_combo, 0, 3)
+        compare_controls.setColumnStretch(4, 1)
         compare_layout.addLayout(compare_controls)
         self.compare_labels = {
             "primary_channel": QLabel("-"),
@@ -772,7 +773,7 @@ class WaveformAnalysisPanel(QWidget):
         grid.setVerticalSpacing(6)
         for index, widget in enumerate(widgets):
             if isinstance(widget, QPushButton):
-                widget.setMinimumWidth(108)
+                widget.setMinimumWidth(max(QFontMetrics(widget.font()).horizontalAdvance(widget.text()) + 28, 108))
             grid.addWidget(widget, index // columns, index % columns)
         outer.addLayout(grid)
         return group

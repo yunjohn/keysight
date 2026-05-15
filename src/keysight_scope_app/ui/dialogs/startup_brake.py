@@ -475,12 +475,10 @@ class StartupBrakeTestDialog(QDialog):
         self.marker_table.setHorizontalHeaderLabels(
             ["标记点", "时间", "定位", "标记点", "时间", "定位", "标记点", "时间", "定位"]
         )
-        self.marker_table.setMinimumHeight(108)
-        self.marker_table.setMaximumHeight(132)
         self.marker_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.marker_table.setSelectionMode(QTableWidget.NoSelection)
         self.marker_table.verticalHeader().setVisible(False)
-        self.marker_table.verticalHeader().setDefaultSectionSize(24)
+        self.marker_table.verticalHeader().setDefaultSectionSize(self._table_row_height(self.marker_table))
         self.marker_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.marker_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.marker_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -490,6 +488,9 @@ class StartupBrakeTestDialog(QDialog):
         self.marker_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.marker_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self.marker_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        marker_table_height = self._table_height_for_rows(self.marker_table, rows=4)
+        self.marker_table.setMinimumHeight(marker_table_height)
+        self.marker_table.setMaximumHeight(marker_table_height)
         layout.addWidget(self.marker_table)
 
         history_title = QLabel("测试记录")
@@ -500,7 +501,7 @@ class StartupBrakeTestDialog(QDialog):
         self.history_table.setHorizontalHeaderLabels(
             ["#", "时间", "启动(ms)", "刹车(ms)", "启动峰值(A)", "刹车峰值(A)", "命中频率(Hz)", "命中周期(ms)"]
         )
-        self.history_table.setMinimumHeight(192)
+        self.history_table.setMinimumHeight(self._table_height_for_rows(self.history_table, rows=5))
         self.history_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.history_table.setSelectionMode(QTableWidget.NoSelection)
         self.history_table.verticalHeader().setVisible(False)
@@ -516,7 +517,7 @@ class StartupBrakeTestDialog(QDialog):
         self.history_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.history_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
         self.history_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
-        self.history_table.verticalHeader().setDefaultSectionSize(28)
+        self.history_table.verticalHeader().setDefaultSectionSize(self._table_row_height(self.history_table))
         self.history_table.customContextMenuRequested.connect(self._show_history_context_menu)
         layout.addWidget(self.history_table, 1)
 
@@ -575,13 +576,14 @@ class StartupBrakeTestDialog(QDialog):
     def _form_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        label.setMinimumWidth(84)
+        label.setMinimumWidth(max(QFontMetrics(label.font()).horizontalAdvance(text) + 12, 84))
         return label
 
     def _set_compact_field_width(self, *widgets: QWidget) -> None:
         for widget in widgets:
-            widget.setMinimumWidth(128)
-            widget.setMaximumWidth(156)
+            field_width = max(QFontMetrics(widget.font()).horizontalAdvance("000000.000") + 34, 128)
+            widget.setMinimumWidth(field_width)
+            widget.setMaximumWidth(max(field_width + 48, 180))
 
     def _create_channel_combo(self, default_channel: str) -> QComboBox:
         combo = QComboBox()
@@ -685,8 +687,16 @@ class StartupBrakeTestDialog(QDialog):
 
     def _centered_table_item(self, text: str) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
-        item.setTextAlignment(int(Qt.AlignCenter))
+        item.setTextAlignment(Qt.AlignCenter)
         return item
+
+    def _table_row_height(self, table: QTableWidget) -> int:
+        return max(QFontMetrics(table.font()).height() + 10, 24)
+
+    def _table_height_for_rows(self, table: QTableWidget, *, rows: int) -> int:
+        header_height = max(table.horizontalHeader().sizeHint().height(), self._table_row_height(table))
+        frame_width = table.frameWidth() * 2
+        return header_height + (self._table_row_height(table) * rows) + frame_width + 8
 
     def _set_single_line_text(self, label: QLabel, text: str) -> None:
         metrics = QFontMetrics(label.font())
