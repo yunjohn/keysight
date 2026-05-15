@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
+from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
@@ -26,7 +26,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.analysis.waveform import EdgeComparison, WaveformData, WaveformStats, compare_waveform_edges
+from keysight_scope_app.analysis.waveform import (
+    EdgeComparison,
+    WaveformData,
+    WaveformStats,
+    compare_encoder_ab_edges,
+    compare_waveform_edges,
+)
 from keysight_scope_app.ui.helpers import display_channel_name
 from keysight_scope_app.utils import format_engineering_value
 
@@ -39,6 +45,8 @@ CROSSHAIR_COLOR = "#455a64"
 CROSSHAIR_LABEL_COLOR = "#1f2933"
 LOCK_ANNOTATION_COLOR = "#264653"
 SMART_PREVIEW_COLOR = "#d4a017"
+ENCODER_PHASE_VALID_COLOR = "#2e7d32"
+ENCODER_PHASE_INVALID_COLOR = "#c62828"
 RAW_RENDER_POINT_THRESHOLD = 10000
 WAVEFORM_REDRAW_DEBOUNCE_MS = 40
 
@@ -361,6 +369,8 @@ class WaveformAnalysisPanel(QWidget):
         self.waveform_series_map: dict[str, QLineSeries] = {}
         self.waveform_source_map: dict[str, tuple[list[float], list[float]]] = {}
         self.waveform_decimated_map: dict[str, tuple[list[float], list[float]]] = {}
+        self.encoder_phase_valid_series: QScatterSeries | None = None
+        self.encoder_phase_invalid_series: QScatterSeries | None = None
         self.visible_channels: set[str] = set()
         self.waveform_offsets: dict[str, float] = {}
         self.pending_cursor_target: str | None = None
@@ -381,6 +391,8 @@ class WaveformAnalysisPanel(QWidget):
         self.channel_comparison_changed = None
         self.current_edge_comparison: EdgeComparison | None = None
         self.current_edge_comparison_message: str | None = None
+        self.current_edge_comparison_mode = "general"
+        self.current_encoder_min_edge_interval_s: float | None = None
         self._axis_updates_suspended = False
         self._pending_axis_refresh = False
         self._axis_refresh_timer = QTimer(self)
@@ -853,6 +865,8 @@ class WaveformAnalysisPanel(QWidget):
             if index == 0:
                 self.waveform_series = series
 
+        self._create_encoder_phase_diagnostic_series(axis_x, axis_y)
+
         self._apply_render_quality(waveforms)
         self._axis_updates_suspended = True
         if all_x_values:
@@ -934,6 +948,8 @@ class WaveformAnalysisPanel(QWidget):
         self.waveform_series_map = {}
         self.waveform_source_map = {}
         self.waveform_decimated_map = {}
+        self.encoder_phase_valid_series = None
+        self.encoder_phase_invalid_series = None
         self.visible_channels = set()
         self.active_waveform_channel = None
         self.waveform_offsets = {}
@@ -1176,11 +1192,13 @@ class WaveformAnalysisPanel(QWidget):
 
     def _update_channel_comparison(self) -> None:
         active_waveform = self._active_waveform()
+        self._clear_encoder_phase_diagnostic_markers()
         if len(self.current_waveforms) < 2 or active_waveform is None:
             self.current_edge_comparison = None
             self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._refresh_encoder_phase_diagnostic_markers()
             self._emit_channel_comparison_changed()
             return
 
@@ -1190,6 +1208,7 @@ class WaveformAnalysisPanel(QWidget):
             self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._refresh_encoder_phase_diagnostic_markers()
             self._emit_channel_comparison_changed()
             return
 
@@ -1199,6 +1218,7 @@ class WaveformAnalysisPanel(QWidget):
             self.current_edge_comparison_message = None
             for label in self.compare_labels.values():
                 label.setText("-")
+            self._refresh_encoder_phase_diagnostic_markers()
             self._emit_channel_comparison_changed()
             return
 
@@ -1256,16 +1276,29 @@ class WaveformAnalysisPanel(QWidget):
             self._emit_channel_comparison_changed()
             return
 
-        comparison = compare_waveform_edges(
-            active_waveform,
-            secondary_waveform,
-            self._current_x_focus(),
-            edge_type,
-            frequency_hz=average_frequency_hz,
-        )
+        if self.current_edge_comparison_mode == "encoder_ab":
+            comparison = compare_encoder_ab_edges(
+                active_waveform,
+                secondary_waveform,
+                self._current_x_focus(),
+                edge_type,
+                frequency_hz=average_frequency_hz,
+                minimum_edge_interval_s=self.current_encoder_min_edge_interval_s,
+            )
+        else:
+            comparison = compare_waveform_edges(
+                active_waveform,
+                secondary_waveform,
+                self._current_x_focus(),
+                edge_type,
+                frequency_hz=average_frequency_hz,
+            )
         if comparison is None:
             self.current_edge_comparison = None
-            self.current_edge_comparison_message = "当前视图内未找到可对应的边沿"
+            if self.current_edge_comparison_mode == "encoder_ab":
+                self.current_edge_comparison_message = "当前视图内编码器AB有效边沿不足或正交序列不合法"
+            else:
+                self.current_edge_comparison_message = "当前视图内未找到可对应的边沿"
             for label in self.compare_labels.values():
                 label.setText("无法估算")
             self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
@@ -1276,9 +1309,14 @@ class WaveformAnalysisPanel(QWidget):
             return
 
         self.current_edge_comparison = comparison
-        self.current_edge_comparison_message = (
-            f"局部频率 {primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz"
-        )
+        if self.current_edge_comparison_mode == "encoder_ab":
+            self.current_edge_comparison_message = (
+                f"局部频率 {primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz，编码器AB，上下沿综合，已去抖并通过序列校验；可信度 {comparison.confidence or '未知'}；总跳变 {comparison.raw_transition_count}；去抖过滤 {comparison.debounce_filtered_count}；序列丢弃 {comparison.sequence_discarded_count}"
+            )
+        else:
+            self.current_edge_comparison_message = (
+                f"局部频率 {primary_frequency_hz:.3f} / {secondary_frequency_hz:.3f} Hz，多周期平均"
+            )
         self.compare_labels["primary_channel"].setText(display_channel_name(active_waveform.channel))
         self.compare_labels["secondary_channel"].setText(display_channel_name(secondary_waveform.channel))
         self.compare_labels["primary_edge"].setText(f"{comparison.primary_time_s:.6e} s")
@@ -1286,6 +1324,7 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_labels["delta_t"].setText(f"{comparison.delta_t_s:.6e} s")
         self.compare_labels["phase"].setText(_format_optional_phase(comparison.phase_deg))
         self.compare_labels["frequency"].setText(_format_optional_hz(comparison.frequency_hz))
+        self._refresh_encoder_phase_diagnostic_markers()
         self.compare_labels["edge_type"].setText("上升沿" if comparison.edge_type == "rising" else "下降沿")
         self._emit_channel_comparison_changed()
         return
@@ -1301,12 +1340,25 @@ class WaveformAnalysisPanel(QWidget):
             if waveform.channel in self.visible_channels and waveform.channel != self.active_waveform_channel
         ]
 
-    def channel_comparison_state(self) -> tuple[str | None, str, EdgeComparison | None, str | None]:
+    def channel_comparison_state(self) -> tuple[str | None, str, str, float | None, EdgeComparison | None, str | None]:
         target_channel = self.compare_channel_combo.currentData()
         edge_type = str(self.compare_edge_combo.currentData() or "rising")
-        return (str(target_channel) if target_channel else None, edge_type, self.current_edge_comparison, self.current_edge_comparison_message)
+        return (
+            str(target_channel) if target_channel else None,
+            edge_type,
+            self.current_edge_comparison_mode,
+            self.current_encoder_min_edge_interval_s,
+            self.current_edge_comparison,
+            self.current_edge_comparison_message,
+        )
 
-    def set_channel_comparison(self, target_channel: str | None, edge_type: str = "rising") -> None:
+    def set_channel_comparison(
+        self,
+        target_channel: str | None,
+        edge_type: str = "rising",
+        comparison_mode: str = "general",
+        minimum_edge_interval_s: float | None = None,
+    ) -> None:
         edge_index = self.compare_edge_combo.findData(edge_type)
         if edge_index >= 0:
             self.compare_edge_combo.blockSignals(True)
@@ -1321,6 +1373,8 @@ class WaveformAnalysisPanel(QWidget):
         else:
             self.compare_channel_combo.setCurrentIndex(-1)
         self.compare_channel_combo.blockSignals(False)
+        self.current_edge_comparison_mode = comparison_mode if comparison_mode in {"general", "encoder_ab"} else "general"
+        self.current_encoder_min_edge_interval_s = minimum_edge_interval_s
         self._update_channel_comparison()
 
     def _primary_visible_stats(self) -> WaveformStats | None:
@@ -1376,6 +1430,7 @@ class WaveformAnalysisPanel(QWidget):
             self._render_waveform_series(channel)
         self.chart.legend().setVisible(len(self.visible_channels) > 1)
         self._refresh_chart_title()
+        self._refresh_encoder_phase_diagnostic_markers()
 
     def _refresh_waveform_series_styles(self) -> None:
         for channel, series in self.waveform_series_map.items():
@@ -1422,6 +1477,90 @@ class WaveformAnalysisPanel(QWidget):
         else:
             self._render_all_waveform_series()
         self._refresh_cursor_graphics()
+
+    def _create_encoder_phase_diagnostic_series(self, axis_x: QValueAxis, axis_y: QValueAxis) -> None:
+        self.encoder_phase_valid_series = QScatterSeries()
+        self.encoder_phase_valid_series.setName("")
+        self.encoder_phase_valid_series.setColor(QColor(ENCODER_PHASE_VALID_COLOR))
+        self.encoder_phase_valid_series.setBorderColor(QColor(ENCODER_PHASE_VALID_COLOR))
+        self.encoder_phase_valid_series.setMarkerSize(8.0)
+        self.chart.addSeries(self.encoder_phase_valid_series)
+        self.encoder_phase_valid_series.attachAxis(axis_x)
+        self.encoder_phase_valid_series.attachAxis(axis_y)
+
+        self.encoder_phase_invalid_series = QScatterSeries()
+        self.encoder_phase_invalid_series.setName("")
+        self.encoder_phase_invalid_series.setColor(QColor(ENCODER_PHASE_INVALID_COLOR))
+        self.encoder_phase_invalid_series.setBorderColor(QColor(ENCODER_PHASE_INVALID_COLOR))
+        self.encoder_phase_invalid_series.setMarkerSize(7.0)
+        self.chart.addSeries(self.encoder_phase_invalid_series)
+        self.encoder_phase_invalid_series.attachAxis(axis_x)
+        self.encoder_phase_invalid_series.attachAxis(axis_y)
+
+        for series in (self.encoder_phase_valid_series, self.encoder_phase_invalid_series):
+            for marker in self.chart.legend().markers(series):
+                marker.setVisible(False)
+        self._clear_encoder_phase_diagnostic_markers()
+
+    def _clear_encoder_phase_diagnostic_markers(self) -> None:
+        if self.encoder_phase_valid_series is not None:
+            self.encoder_phase_valid_series.clear()
+            self.encoder_phase_valid_series.setVisible(False)
+        if self.encoder_phase_invalid_series is not None:
+            self.encoder_phase_invalid_series.clear()
+            self.encoder_phase_invalid_series.setVisible(False)
+
+    def _refresh_encoder_phase_diagnostic_markers(self) -> None:
+        if self.encoder_phase_valid_series is None or self.encoder_phase_invalid_series is None:
+            return
+        if self.current_edge_comparison_mode != "encoder_ab" or self.current_edge_comparison is None:
+            self._clear_encoder_phase_diagnostic_markers()
+            return
+        active_waveform = self._active_waveform()
+        secondary_channel = self.compare_channel_combo.currentData()
+        if active_waveform is None or not secondary_channel:
+            self._clear_encoder_phase_diagnostic_markers()
+            return
+        role_channel_map = {
+            "primary": active_waveform.channel,
+            "secondary": str(secondary_channel),
+        }
+        valid_points: list[QPointF] = []
+        invalid_points: list[QPointF] = []
+        for role, _edge_type, time_s in self.current_edge_comparison.valid_event_points:
+            point = self._encoder_phase_marker_point(role_channel_map.get(role), time_s)
+            if point is not None:
+                valid_points.append(point)
+        for role, _edge_type, time_s in self.current_edge_comparison.invalid_event_points:
+            point = self._encoder_phase_marker_point(role_channel_map.get(role), time_s)
+            if point is not None:
+                invalid_points.append(point)
+
+        self.encoder_phase_valid_series.clear()
+        self.encoder_phase_invalid_series.clear()
+        if valid_points:
+            self.encoder_phase_valid_series.replace(valid_points)
+            self.encoder_phase_valid_series.setVisible(True)
+        else:
+            self.encoder_phase_valid_series.setVisible(False)
+        if invalid_points:
+            self.encoder_phase_invalid_series.replace(invalid_points)
+            self.encoder_phase_invalid_series.setVisible(True)
+        else:
+            self.encoder_phase_invalid_series.setVisible(False)
+
+    def _encoder_phase_marker_point(self, channel: str | None, time_s: float) -> QPointF | None:
+        if channel is None or channel not in self.visible_channels:
+            return None
+        points = self.waveform_source_map.get(channel)
+        if points is None:
+            return None
+        x_values, y_values = points
+        y_value = _interpolate_waveform_y_at_x(x_values, y_values, time_s)
+        if y_value is None:
+            return None
+        offset = self.waveform_offsets.get(channel, 0.0)
+        return QPointF(time_s, y_value + offset)
 
     def _refresh_chart_title(self) -> None:
         if not self.current_waveforms:

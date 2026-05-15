@@ -27,6 +27,7 @@ from keysight_scope_app.analysis.waveform import (
     ZeroStableWindow,
     _negative_pulse_width_from_stats,
     _ratio_to_percent,
+    compare_encoder_ab_edges,
     compare_waveform_edges,
 )
 
@@ -405,8 +406,19 @@ class KeysightOscilloscope:
             self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
             self._instrument.write(f":WAVeform:POINts {points}")
             preamble_values = self._instrument.query_ascii_values(":WAVeform:PREamble?")
-            self._instrument.write(":WAVeform:DATA?")
-            payload = list(strip_ieee4882_block(self._instrument.read_raw()))
+            try:
+                payload = list(
+                    self._instrument.query_binary_values(
+                        ":WAVeform:DATA?",
+                        datatype="B",
+                        container=list,
+                        header_fmt="ieee",
+                        expect_termination=False,
+                    )
+                )
+            except Exception:
+                self._instrument.write(":WAVeform:DATA?")
+                payload = list(strip_ieee4882_block(self._instrument.read_raw()))
 
         preamble = _parse_preamble(preamble_values)
         x_values = [

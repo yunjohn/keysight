@@ -24,13 +24,18 @@ from PySide6.QtWidgets import (
 
 from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
 from keysight_scope_app.device.instrument import SUPPORTED_CHANNELS
-from keysight_scope_app.ui.helpers import display_channel_name
+from keysight_scope_app.ui.helpers import (
+    apply_responsive_window_geometry,
+    create_scroll_area,
+    display_channel_name,
+)
 from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
 from keysight_scope_app.utils import format_engineering_value
 
 
 WAVEFORM_CONFIG_DIR = Path("captures") / "waveforms"
 WAVEFORM_MEASUREMENT_SETTINGS_PATH = WAVEFORM_CONFIG_DIR / "waveform_measurements.json"
+WAVEFORM_PHASE_SETTINGS_PATH = WAVEFORM_CONFIG_DIR / "waveform_phase_settings.json"
 WAVEFORM_MEASUREMENT_ORDER = [
     "频率",
     "周期",
@@ -237,18 +242,33 @@ class WaveformDetailDialog(QDialog):
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle("独立波形显示")
-        self.resize(1440, 920)
-        layout = QVBoxLayout(self)
+        apply_responsive_window_geometry(
+            self,
+            minimum_width=760,
+            minimum_height=540,
+            preferred_width=1440,
+            preferred_height=920,
+        )
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
+        outer_layout.addWidget(create_scroll_area(self, content, minimum_px=1120, minimum_chars=132))
         self.channel_visibility_checks: dict[str, QCheckBox] = {}
         self.current_waveforms: list[WaveformData] = []
         self.measurement_config: dict[str, set[str]] = {}
         self.cursor_measurements: dict[str, str] = {}
+        self._phase_interval_memory: dict[str, float | None] = {}
         self._updating_channel_checks = False
         self._link_scope_channels = False
         self._measurement_frozen = False
+        self._applying_saved_phase_interval = False
         self._load_measurement_config()
+        self._load_phase_settings()
 
-        toolbar = QHBoxLayout()
+        toolbar = QGridLayout()
+        toolbar.setHorizontalSpacing(8)
+        toolbar.setVerticalSpacing(6)
         self.refresh_waveform_button = QPushButton("抓取波形")
         self.refresh_waveform_button.clicked.connect(self._request_waveform_refresh)
         self.reset_waveform_button = QPushButton("重置波形")
@@ -269,28 +289,45 @@ class WaveformDetailDialog(QDialog):
         self.measurement_scope_combo.currentIndexChanged.connect(self._refresh_measurement_footer)
         self.measurement_settings_button = QPushButton("测量项设置")
         self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
-        toolbar.addWidget(self.refresh_waveform_button)
-        toolbar.addWidget(self.reset_waveform_button)
-        toolbar.addWidget(self.export_current_view_button)
-        toolbar.addWidget(self.export_cursor_ab_button)
-        toolbar.addWidget(self.capture_current_view_button)
-        toolbar.addWidget(self.freeze_measurements_button)
-        toolbar.addWidget(self.measurement_settings_button)
-        toolbar.addSpacing(12)
-        toolbar.addWidget(QLabel("相位差通道"))
+        toolbar.addWidget(self.refresh_waveform_button, 0, 0)
+        toolbar.addWidget(self.reset_waveform_button, 0, 1)
+        toolbar.addWidget(self.export_current_view_button, 0, 2)
+        toolbar.addWidget(self.export_cursor_ab_button, 0, 3)
+        toolbar.addWidget(self.capture_current_view_button, 0, 4)
+        toolbar.addWidget(self.freeze_measurements_button, 0, 5)
+        toolbar.addWidget(self.measurement_settings_button, 0, 6)
+        toolbar.addWidget(QLabel("相位差通道"), 1, 0)
         self.phase_channel_combo = QComboBox()
         self.phase_channel_combo.addItem("关闭", "")
         self.phase_channel_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_channel_combo)
-        toolbar.addWidget(QLabel("边沿"))
+        toolbar.addWidget(self.phase_channel_combo, 1, 1)
+        toolbar.addWidget(QLabel("模式"), 1, 2)
+        self.phase_mode_combo = QComboBox()
+        self.phase_mode_combo.addItem("通用", "general")
+        self.phase_mode_combo.addItem("编码器AB", "encoder_ab")
+        self.phase_mode_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
+        toolbar.addWidget(self.phase_mode_combo, 1, 3)
+        toolbar.addWidget(QLabel("最小间隔"), 1, 4)
+        self.phase_interval_combo = QComboBox()
+        self.phase_interval_combo.addItem("自动", None)
+        self.phase_interval_combo.addItem("10 us", 10e-6)
+        self.phase_interval_combo.addItem("20 us", 20e-6)
+        self.phase_interval_combo.addItem("50 us", 50e-6)
+        self.phase_interval_combo.addItem("100 us", 100e-6)
+        self.phase_interval_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
+        toolbar.addWidget(self.phase_interval_combo, 1, 5)
+        self.export_phase_diagnostics_button = QPushButton("导出相位差诊断")
+        self.export_phase_diagnostics_button.clicked.connect(self._export_phase_diagnostics)
+        toolbar.addWidget(self.export_phase_diagnostics_button, 1, 6)
+        toolbar.addWidget(QLabel("边沿"), 2, 0)
         self.phase_edge_combo = QComboBox()
         self.phase_edge_combo.addItem("上升沿", "rising")
         self.phase_edge_combo.addItem("下降沿", "falling")
         self.phase_edge_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_edge_combo)
-        toolbar.addStretch(1)
-        toolbar.addWidget(QLabel("测量范围"))
-        toolbar.addWidget(self.measurement_scope_combo)
+        toolbar.addWidget(self.phase_edge_combo, 2, 1)
+        toolbar.addWidget(QLabel("测量范围"), 2, 2)
+        toolbar.addWidget(self.measurement_scope_combo, 2, 3)
+        toolbar.setColumnStretch(7, 1)
         layout.addLayout(toolbar)
 
         self.operation_hint_label = QLabel(
@@ -374,6 +411,10 @@ class WaveformDetailDialog(QDialog):
         self.phase_result_label = QLabel("相位差: --")
         self.phase_result_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self.phase_result_label)
+        self.phase_metrics_label = QLabel("")
+        self.phase_metrics_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.phase_metrics_label.setStyleSheet("color: #5f6b76;")
+        layout.addWidget(self.phase_metrics_label)
 
     def set_waveform(self, waveform: WaveformData, stats: WaveformStats) -> None:
         self.current_waveforms = [waveform]
@@ -671,6 +712,109 @@ class WaveformDetailDialog(QDialog):
         else:
             self._log_message(f"当前视图截图保存失败: {output_path}")
 
+    def _export_phase_diagnostics(self) -> None:
+        target_channel, edge_type, comparison_mode, minimum_edge_interval_s, comparison, message = self.analysis_panel.channel_comparison_state()
+        if not target_channel:
+            self._log_message("请先选择相位差通道，再导出相位差诊断。")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        diagnostics_dir = WAVEFORM_CONFIG_DIR / "phase_diagnostics"
+        default_path = diagnostics_dir / f"phase_diagnostics_{timestamp}.json"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出相位差诊断",
+            str(default_path),
+            "JSON Files (*.json)",
+        )
+        if not file_path:
+            return
+
+        output_path = Path(file_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._build_phase_diagnostics_payload(
+            target_channel=str(target_channel),
+            edge_type=edge_type,
+            comparison_mode=comparison_mode,
+            minimum_edge_interval_s=minimum_edge_interval_s,
+            comparison=comparison,
+            message=message,
+        )
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._log_message(f"相位差诊断已导出: {output_path}")
+
+    def _build_phase_diagnostics_payload(
+        self,
+        *,
+        target_channel: str,
+        edge_type: str,
+        comparison_mode: str,
+        minimum_edge_interval_s: float | None,
+        comparison,
+        message: str | None,
+    ) -> dict[str, object]:
+        reference_channel = self.analysis_panel.active_waveform_channel
+        current_window = self.analysis_panel.current_time_window()
+        return {
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "reference_channel": reference_channel,
+            "target_channel": target_channel,
+            "mode": comparison_mode,
+            "edge_type": edge_type,
+            "minimum_edge_interval_s": minimum_edge_interval_s,
+            "time_window_s": list(current_window) if current_window is not None else None,
+            "visible_channels": sorted(self.analysis_panel.visible_channels),
+            "comparison": None
+            if comparison is None
+            else {
+                "delta_t_s": comparison.delta_t_s,
+                "phase_deg": comparison.phase_deg,
+                "frequency_hz": comparison.frequency_hz,
+                "confidence": comparison.confidence,
+                "raw_transition_count": comparison.raw_transition_count,
+                "debounce_filtered_count": comparison.debounce_filtered_count,
+                "sequence_discarded_count": comparison.sequence_discarded_count,
+                "valid_transition_count": comparison.valid_transition_count,
+                "invalid_transition_count": comparison.invalid_transition_count,
+                "primary_time_s": comparison.primary_time_s,
+                "secondary_time_s": comparison.secondary_time_s,
+            },
+            "message": message,
+            "reference_stats": self._phase_channel_stats_snapshot(reference_channel),
+            "target_stats": self._phase_channel_stats_snapshot(target_channel),
+        }
+
+    def _phase_channel_stats_snapshot(self, channel: str | None) -> dict[str, object] | None:
+        if not channel:
+            return None
+        visible_stats = self.analysis_panel.visible_stats_for_channel(channel)
+        full_stats = self.analysis_panel.full_stats_for_channel(channel)
+        if visible_stats is None and full_stats is None:
+            return None
+        return {
+            "channel": channel,
+            "visible": None
+            if visible_stats is None
+            else {
+                "frequency_hz": visible_stats.estimated_frequency_hz,
+                "pulse_count": visible_stats.pulse_count,
+                "logic_low_v": visible_stats.logic_low_v,
+                "logic_high_v": visible_stats.logic_high_v,
+                "sample_period_s": visible_stats.sample_period_s,
+                "duration_s": visible_stats.duration_s,
+            },
+            "full": None
+            if full_stats is None
+            else {
+                "frequency_hz": full_stats.estimated_frequency_hz,
+                "pulse_count": full_stats.pulse_count,
+                "logic_low_v": full_stats.logic_low_v,
+                "logic_high_v": full_stats.logic_high_v,
+                "sample_period_s": full_stats.sample_period_s,
+                "duration_s": full_stats.duration_s,
+            },
+        }
+
     def _render_current_view_image(self, *, scale: float = 2.0) -> QPixmap:
         container = self
         base_size = container.size()
@@ -797,6 +941,49 @@ class WaveformDetailDialog(QDialog):
                 loaded_config[str(channel)] = valid_names
         self.measurement_config = loaded_config
 
+    def _save_phase_settings(self) -> None:
+        WAVEFORM_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "phase_interval_memory": self._phase_interval_memory,
+        }
+        with WAVEFORM_PHASE_SETTINGS_PATH.open("w", encoding="utf-8") as settings_file:
+            json.dump(payload, settings_file, ensure_ascii=False, indent=2)
+
+    def _load_phase_settings(self) -> None:
+        if not WAVEFORM_PHASE_SETTINGS_PATH.exists():
+            return
+        try:
+            payload = json.loads(WAVEFORM_PHASE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._log_message(f"相位差配置加载失败: {exc}")
+            return
+        loaded_memory: dict[str, float | None] = {}
+        for key, value in payload.get("phase_interval_memory", {}).items():
+            if value is None:
+                loaded_memory[str(key)] = None
+                continue
+            try:
+                loaded_memory[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        self._phase_interval_memory = loaded_memory
+
+    def _phase_interval_memory_key(self, reference_channel: str, target_channel: str, mode: str) -> str:
+        return f"{reference_channel}->{target_channel}|{mode}"
+
+    def _preferred_phase_interval(
+        self,
+        reference_channel: str | None,
+        target_channel: str | None,
+        mode: str,
+        fallback: float | None,
+    ) -> float | None:
+        if reference_channel and target_channel and mode == "encoder_ab":
+            key = self._phase_interval_memory_key(reference_channel, target_channel, mode)
+            if key in self._phase_interval_memory:
+                return self._phase_interval_memory[key]
+        return fallback
+
     def _log_message(self, message: str) -> None:
         parent = self.parent()
         if parent is not None and hasattr(parent, "log"):
@@ -867,7 +1054,8 @@ class WaveformDetailDialog(QDialog):
 
     def _sync_phase_compare_toolbar_from_panel(self) -> None:
         options = self.analysis_panel.comparison_target_options()
-        target_channel, edge_type, _comparison, _message = self.analysis_panel.channel_comparison_state()
+        target_channel, edge_type, comparison_mode, minimum_edge_interval_s, _comparison, _message = self.analysis_panel.channel_comparison_state()
+        reference_channel = self.analysis_panel.active_waveform_channel
 
         self.phase_channel_combo.blockSignals(True)
         self.phase_channel_combo.clear()
@@ -887,21 +1075,74 @@ class WaveformDetailDialog(QDialog):
             self.phase_edge_combo.setCurrentIndex(edge_index)
         self.phase_edge_combo.setEnabled(bool(options))
         self.phase_edge_combo.blockSignals(False)
+
+        self.phase_mode_combo.blockSignals(True)
+        mode_index = self.phase_mode_combo.findData(comparison_mode)
+        if mode_index >= 0:
+            self.phase_mode_combo.setCurrentIndex(mode_index)
+        self.phase_mode_combo.setEnabled(bool(options))
+        self.phase_mode_combo.blockSignals(False)
+
+        preferred_interval = self._preferred_phase_interval(
+            reference_channel,
+            target_channel,
+            comparison_mode,
+            minimum_edge_interval_s,
+        )
+        self.phase_interval_combo.blockSignals(True)
+        interval_index = self.phase_interval_combo.findData(preferred_interval)
+        if interval_index < 0:
+            interval_index = 0
+        self.phase_interval_combo.setCurrentIndex(interval_index)
+        self.phase_interval_combo.setEnabled(comparison_mode == "encoder_ab" and bool(options))
+        self.phase_interval_combo.blockSignals(False)
+
+        if (
+            comparison_mode == "encoder_ab"
+            and target_channel
+            and preferred_interval != minimum_edge_interval_s
+            and not self._applying_saved_phase_interval
+        ):
+            self._applying_saved_phase_interval = True
+            try:
+                self.analysis_panel.set_channel_comparison(
+                    target_channel,
+                    edge_type,
+                    comparison_mode,
+                    preferred_interval,
+                )
+            finally:
+                self._applying_saved_phase_interval = False
+            return
         self._refresh_phase_compare_toolbar()
 
     def _sync_phase_compare_controls_to_panel(self) -> None:
         target_channel = self.phase_channel_combo.currentData()
         edge_type = str(self.phase_edge_combo.currentData() or "rising")
-        self.analysis_panel.set_channel_comparison(str(target_channel) if target_channel else None, edge_type)
+        comparison_mode = str(self.phase_mode_combo.currentData() or "general")
+        minimum_edge_interval_s = self.phase_interval_combo.currentData()
+        reference_channel = self.analysis_panel.active_waveform_channel
+        if comparison_mode == "encoder_ab" and target_channel and reference_channel:
+            key = self._phase_interval_memory_key(reference_channel, str(target_channel), comparison_mode)
+            self._phase_interval_memory[key] = minimum_edge_interval_s
+            self._save_phase_settings()
+        self.analysis_panel.set_channel_comparison(
+            str(target_channel) if target_channel else None,
+            edge_type,
+            comparison_mode,
+            minimum_edge_interval_s if comparison_mode == "encoder_ab" else None,
+        )
 
     def _refresh_phase_compare_toolbar(self) -> None:
         if self._measurement_frozen:
             return
-        target_channel, edge_type, comparison, message = self.analysis_panel.channel_comparison_state()
+        target_channel, edge_type, comparison_mode, minimum_edge_interval_s, comparison, message = self.analysis_panel.channel_comparison_state()
         reference_channel = self.analysis_panel.active_waveform_channel
         if not target_channel:
             self.phase_result_label.setText("相位差: --")
+            self.phase_metrics_label.clear()
             return
+        mode_label = "编码器AB" if comparison_mode == "encoder_ab" else "通用"
         relation_text = (
             f"{display_channel_name(target_channel)} 相对 {display_channel_name(reference_channel)}"
             if reference_channel
@@ -909,14 +1150,28 @@ class WaveformDetailDialog(QDialog):
         )
         if comparison is None:
             self.phase_result_label.setText(
-                f"{relation_text} / {'上升沿' if edge_type == 'rising' else '下降沿'}: {message or '无法估算'}"
+                f"{relation_text} / {mode_label} / {'上升沿' if edge_type == 'rising' else '下降沿'}: {message or '无法估算'}"
             )
+            self.phase_metrics_label.clear()
             return
         dt_text = format_engineering_value(comparison.delta_t_s, "s")
         phase_text = f"{comparison.phase_deg:.2f}°" if comparison.phase_deg is not None else "--"
+        suffix = ""
+        metrics_text = ""
+        if comparison_mode == "encoder_ab":
+            interval_text = "自动" if minimum_edge_interval_s is None else format_engineering_value(minimum_edge_interval_s, "s")
+            suffix = f"  可信度 {comparison.confidence or '--'}"
+            metrics_text = (
+                f"总跳变 {comparison.raw_transition_count}  "
+                f"去抖过滤 {comparison.debounce_filtered_count}  "
+                f"序列丢弃 {comparison.sequence_discarded_count}  "
+                f"合法/非法 {comparison.valid_transition_count}/{comparison.invalid_transition_count}  "
+                f"最小间隔 {interval_text}"
+            )
         self.phase_result_label.setText(
-            f"{relation_text}  Δt {dt_text}  相位差 {phase_text}  {message or ''}".rstrip()
+            f"{relation_text} / {mode_label}  Δt {dt_text}  相位差 {phase_text}{suffix}  {message or ''}".rstrip()
         )
+        self.phase_metrics_label.setText(metrics_text)
 
     def _measurement_stats_for_channel(self, channel: str, measurement_scope: str) -> WaveformStats | None:
         if measurement_scope == "cursor":
@@ -925,10 +1180,10 @@ class WaveformDetailDialog(QDialog):
             return self.analysis_panel.full_stats_for_channel(channel)
         return self.analysis_panel.visible_stats_for_channel(channel)
 
-    def _build_measurement_section_html(self, waveform: WaveformData, measurement_scope: str) -> str:
+    def _build_measurement_section_html(self, waveform: WaveformData, measurement_scope: str = "view") -> str:
         stats = self._measurement_stats_for_channel(waveform.channel, measurement_scope)
         if stats is None:
-            return ""
+            stats = waveform.analyze()
         channel_unit = self._channel_unit(waveform.channel)
         selected_names = self.measurement_config.get(waveform.channel, set(WAVEFORM_DEFAULT_MEASUREMENTS))
         metric_items: list[str] = []
@@ -1004,7 +1259,7 @@ class WaveformDetailDialog(QDialog):
             for label, value in self.cursor_measurements.items()
             if value and value != "-"
         ]
-        target_channel, edge_type, comparison, message = self.analysis_panel.channel_comparison_state()
+        target_channel, edge_type, comparison_mode, minimum_edge_interval_s, comparison, message = self.analysis_panel.channel_comparison_state()
         reference_channel = self.analysis_panel.active_waveform_channel
         if target_channel:
             relation_label = (
@@ -1012,20 +1267,32 @@ class WaveformDetailDialog(QDialog):
                 if reference_channel
                 else display_channel_name(target_channel)
             )
+            mode_label = "编码器AB" if comparison_mode == "encoder_ab" else "通用"
             if comparison is None:
                 visible_items.append(
                     (
-                        f"相位差({relation_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        f"相位差({relation_label} / {mode_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
                         message or "无法估算",
                     )
                 )
             else:
                 phase_text = f"{comparison.phase_deg:.2f}°" if comparison.phase_deg is not None else "--"
                 dt_text = format_engineering_value(comparison.delta_t_s, "s")
+                extra_text = ""
+                if comparison_mode == "encoder_ab":
+                    interval_text = "自动" if minimum_edge_interval_s is None else format_engineering_value(minimum_edge_interval_s, "s")
+                    extra_text = (
+                        f" / 可信度 {comparison.confidence or '--'}"
+                        f" / 总跳变 {comparison.raw_transition_count}"
+                        f" / 去抖过滤 {comparison.debounce_filtered_count}"
+                        f" / 序列丢弃 {comparison.sequence_discarded_count}"
+                        f" / 合法/非法 {comparison.valid_transition_count}/{comparison.invalid_transition_count}"
+                        f" / 最小间隔 {interval_text}"
+                    )
                 visible_items.append(
                     (
-                        f"相位差({relation_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
-                        f"{phase_text} / Δt {dt_text}" + (f" / {message}" if message else ""),
+                        f"相位差({relation_label} / {mode_label} / {'上升沿' if edge_type == 'rising' else '下降沿'})",
+                        f"{phase_text} / Δt {dt_text}{extra_text}" + (f" / {message}" if message else ""),
                     )
                 )
         if not visible_items:
@@ -1050,9 +1317,14 @@ class WaveformDetailDialog(QDialog):
     def _reposition_measurement_overlay(self) -> None:
         chart_rect = self.analysis_panel.chart_view.rect()
         if self.measurement_overlay.isVisible():
-            overlay_width = min(max(int(chart_rect.width() * 0.86), 900), chart_rect.width() - 44)
-            self.measurement_overlay.setFixedWidth(overlay_width)
-            self.measurement_text_label.setFixedWidth(max(overlay_width - 16, 240))
+            overlay_width = min(
+                max(int(chart_rect.width() * 0.82), 420),
+                max(chart_rect.width() - 44, 260),
+            )
+            self.measurement_overlay.setMinimumWidth(260)
+            self.measurement_overlay.setMaximumWidth(max(overlay_width, 260))
+            self.measurement_text_label.setMinimumWidth(220)
+            self.measurement_text_label.setMaximumWidth(max(overlay_width - 16, 220))
             self.measurement_text_label.adjustSize()
             content_height = self.measurement_text_label.sizeHint().height()
             hint_height = self.measurement_overlay_hint.sizeHint().height()
@@ -1063,9 +1335,11 @@ class WaveformDetailDialog(QDialog):
             self.measurement_overlay.raise_()
 
         if self.cursor_overlay.isVisible():
-            cursor_width = min(max(int(chart_rect.width() * 0.17), 220), 290)
-            self.cursor_overlay.setFixedWidth(cursor_width)
-            self.cursor_text_label.setFixedWidth(max(cursor_width - 10, 140))
+            cursor_width = min(max(int(chart_rect.width() * 0.2), 180), 290)
+            self.cursor_overlay.setMinimumWidth(160)
+            self.cursor_overlay.setMaximumWidth(cursor_width)
+            self.cursor_text_label.setMinimumWidth(140)
+            self.cursor_text_label.setMaximumWidth(max(cursor_width - 10, 140))
             self.cursor_text_label.adjustSize()
             cursor_content_height = self.cursor_text_label.sizeHint().height()
             cursor_hint_height = self.cursor_overlay_hint.sizeHint().height()
@@ -1091,8 +1365,18 @@ class WaveformOnlyDialog(QDialog):
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle("独立波形显示")
-        self.resize(1440, 920)
-        layout = QVBoxLayout(self)
+        apply_responsive_window_geometry(
+            self,
+            minimum_width=760,
+            minimum_height=540,
+            preferred_width=1440,
+            preferred_height=920,
+        )
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        content = QWidget(self)
+        layout = QVBoxLayout(content)
+        outer_layout.addWidget(create_scroll_area(self, content, minimum_px=960, minimum_chars=112))
         self.channel_visibility_checks: dict[str, QCheckBox] = {}
 
         toolbar = QHBoxLayout()

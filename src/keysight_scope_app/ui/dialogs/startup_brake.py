@@ -39,6 +39,8 @@ from keysight_scope_app.analysis.startup_brake import (
 )
 from keysight_scope_app.analysis.waveform import SignalPeak, SpeedTargetMatch, WaveformData, ZeroStableWindow
 from keysight_scope_app.ui.helpers import (
+    apply_responsive_window_geometry,
+    create_scroll_area,
     display_channel_name,
     normalize_channel_name,
 )
@@ -85,10 +87,20 @@ class StartupBrakeTestDialog(QDialog):
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle("启动刹车性能测试")
-        self.resize(1180, 760)
+        apply_responsive_window_geometry(
+            self,
+            minimum_width=760,
+            minimum_height=540,
+            preferred_width=1180,
+            preferred_height=760,
+        )
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._build_test_box())
+        layout.setContentsMargins(0, 0, 0, 0)
+        content = QWidget(self)
+        content_layout = QVBoxLayout(content)
+        content_layout.addWidget(self._build_test_box())
+        layout.addWidget(create_scroll_area(self, content, minimum_px=1040, minimum_chars=122))
 
         for combo in self.channel_combos:
             combo.currentIndexChanged.connect(
@@ -362,8 +374,9 @@ class StartupBrakeTestDialog(QDialog):
         brake_grid.addWidget(self._inline_form_field("最大下降时间", self.brake_max_fall_ms_input), 2, 1)
         layout.addLayout(brake_grid)
 
-        button_row = QHBoxLayout()
-        button_row.setSpacing(8)
+        button_row = QGridLayout()
+        button_row.setHorizontalSpacing(8)
+        button_row.setVerticalSpacing(6)
         self.run_button = QPushButton("执行测试")
         self.simulate_button = QPushButton("加载波形模拟测试")
         self.export_startup_waveform_button = QPushButton("导出启动段波形")
@@ -381,21 +394,17 @@ class StartupBrakeTestDialog(QDialog):
         self.archive_snapshots_check = QCheckBox("自动截图归档")
         self.archive_snapshots_check.setChecked(False)
         self.archive_snapshots_check.setToolTip("开启后，测试完成会自动导出启动段/刹车段/全流程标准化截图。关闭可减少执行测试耗时。")
-        button_row.addWidget(self.run_button)
-        button_row.addWidget(self.simulate_button)
-        button_row.addSpacing(12)
-        button_row.addWidget(self.export_startup_waveform_button)
-        button_row.addWidget(self.export_brake_waveform_button)
-        button_row.addWidget(self.export_report_button)
-        button_row.addSpacing(12)
-        button_row.addWidget(self.archive_snapshots_check)
-        button_row.addSpacing(12)
-        button_row.addWidget(self.apply_startup_cursor_button)
-        button_row.addWidget(self.apply_brake_cursor_button)
-        button_row.addSpacing(12)
-        button_row.addWidget(self.export_stats_button)
-        button_row.addWidget(self.clear_stats_button)
-        button_row.addStretch(1)
+        button_row.addWidget(self.run_button, 0, 0)
+        button_row.addWidget(self.simulate_button, 0, 1)
+        button_row.addWidget(self.archive_snapshots_check, 0, 2)
+        button_row.addWidget(self.export_startup_waveform_button, 1, 0)
+        button_row.addWidget(self.export_brake_waveform_button, 1, 1)
+        button_row.addWidget(self.export_report_button, 1, 2)
+        button_row.addWidget(self.apply_startup_cursor_button, 2, 0)
+        button_row.addWidget(self.apply_brake_cursor_button, 2, 1)
+        button_row.addWidget(self.export_stats_button, 2, 2)
+        button_row.addWidget(self.clear_stats_button, 2, 3)
+        button_row.setColumnStretch(3, 1)
         layout.addLayout(button_row)
 
         result_stats_row = QHBoxLayout()
@@ -515,7 +524,7 @@ class StartupBrakeTestDialog(QDialog):
         self.summary_label.setWordWrap(False)
         self.summary_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.summary_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.summary_label.setFixedHeight(QFontMetrics(self.summary_label.font()).height() + 6)
+        self.summary_label.setMinimumHeight(QFontMetrics(self.summary_label.font()).height() + 6)
         layout.addWidget(self.summary_label)
 
         diagnostics_box = self._group_box("失败诊断")
@@ -525,7 +534,7 @@ class StartupBrakeTestDialog(QDialog):
         self.failure_diagnostics_label.setWordWrap(False)
         self.failure_diagnostics_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.failure_diagnostics_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.failure_diagnostics_label.setFixedHeight(QFontMetrics(self.failure_diagnostics_label.font()).height() + 6)
+        self.failure_diagnostics_label.setMinimumHeight(QFontMetrics(self.failure_diagnostics_label.font()).height() + 6)
         diagnostics_layout.addWidget(self.failure_diagnostics_label)
         layout.addWidget(diagnostics_box)
         self._update_footer_texts()
@@ -566,7 +575,7 @@ class StartupBrakeTestDialog(QDialog):
     def _form_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        label.setFixedWidth(84)
+        label.setMinimumWidth(84)
         return label
 
     def _set_compact_field_width(self, *widgets: QWidget) -> None:

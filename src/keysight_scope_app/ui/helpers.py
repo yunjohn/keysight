@@ -1,5 +1,68 @@
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QWidget
+
+
+def configure_high_dpi_policy() -> None:
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+
+
+def content_min_width(widget: QWidget, *, minimum_px: int, minimum_chars: int) -> int:
+    return max(minimum_px, widget.fontMetrics().horizontalAdvance("0") * minimum_chars)
+
+
+def create_scroll_area(
+    parent: QWidget,
+    content: QWidget,
+    *,
+    minimum_px: int,
+    minimum_chars: int,
+) -> QScrollArea:
+    content.setMinimumWidth(
+        content_min_width(parent, minimum_px=minimum_px, minimum_chars=minimum_chars)
+    )
+    scroll_area = QScrollArea(parent)
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setFrameShape(QFrame.NoFrame)
+    scroll_area.setWidget(content)
+    return scroll_area
+
+
+def apply_responsive_window_geometry(
+    window: QWidget,
+    *,
+    minimum_width: int,
+    minimum_height: int,
+    preferred_width: int | None = None,
+    preferred_height: int | None = None,
+    extra_width: int = 0,
+    extra_height: int = 0,
+    margin_width: int = 40,
+    margin_height: int = 60,
+) -> None:
+    window.adjustSize()
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        max_width = max(available.width() - margin_width, minimum_width)
+        max_height = max(available.height() - margin_height, minimum_height)
+    else:
+        max_width = max(preferred_width or 1600, minimum_width)
+        max_height = max(preferred_height or 1000, minimum_height)
+
+    size_hint = window.sizeHint().expandedTo(window.minimumSizeHint())
+    target_width = preferred_width if preferred_width is not None else size_hint.width() + extra_width
+    target_height = preferred_height if preferred_height is not None else size_hint.height() + extra_height
+    target_width = min(max(target_width, minimum_width), max_width)
+    target_height = min(max(target_height, minimum_height), max_height)
+
+    window.setMinimumSize(min(minimum_width, target_width), min(minimum_height, target_height))
+    window.resize(target_width, target_height)
+
 
 def display_channel_name(channel: str) -> str:
     if channel.startswith("CHANnel"):

@@ -11,6 +11,7 @@ from keysight_scope_app.device.instrument import (
     WaveformData,
     WaveformPreamble,
     analyze_startup_brake_test,
+    compare_encoder_ab_edges,
     compare_waveform_edges,
 )
 from keysight_scope_app.ui.dialogs import waveform as waveform_dialog_module
@@ -646,6 +647,219 @@ def test_compare_waveform_edges_returns_delay_and_phase() -> None:
     assert comparison is not None
     assert abs(comparison.delta_t_s - 0.1) < 1e-9
     assert abs(comparison.phase_deg - 36.0) < 1e-9
+
+
+def test_compare_waveform_edges_prefers_multi_cycle_median_when_local_glitch_exists() -> None:
+    x_values = [index * 0.05 for index in range(81)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.20 for start in (0.20, 1.20, 2.20, 3.20))
+        secondary_high = any(start <= x_value < start + 0.20 for start in (0.45, 1.45, 2.45, 3.45))
+        if 2.95 <= x_value < 3.00:
+            primary_high = True
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.05, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.05, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_waveform_edges(primary, secondary, 2.9, "rising", frequency_hz=1.0)
+
+    assert comparison is not None
+    assert abs(comparison.delta_t_s - 0.25) < 1e-9
+    assert abs(comparison.phase_deg - 90.0) < 1e-9
+
+
+def test_compare_encoder_ab_edges_combines_rising_and_falling_cycles() -> None:
+    x_values = [index * 0.05 for index in range(81)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.50 for start in (0.20, 1.20, 2.20, 3.20))
+        secondary_high = any(start <= x_value < start + 0.50 for start in (0.45, 1.45, 2.45, 3.45))
+        if 2.95 <= x_value < 3.00:
+            primary_high = True
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.05, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.05, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_encoder_ab_edges(primary, secondary, 2.9, "rising", frequency_hz=1.0)
+
+    assert comparison is not None
+    assert abs(comparison.phase_deg - 90.0) < 1e-6
+    assert comparison.raw_transition_count >= comparison.valid_transition_count
+    assert comparison.sequence_discarded_count >= 0
+
+
+def test_compare_encoder_ab_edges_filters_short_glitches() -> None:
+    x_values = [index * 0.01 for index in range(501)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.50 for start in (0.20, 1.20, 2.20, 3.20, 4.20))
+        secondary_high = any(start <= x_value < start + 0.50 for start in (0.45, 1.45, 2.45, 3.45, 4.45))
+        if 2.94 <= x_value < 2.98:
+            primary_high = not primary_high
+        if 3.66 <= x_value < 3.69:
+            secondary_high = not secondary_high
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_encoder_ab_edges(primary, secondary, 2.9, "rising", frequency_hz=1.0)
+
+    assert comparison is not None
+    assert abs(comparison.phase_deg - 90.0) < 5.0
+
+
+def test_compare_encoder_ab_edges_exposes_valid_and_invalid_event_points() -> None:
+    x_values = [index * 0.01 for index in range(501)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.50 for start in (0.20, 1.20, 2.20, 3.20, 4.20))
+        secondary_high = any(start <= x_value < start + 0.50 for start in (0.45, 1.45, 2.45, 3.45, 4.45))
+        if 2.94 <= x_value < 2.98:
+            primary_high = not primary_high
+        if 3.66 <= x_value < 3.69:
+            secondary_high = not secondary_high
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_encoder_ab_edges(primary, secondary, 2.9, "rising", frequency_hz=1.0)
+
+    assert comparison is not None
+    assert len(comparison.valid_event_points) == comparison.valid_transition_count
+    assert len(comparison.invalid_event_points) == comparison.invalid_transition_count
+    assert any(point[0] in {"primary", "secondary"} for point in comparison.valid_event_points)
+
+
+def test_compare_encoder_ab_edges_rejects_nearly_simultaneous_channels() -> None:
+    x_values = [index * 0.01 for index in range(501)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.50 for start in (0.20, 1.20, 2.20, 3.20, 4.20))
+        secondary_high = any(start <= x_value < start + 0.50 for start in (0.205, 1.205, 2.205, 3.205, 4.205))
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.01, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_encoder_ab_edges(primary, secondary, 2.9, "rising", frequency_hz=1.0)
+
+    assert comparison is None
+
+
+def test_compare_encoder_ab_edges_accepts_manual_minimum_interval() -> None:
+    x_values = [index * 0.002 for index in range(2001)]
+    primary_y: list[float] = []
+    secondary_y: list[float] = []
+    for x_value in x_values:
+        primary_high = any(start <= x_value < start + 0.10 for start in (0.10, 0.30, 0.50, 0.70, 0.90))
+        secondary_high = any(start <= x_value < start + 0.10 for start in (0.125, 0.325, 0.525, 0.725, 0.925))
+        if 0.502 <= x_value < 0.506:
+            primary_high = not primary_high
+        primary_y.append(1.0 if primary_high else 0.0)
+        secondary_y.append(1.0 if secondary_high else 0.0)
+
+    primary = WaveformData(
+        channel="CHANnel1",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.002, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=primary_y,
+    )
+    secondary = WaveformData(
+        channel="CHANnel2",
+        points_mode="NORMal",
+        preamble=WaveformPreamble(0, 0, len(x_values), 1, 0.002, 0.0, 0, 1.0, 0.0, 0),
+        x_values=x_values,
+        y_values=secondary_y,
+    )
+
+    comparison = compare_encoder_ab_edges(
+        primary,
+        secondary,
+        0.55,
+        "rising",
+        frequency_hz=5.0,
+        minimum_edge_interval_s=20e-6,
+    )
+
+    assert comparison is not None
+    assert comparison.valid_transition_count >= 8
+    assert comparison.invalid_transition_count >= 0
+    assert comparison.raw_transition_count >= comparison.valid_transition_count
 
 
 def test_analyze_startup_brake_test_current_zero_mode() -> None:

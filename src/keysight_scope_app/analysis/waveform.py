@@ -56,6 +56,14 @@ class EdgeComparison:
     delta_t_s: float
     frequency_hz: float | None
     phase_deg: float | None
+    valid_transition_count: int = 0
+    invalid_transition_count: int = 0
+    confidence: str | None = None
+    raw_transition_count: int = 0
+    debounce_filtered_count: int = 0
+    sequence_discarded_count: int = 0
+    valid_event_points: tuple[tuple[str, str, float], ...] = ()
+    invalid_event_points: tuple[tuple[str, str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -883,21 +891,429 @@ def compare_waveform_edges(
 ) -> EdgeComparison | None:
     primary_edge = primary.snap_to_edge(x_hint, edge_type)
     secondary_edge = secondary.snap_to_edge(x_hint, edge_type)
-    if primary_edge is None or secondary_edge is None:
+
+    threshold_primary = (min(primary.y_values) + max(primary.y_values)) / 2 if primary.y_values else 0.0
+    threshold_secondary = (min(secondary.y_values) + max(secondary.y_values)) / 2 if secondary.y_values else 0.0
+    primary_crossings = _find_crossings(primary.x_values, primary.y_values, threshold_primary, edge_type)
+    secondary_crossings = _find_crossings(secondary.x_values, secondary.y_values, threshold_secondary, edge_type)
+
+    return _build_edge_comparison_from_crossings(
+        primary,
+        secondary,
+        primary_crossings,
+        secondary_crossings,
+        x_hint,
+        edge_type,
+        frequency_hz=frequency_hz,
+    )
+
+
+def compare_encoder_ab_edges(
+    primary: WaveformData,
+    secondary: WaveformData,
+    x_hint: float,
+    edge_type: str,
+    *,
+    frequency_hz: float | None = None,
+    minimum_edge_interval_s: float | None = None,
+) -> EdgeComparison | None:
+    validated_edges = _validated_encoder_crossings(
+        primary,
+        secondary,
+        minimum_edge_interval_s=minimum_edge_interval_s,
+    )
+    if validated_edges is None:
         return None
 
     if frequency_hz is None or frequency_hz <= 0:
+        primary_stats = primary.analyze()
+        secondary_stats = secondary.analyze()
+        primary_frequency_hz = primary_stats.estimated_frequency_hz
+        secondary_frequency_hz = secondary_stats.estimated_frequency_hz
+        if primary_frequency_hz and secondary_frequency_hz:
+            frequency_hz = (primary_frequency_hz + secondary_frequency_hz) / 2.0
+        else:
+            frequency_hz = primary_frequency_hz or secondary_frequency_hz
+
+    preferred = _build_edge_comparison_from_crossings(
+        primary,
+        secondary,
+        validated_edges["primary"][edge_type],
+        validated_edges["secondary"][edge_type],
+        x_hint,
+        edge_type,
+        frequency_hz=frequency_hz,
+    )
+    alternate_edge_type = "falling" if edge_type == "rising" else "rising"
+    alternate = _build_edge_comparison_from_crossings(
+        primary,
+        secondary,
+        validated_edges["primary"][alternate_edge_type],
+        validated_edges["secondary"][alternate_edge_type],
+        x_hint,
+        alternate_edge_type,
+        frequency_hz=frequency_hz,
+    )
+
+    if preferred is None and alternate is None:
+        return None
+    if preferred is None:
+        return alternate
+    if alternate is None:
+        return preferred
+
+    phase_deg = _circular_mean_degrees([preferred.phase_deg, alternate.phase_deg])
+    delta_t_s = statistics.mean([preferred.delta_t_s, alternate.delta_t_s])
+    chosen = preferred if abs(preferred.primary_time_s - x_hint) <= abs(alternate.primary_time_s - x_hint) else alternate
+    return EdgeComparison(
+        edge_type=edge_type,
+        primary_time_s=chosen.primary_time_s,
+        secondary_time_s=chosen.secondary_time_s,
+        delta_t_s=delta_t_s,
+        frequency_hz=preferred.frequency_hz if preferred.frequency_hz is not None else alternate.frequency_hz,
+        phase_deg=phase_deg,
+        valid_transition_count=validated_edges["valid_transition_count"],
+        invalid_transition_count=validated_edges["invalid_transition_count"],
+        confidence=_encoder_confidence_label(
+            validated_edges["valid_transition_count"],
+            validated_edges["invalid_transition_count"],
+        ),
+        raw_transition_count=validated_edges["raw_transition_count"],
+        debounce_filtered_count=validated_edges["debounce_filtered_count"],
+        sequence_discarded_count=validated_edges["sequence_discarded_count"],
+        valid_event_points=tuple(validated_edges["valid_event_points"]),
+        invalid_event_points=tuple(validated_edges["invalid_event_points"]),
+    )
+
+
+def _build_edge_comparison_from_crossings(
+    primary: WaveformData,
+    secondary: WaveformData,
+    primary_crossings: list[float],
+    secondary_crossings: list[float],
+    x_hint: float,
+    edge_type: str,
+    *,
+    frequency_hz: float | None = None,
+) -> EdgeComparison | None:
+    if not primary_crossings or not secondary_crossings:
+        return None
+
+    averaged_delta_t_s = _average_edge_delta(primary_crossings, secondary_crossings)
+    representative_pair = _representative_edge_pair(primary_crossings, secondary_crossings, x_hint)
+
+    if representative_pair is None:
+        return None
+
+    if averaged_delta_t_s is None:
+        averaged_delta_t_s = representative_pair[1] - representative_pair[0]
+
+    if frequency_hz is None or frequency_hz <= 0:
         frequency_hz = primary.analyze().estimated_frequency_hz
-    delta_t_s = secondary_edge[0] - primary_edge[0]
+    delta_t_s = averaged_delta_t_s
     phase_deg = _normalize_phase_degrees(delta_t_s * frequency_hz * 360.0) if frequency_hz and frequency_hz > 0 else None
     return EdgeComparison(
         edge_type=edge_type,
-        primary_time_s=primary_edge[0],
-        secondary_time_s=secondary_edge[0],
+        primary_time_s=representative_pair[0],
+        secondary_time_s=representative_pair[1],
         delta_t_s=delta_t_s,
         frequency_hz=frequency_hz,
         phase_deg=phase_deg,
+        confidence="普通",
     )
+
+def _validated_encoder_crossings(
+    primary: WaveformData,
+    secondary: WaveformData,
+    *,
+    minimum_edge_interval_s: float | None = None,
+) -> dict[str, dict[str, list[float]] | int] | None:
+    primary_events, primary_raw_count, primary_debounce_filtered = _build_encoder_channel_events(
+        primary,
+        channel_name="primary",
+        minimum_edge_interval_s=minimum_edge_interval_s,
+    )
+    secondary_events, secondary_raw_count, secondary_debounce_filtered = _build_encoder_channel_events(
+        secondary,
+        channel_name="secondary",
+        minimum_edge_interval_s=minimum_edge_interval_s,
+    )
+    if not primary_events or not secondary_events:
+        return None
+
+    raw_transition_count = primary_raw_count + secondary_raw_count
+    debounce_filtered_count = primary_debounce_filtered + secondary_debounce_filtered
+    candidate_events = sorted(primary_events + secondary_events, key=lambda event: event["time_s"])
+    if len(candidate_events) < 4:
+        return None
+    nominal_period_s = _encoder_nominal_period(primary, secondary)
+    ambiguous_spacing_s = max(
+        max(primary.analyze().sample_period_s, secondary.analyze().sample_period_s) * 2.5,
+        (nominal_period_s or 0.0) * 0.10,
+    )
+    candidate_events = _filter_ambiguous_encoder_events(candidate_events, ambiguous_spacing_s)
+    if len(candidate_events) < 4:
+        return None
+
+    primary_state = _digital_state_before_time(primary, candidate_events[0]["time_s"])
+    secondary_state = _digital_state_before_time(secondary, candidate_events[0]["time_s"])
+    initial_state = (secondary_state << 1) | primary_state
+
+    forward_count = 0
+    reverse_count = 0
+    trial_state = initial_state
+    for event in candidate_events:
+        step = _quadrature_step(trial_state, event["bit"])
+        if step > 0:
+            forward_count += 1
+        elif step < 0:
+            reverse_count += 1
+        trial_state ^= event["bit"]
+
+    if forward_count == 0 and reverse_count == 0:
+        return None
+    dominant_direction = 1 if forward_count >= reverse_count else -1
+
+    accepted_primary: dict[str, list[float]] = {"rising": [], "falling": []}
+    accepted_secondary: dict[str, list[float]] = {"rising": [], "falling": []}
+    accepted_count = 0
+    current_state = initial_state
+    valid_event_points: list[tuple[str, str, float]] = []
+    invalid_event_points: list[tuple[str, str, float]] = []
+    for event in candidate_events:
+        step = _quadrature_step(current_state, event["bit"])
+        if step != dominant_direction:
+            invalid_event_points.append((str(event["channel_name"]), str(event["edge_type"]), float(event["time_s"])))
+            continue
+        current_state ^= event["bit"]
+        accepted_count += 1
+        valid_event_points.append((str(event["channel_name"]), str(event["edge_type"]), float(event["time_s"])))
+        target = accepted_primary if event["channel_name"] == "primary" else accepted_secondary
+        target[event["edge_type"]].append(event["time_s"])
+
+    if accepted_count < 4:
+        return None
+    for edge_type in ("rising", "falling"):
+        if not accepted_primary[edge_type] or not accepted_secondary[edge_type]:
+            return None
+
+    sequence_discarded_count = max(len(candidate_events) - accepted_count, 0)
+    invalid_transition_count = sequence_discarded_count
+    return {
+        "primary": accepted_primary,
+        "secondary": accepted_secondary,
+        "valid_transition_count": accepted_count,
+        "invalid_transition_count": invalid_transition_count,
+        "raw_transition_count": raw_transition_count,
+        "debounce_filtered_count": debounce_filtered_count,
+        "sequence_discarded_count": sequence_discarded_count,
+        "valid_event_points": valid_event_points,
+        "invalid_event_points": invalid_event_points,
+    }
+
+
+def _build_encoder_channel_events(
+    waveform: WaveformData,
+    *,
+    channel_name: str,
+    minimum_edge_interval_s: float | None = None,
+) -> tuple[list[dict[str, object]], int, int]:
+    thresholds = _encoder_schmitt_thresholds(waveform)
+    if thresholds is None:
+        return [], 0, 0
+    rise_threshold, fall_threshold = thresholds
+    rising_crossings = _find_crossings(waveform.x_values, waveform.y_values, rise_threshold, "rising")
+    falling_crossings = _find_crossings(waveform.x_values, waveform.y_values, fall_threshold, "falling")
+    if not rising_crossings and not falling_crossings:
+        return [], 0, 0
+
+    nominal_period_s = _estimate_nominal_period(rising_crossings)
+    if nominal_period_s is None:
+        nominal_period_s = _estimate_nominal_period(falling_crossings)
+    auto_minimum_interval_s = max(waveform.analyze().sample_period_s * 8.0, (nominal_period_s or 0.0) * 0.15)
+    minimum_interval_s = auto_minimum_interval_s if minimum_edge_interval_s is None else max(minimum_edge_interval_s, waveform.analyze().sample_period_s * 2.0)
+
+    events = [
+        {"time_s": time_s, "edge_type": "rising", "channel_name": channel_name}
+        for time_s in rising_crossings
+    ] + [
+        {"time_s": time_s, "edge_type": "falling", "channel_name": channel_name}
+        for time_s in falling_crossings
+    ]
+    raw_event_count = len(events)
+    events.sort(key=lambda event: float(event["time_s"]))
+
+    filtered_events: list[dict[str, object]] = []
+    last_time_s: float | None = None
+    for event in events:
+        time_s = float(event["time_s"])
+        if last_time_s is not None and (time_s - last_time_s) < minimum_interval_s:
+            continue
+        filtered_events.append(event)
+        last_time_s = time_s
+
+    bit = 0b01 if channel_name == "primary" else 0b10
+    for event in filtered_events:
+        event["bit"] = bit
+    debounce_filtered_count = max(raw_event_count - len(filtered_events), 0)
+    return filtered_events, raw_event_count, debounce_filtered_count
+
+
+def _encoder_confidence_label(valid_transition_count: int, invalid_transition_count: int) -> str:
+    total = valid_transition_count + invalid_transition_count
+    if total <= 0:
+        return "低"
+    valid_ratio = valid_transition_count / total
+    if valid_transition_count >= 10 and valid_ratio >= 0.75:
+        return "高"
+    if valid_transition_count >= 6 and valid_ratio >= 0.50:
+        return "中"
+    return "低"
+
+
+def _encoder_schmitt_thresholds(waveform: WaveformData) -> tuple[float, float] | None:
+    stats = waveform.analyze()
+    amplitude = stats.logic_high_v - stats.logic_low_v
+    if amplitude <= 0:
+        return None
+    rise_threshold = stats.logic_low_v + amplitude * 0.65
+    fall_threshold = stats.logic_low_v + amplitude * 0.35
+    return rise_threshold, fall_threshold
+
+
+def _digital_state_before_time(waveform: WaveformData, time_s: float) -> int:
+    thresholds = _encoder_schmitt_thresholds(waveform)
+    if thresholds is None or not waveform.x_values or not waveform.y_values:
+        return 0
+    rise_threshold, fall_threshold = thresholds
+    midpoint = (rise_threshold + fall_threshold) / 2.0
+    state = 1 if waveform.y_values[0] >= midpoint else 0
+    limit = bisect.bisect_right(waveform.x_values, time_s)
+    for value in waveform.y_values[1:limit]:
+        if state == 0 and value >= rise_threshold:
+            state = 1
+        elif state == 1 and value <= fall_threshold:
+            state = 0
+    return state
+
+
+def _quadrature_step(current_state: int, bit: int) -> int:
+    next_state = current_state ^ bit
+    gray_cycle = (0b00, 0b01, 0b11, 0b10)
+    try:
+        current_index = gray_cycle.index(current_state)
+        next_index = gray_cycle.index(next_state)
+    except ValueError:
+        return 0
+    if next_index == (current_index + 1) % len(gray_cycle):
+        return 1
+    if next_index == (current_index - 1) % len(gray_cycle):
+        return -1
+    return 0
+
+
+def _estimate_nominal_period(crossings: list[float]) -> float | None:
+    if len(crossings) < 2:
+        return None
+    periods = [
+        crossings[index] - crossings[index - 1]
+        for index in range(1, len(crossings))
+        if crossings[index] > crossings[index - 1]
+    ]
+    if not periods:
+        return None
+    return statistics.median(periods)
+
+
+def _encoder_nominal_period(primary: WaveformData, secondary: WaveformData) -> float | None:
+    primary_stats = primary.analyze()
+    secondary_stats = secondary.analyze()
+    candidate_periods = []
+    if primary_stats.estimated_frequency_hz and primary_stats.estimated_frequency_hz > 0:
+        candidate_periods.append(1.0 / primary_stats.estimated_frequency_hz)
+    if secondary_stats.estimated_frequency_hz and secondary_stats.estimated_frequency_hz > 0:
+        candidate_periods.append(1.0 / secondary_stats.estimated_frequency_hz)
+    if not candidate_periods:
+        return None
+    return statistics.median(candidate_periods)
+
+
+def _filter_ambiguous_encoder_events(
+    events: list[dict[str, object]],
+    minimum_spacing_s: float,
+) -> list[dict[str, object]]:
+    if minimum_spacing_s <= 0 or len(events) < 2:
+        return events
+
+    filtered_events: list[dict[str, object]] = []
+    index = 0
+    while index < len(events):
+        current = events[index]
+        if index + 1 < len(events):
+            following = events[index + 1]
+            current_time = float(current["time_s"])
+            following_time = float(following["time_s"])
+            if (
+                str(current["channel_name"]) != str(following["channel_name"])
+                and (following_time - current_time) < minimum_spacing_s
+            ):
+                index += 2
+                continue
+        filtered_events.append(current)
+        index += 1
+    return filtered_events
+
+
+def _average_edge_delta(primary_crossings: list[float], secondary_crossings: list[float]) -> float | None:
+    aligned_pairs = _aligned_crossing_pairs(primary_crossings, secondary_crossings)
+    if not aligned_pairs:
+        return None
+    deltas = [secondary_time - primary_time for primary_time, secondary_time in aligned_pairs]
+    return statistics.median(deltas)
+
+
+def _representative_edge_pair(
+    primary_crossings: list[float],
+    secondary_crossings: list[float],
+    x_hint: float,
+) -> tuple[float, float] | None:
+    aligned_pairs = _aligned_crossing_pairs(primary_crossings, secondary_crossings)
+    if not aligned_pairs:
+        return None
+    return min(aligned_pairs, key=lambda pair: abs(((pair[0] + pair[1]) / 2.0) - x_hint))
+
+
+def _aligned_crossing_pairs(primary_crossings: list[float], secondary_crossings: list[float]) -> list[tuple[float, float]]:
+    if not primary_crossings or not secondary_crossings:
+        return []
+
+    best_pairs: list[tuple[float, float]] = []
+    best_score: float | None = None
+    max_offset = min(3, len(primary_crossings) - 1, len(secondary_crossings) - 1)
+    for offset in range(-max_offset, max_offset + 1):
+        if offset >= 0:
+            primary_slice = primary_crossings[: len(secondary_crossings) - offset]
+            secondary_slice = secondary_crossings[offset : offset + len(primary_slice)]
+        else:
+            secondary_slice = secondary_crossings[: len(primary_crossings) + offset]
+            primary_slice = primary_crossings[-offset : -offset + len(secondary_slice)]
+        if not primary_slice or not secondary_slice:
+            continue
+        pair_count = min(len(primary_slice), len(secondary_slice))
+        pairs = list(zip(primary_slice[:pair_count], secondary_slice[:pair_count]))
+        if pair_count < 2:
+            continue
+        deltas = [secondary_time - primary_time for primary_time, secondary_time in pairs]
+        score = abs(statistics.median(deltas))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_pairs = pairs
+
+    if best_pairs:
+        return best_pairs
+
+    pair_count = min(len(primary_crossings), len(secondary_crossings))
+    return list(zip(primary_crossings[:pair_count], secondary_crossings[:pair_count]))
 
 
 def _normalize_phase_degrees(phase_deg: float) -> float:
@@ -905,6 +1321,17 @@ def _normalize_phase_degrees(phase_deg: float) -> float:
     if normalized == -180.0 and phase_deg > 0:
         return 180.0
     return normalized
+
+
+def _circular_mean_degrees(values: list[float | None]) -> float | None:
+    valid_values = [value for value in values if value is not None]
+    if not valid_values:
+        return None
+    sin_sum = sum(math.sin(math.radians(value)) for value in valid_values)
+    cos_sum = sum(math.cos(math.radians(value)) for value in valid_values)
+    if abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12:
+        return None
+    return _normalize_phase_degrees(math.degrees(math.atan2(sin_sum, cos_sum)))
 
 
 def _parse_bundle_section_header(header: str) -> dict[str, str]:

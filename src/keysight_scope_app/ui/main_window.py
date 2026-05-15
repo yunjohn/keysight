@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -54,10 +55,17 @@ from keysight_scope_app.analysis.waveform import WaveformData, WaveformStats
 from keysight_scope_app import __version__
 from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeTestDialog
 from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
-from keysight_scope_app.ui.helpers import display_channel_name, normalize_channel_name
+from keysight_scope_app.ui.helpers import (
+    apply_responsive_window_geometry,
+    configure_high_dpi_policy,
+    create_scroll_area,
+    display_channel_name,
+    normalize_channel_name,
+)
 
 
 CAPTURE_DIR = Path("captures")
+SCREENSHOT_DIR = CAPTURE_DIR / "screenshots"
 WAVEFORM_DIR = Path("captures") / "waveforms"
 UI_STATE_PATH = CAPTURE_DIR / "ui_state.json"
 MAX_LOG_LINES = 300
@@ -168,7 +176,9 @@ class ScopeMainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        self.setCentralWidget(central)
+        self.setCentralWidget(
+            create_scroll_area(self, central, minimum_px=1100, minimum_chars=130)
+        )
 
         root = QHBoxLayout(central)
         root.setContentsMargins(16, 16, 16, 16)
@@ -219,15 +229,16 @@ class ScopeMainWindow(QMainWindow):
         self.error_button = QPushButton("读取错误")
 
         connection_layout.addWidget(QLabel("资源地址"), 0, 0)
-        connection_layout.addWidget(self.resource_combo, 0, 1)
-        connection_layout.addWidget(self.refresh_button, 0, 2)
-        connection_layout.addWidget(self.connect_button, 0, 3)
-        connection_layout.addWidget(self.disconnect_button, 0, 4)
-        connection_layout.addWidget(self.error_button, 0, 5)
+        connection_layout.addWidget(self.resource_combo, 0, 1, 1, 5)
+        connection_layout.addWidget(self.refresh_button, 1, 1)
+        connection_layout.addWidget(self.connect_button, 1, 2)
+        connection_layout.addWidget(self.disconnect_button, 1, 3)
+        connection_layout.addWidget(self.error_button, 1, 4)
+        connection_layout.setColumnStretch(1, 1)
 
         self.resource_hint = QLabel("提示：优先选择带真实序列号的资源地址。")
         self.resource_hint.setWordWrap(True)
-        connection_layout.addWidget(self.resource_hint, 1, 0, 1, 6)
+        connection_layout.addWidget(self.resource_hint, 2, 0, 1, 6)
         left_panel.addWidget(connection_box)
 
         acquire_box = self._group_box("采集控制")
@@ -295,13 +306,13 @@ class ScopeMainWindow(QMainWindow):
         trigger_form_layout.addWidget(self.trigger_sweep_combo, 1, 3)
 
         trigger_action_bar = QWidget()
-        trigger_action_layout = QHBoxLayout(trigger_action_bar)
+        trigger_action_layout = QGridLayout(trigger_action_bar)
         trigger_action_layout.setContentsMargins(0, 0, 0, 0)
-        trigger_action_layout.setSpacing(8)
-        trigger_action_layout.addWidget(self.read_trigger_status_button)
-        trigger_action_layout.addWidget(self.single_trigger_button)
-        trigger_action_layout.addWidget(self.standard_mode_button)
-        trigger_action_layout.addStretch(1)
+        trigger_action_layout.setHorizontalSpacing(8)
+        trigger_action_layout.setVerticalSpacing(6)
+        trigger_action_layout.addWidget(self.read_trigger_status_button, 0, 0)
+        trigger_action_layout.addWidget(self.single_trigger_button, 0, 1)
+        trigger_action_layout.addWidget(self.standard_mode_button, 1, 0, 1, 2)
 
         trigger_status_card = QFrame()
         trigger_status_card.setFrameShape(QFrame.StyledPanel)
@@ -471,13 +482,17 @@ class ScopeMainWindow(QMainWindow):
         screenshot_box = self._group_box("截图")
         screenshot_layout = QVBoxLayout(screenshot_box)
         screenshot_action_row = QHBoxLayout()
-        self.capture_button = QPushButton("一键截图")
-        self.copy_capture_button = QPushButton("复制截图")
-        self.copy_capture_button.setEnabled(False)
+        self.capture_button = QPushButton("一键截图并复制")
+        self.screenshot_prefix_input = QLineEdit()
+        self.screenshot_prefix_input.setPlaceholderText("截图前缀，例如 电机A")
+        self.screenshot_prefix_input.setClearButtonEnabled(True)
+        screenshot_action_row.addWidget(QLabel("截图前缀"))
+        screenshot_action_row.addWidget(self.screenshot_prefix_input, 1)
         screenshot_action_row.addWidget(self.capture_button)
-        screenshot_action_row.addWidget(self.copy_capture_button)
-        screenshot_action_row.addStretch(1)
         screenshot_layout.addLayout(screenshot_action_row)
+        self.screenshot_path_hint = QLabel("保存目录：captures/screenshots/default/")
+        self.screenshot_path_hint.setWordWrap(True)
+        screenshot_layout.addWidget(self.screenshot_path_hint)
         self.preview_label = QLabel("暂无截图预览")
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setFrameShape(QFrame.StyledPanel)
@@ -524,8 +539,8 @@ class ScopeMainWindow(QMainWindow):
         self.run_button.clicked.connect(self.run_scope)
         self.stop_button.clicked.connect(self.stop_scope)
         self.capture_button.clicked.connect(self.capture_screenshot)
-        self.copy_capture_button.clicked.connect(self.copy_screenshot_to_clipboard)
         self.preview_label.customContextMenuRequested.connect(self._show_preview_context_menu)
+        self.screenshot_prefix_input.textChanged.connect(self._on_screenshot_prefix_changed)
         self.read_trigger_status_button.clicked.connect(self.read_trigger_status)
         self.single_trigger_button.clicked.connect(self.arm_single_trigger)
         self.standard_mode_button.clicked.connect(self.toggle_timebase_mode)
@@ -566,6 +581,7 @@ class ScopeMainWindow(QMainWindow):
             "acquire_type": str(self.acquire_type_combo.currentData()),
             "waveform_mode": self.waveform_mode_combo.currentText(),
             "waveform_points": int(self.waveform_points_input.value()),
+            "screenshot_prefix": self.screenshot_prefix_input.text(),
             "recent_waveforms": list(self.recent_waveform_paths),
             "trigger": {
                 "source": str(self.trigger_source_combo.currentData()),
@@ -603,6 +619,9 @@ class ScopeMainWindow(QMainWindow):
         waveform_points = payload.get("waveform_points")
         if isinstance(waveform_points, (int, float)):
             self.waveform_points_input.setValue(int(waveform_points))
+        screenshot_prefix = payload.get("screenshot_prefix")
+        if isinstance(screenshot_prefix, str):
+            self.screenshot_prefix_input.setText(screenshot_prefix)
         recent_waveforms = payload.get("recent_waveforms")
         if isinstance(recent_waveforms, list):
             self.recent_waveform_paths = [
@@ -621,6 +640,7 @@ class ScopeMainWindow(QMainWindow):
                 sweep=str(trigger_payload.get("sweep", self.trigger_sweep_combo.currentData())),
             )
             self._apply_trigger_settings_to_controls(settings)
+        self._update_screenshot_path_hint()
     def _apply_trigger_settings_to_controls(self, settings: EdgeTriggerSettings) -> None:
         source_index = self.trigger_source_combo.findData(settings.source)
         slope_index = self.trigger_slope_combo.findData(settings.slope)
@@ -762,23 +782,13 @@ class ScopeMainWindow(QMainWindow):
             label.setAlignment(label.alignment() | Qt.AlignVCenter)
 
     def _apply_initial_window_geometry(self) -> None:
-        self.adjustSize()
-        size_hint = self.sizeHint().expandedTo(self.minimumSizeHint())
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            available = screen.availableGeometry()
-            max_width = max(available.width() - 40, 960)
-            max_height = max(available.height() - 60, 720)
-        else:
-            max_width = 1600
-            max_height = 1000
-
-        target_width = min(size_hint.width() + 180, max_width)
-        target_height = min(size_hint.height() + 24, max_height)
-        minimum_width = min(max(1280, size_hint.width()), target_width)
-        minimum_height = min(max(840, size_hint.height()), target_height)
-        self.setMinimumSize(minimum_width, minimum_height)
-        self.resize(target_width, target_height)
+        apply_responsive_window_geometry(
+            self,
+            minimum_width=900,
+            minimum_height=620,
+            extra_width=180,
+            extra_height=24,
+        )
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1056,7 +1066,10 @@ class ScopeMainWindow(QMainWindow):
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        target = CAPTURE_DIR / f"scope_{timestamp}.png"
+        folder_name, file_prefix = self._current_screenshot_storage_names()
+        target_dir = SCREENSHOT_DIR / folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{file_prefix}_{timestamp}.png"
         self.log("正在抓取屏幕截图。")
         self._run_task(
             lambda: scope.capture_screenshot(target),
@@ -1068,9 +1081,10 @@ class ScopeMainWindow(QMainWindow):
     def _on_screenshot_saved(self, image_path: Path) -> None:
         self.last_capture_path = image_path
         self.capture_value.setText(str(image_path))
-        self.copy_capture_button.setEnabled(True)
         self.log(f"截图已保存: {image_path}")
         self._update_preview(image_path)
+        self.copy_screenshot_to_clipboard(show_warning=False, write_log=False)
+        self.log("截图已复制到剪贴板。")
 
     def fetch_waveform(self) -> None:
         scope = self._get_scope_or_warn()
@@ -1379,16 +1393,20 @@ class ScopeMainWindow(QMainWindow):
         self.preview_label.setText("")
         self.preview_label.setPixmap(scaled)
 
-    def copy_screenshot_to_clipboard(self) -> None:
+    def copy_screenshot_to_clipboard(self, *, show_warning: bool = True, write_log: bool = True) -> bool:
         if self.last_capture_path is None or not self.last_capture_path.exists():
-            self._show_warning("当前没有可复制的截图。")
-            return
+            if show_warning:
+                self._show_warning("当前没有可复制的截图。")
+            return False
         pixmap = QPixmap(str(self.last_capture_path))
         if pixmap.isNull():
-            self._show_warning("截图文件无法读取，不能复制。")
-            return
+            if show_warning:
+                self._show_warning("截图文件无法读取，不能复制。")
+            return False
         QApplication.clipboard().setPixmap(pixmap)
-        self.log("截图已复制到剪贴板。")
+        if write_log:
+            self.log("截图已复制到剪贴板。")
+        return True
 
     def _show_preview_context_menu(self, position) -> None:
         menu = QMenu(self)
@@ -1397,6 +1415,26 @@ class ScopeMainWindow(QMainWindow):
         chosen = menu.exec(self.preview_label.mapToGlobal(position))
         if chosen is copy_action:
             self.copy_screenshot_to_clipboard()
+
+    def _on_screenshot_prefix_changed(self) -> None:
+        self._update_screenshot_path_hint()
+        self._save_ui_state()
+
+    @staticmethod
+    def _sanitize_storage_component(raw_text: str) -> str:
+        sanitized = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in raw_text.strip())
+        sanitized = "_".join(part for part in sanitized.replace("\t", " ").split() if part)
+        return sanitized[:60]
+
+    def _current_screenshot_storage_names(self) -> tuple[str, str]:
+        sanitized_prefix = self._sanitize_storage_component(self.screenshot_prefix_input.text())
+        if not sanitized_prefix:
+            return ("default", "scope")
+        return (sanitized_prefix, sanitized_prefix)
+
+    def _update_screenshot_path_hint(self) -> None:
+        folder_name, _ = self._current_screenshot_storage_names()
+        self.screenshot_path_hint.setText(f"保存目录：{SCREENSHOT_DIR / folder_name}")
 
     def _on_waveforms_fetched(self, waveforms: list[WaveformData], *, source_path: Path | None = None) -> None:
         self._apply_fetched_waveforms(
@@ -2053,7 +2091,10 @@ class ScopeMainWindow(QMainWindow):
 
 
 def main() -> None:
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication.instance()
+    if app is None:
+        configure_high_dpi_policy()
+        app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setWindowIcon(build_app_icon())
     window = ScopeMainWindow()
