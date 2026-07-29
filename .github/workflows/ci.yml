@@ -26,3 +26,9 @@ jobs:
         run: python -m pytest -q
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean KeysightScopeApp-OneFile.spec
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeysightScopeApp-OneFile-v1.0.2
+          path: dist/KeysightScopeApp-OneFile.exe
+          if-no-files-found: error
