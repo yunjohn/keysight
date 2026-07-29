@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication, QFrame, QScrollArea, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QAbstractSpinBox,
+    QComboBox,
+    QFrame,
+    QLineEdit,
+    QPushButton,
+    QScrollArea,
+    QWidget,
+)
 
 
 def configure_high_dpi_policy() -> None:
@@ -30,6 +39,39 @@ def create_scroll_area(
     scroll_area.setFrameShape(QFrame.NoFrame)
     scroll_area.setWidget(content)
     return scroll_area
+
+
+def set_uniform_control_height(
+    container: QWidget,
+    *,
+    height: int | None = None,
+) -> None:
+    if height is None:
+        combo_heights = [
+            combo.sizeHint().height()
+            for combo in container.findChildren(QComboBox)
+        ]
+        height = max(combo_heights) if combo_heights else 24
+
+    for button in container.findChildren(QPushButton):
+        button.setAutoDefault(False)
+        button.setDefault(False)
+        button.setMinimumHeight(height)
+
+
+def set_equal_button_widths(
+    *buttons: QPushButton,
+    minimum_width: int | None = None,
+) -> None:
+    visible_buttons = [button for button in buttons if button is not None]
+    if not visible_buttons:
+        return
+    width = max(button.sizeHint().width() for button in visible_buttons)
+    if minimum_width is not None:
+        width = max(width, minimum_width)
+    for button in visible_buttons:
+        button.setMinimumWidth(width)
+        button.setMaximumWidth(width)
 
 
 def apply_responsive_window_geometry(

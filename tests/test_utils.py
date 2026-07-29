@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -14,9 +15,11 @@ from keysight_scope_app.device.instrument import (
     compare_encoder_ab_edges,
     compare_waveform_edges,
 )
-from keysight_scope_app.ui.dialogs import waveform as waveform_dialog_module
-from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
 from keysight_scope_app.ui import main_window as main_window_module
+from keysight_scope_app.ui.dialogs import waveform as waveform_dialog_module
+from keysight_scope_app.ui.dialogs import startup_brake as startup_brake_dialog_module
+from keysight_scope_app.ui.dialogs.startup_brake import StartupBrakeArchiveSource, StartupBrakeTestDialog
+from keysight_scope_app.ui.dialogs.waveform import WaveformDetailDialog
 from keysight_scope_app.ui.main_window import ScopeMainWindow
 from keysight_scope_app.ui.panels.waveform import _should_apply_scope_vertical_layouts
 from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
@@ -429,6 +432,68 @@ def test_main_window_channel_unit_manual_override_takes_precedence() -> None:
         window.close()
 
 
+def test_main_window_delete_current_resource_removes_selected_address() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window.resource_combo.addItems(("USB::FIRST::INSTR", "USB::SECOND::INSTR"))
+        window.resource_combo.setCurrentText("USB::FIRST::INSTR")
+
+        window._delete_current_resource()
+
+        assert window.resource_combo.findText("USB::FIRST::INSTR") == -1
+        assert window.resource_combo.findText("USB::SECOND::INSTR") >= 0
+    finally:
+        window.close()
+
+
+def test_main_window_delete_current_resource_clears_typed_address() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window.resource_combo.addItem("USB::KNOWN::INSTR")
+        window.resource_combo.setCurrentText("TCPIP0::192.0.2.10::INSTR")
+
+        window._delete_current_resource()
+
+        assert window.resource_combo.currentText() == ""
+        assert window.resource_combo.findText("USB::KNOWN::INSTR") >= 0
+    finally:
+        window.close()
+
+
+def test_main_window_refresh_restores_deleted_resource() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window.resource_combo.addItem("USB::CONNECTED::INSTR")
+        window.resource_combo.setCurrentText("USB::CONNECTED::INSTR")
+        window._delete_current_resource()
+
+        assert window.resource_combo.findText("USB::CONNECTED::INSTR") == -1
+
+        window._on_resources_loaded(("USB::CONNECTED::INSTR",))
+
+        assert window.resource_combo.findText("USB::CONNECTED::INSTR") >= 0
+        assert window.resource_combo.currentText() == "USB::CONNECTED::INSTR"
+    finally:
+        window.close()
+
+
+def test_main_window_formats_visa_controller_error_message() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        error = VisaIOError(-1073807264)
+
+        assert window._is_visa_controller_error(error)
+        message = window._visa_controller_error_message(error)
+        assert "VISA 接口没有拿到设备控制权" in message
+        assert "刷新资源" in message
+    finally:
+        window.close()
+
+
 def test_get_edge_trigger_settings_reads_scope_values() -> None:
     class FakeScope(KeysightOscilloscope):
         def __init__(self) -> None:
@@ -595,6 +660,151 @@ def test_main_window_persists_waveform_mode_and_points(tmp_path: Path) -> None:
         second.close()
     finally:
         main_window_module.UI_STATE_PATH = original_ui_state_path
+
+
+def test_startup_brake_project_name_is_sanitized_and_defaults() -> None:
+    assert StartupBrakeTestDialog.sanitize_project_name("") == "default"
+    assert StartupBrakeTestDialog.sanitize_project_name("  项目 A  ") == "项目_A"
+    assert StartupBrakeTestDialog.sanitize_project_name('项目<>:"/\\|?* A.') == "项目__________A"
+    assert StartupBrakeTestDialog.sanitize_project_name("CON") == "_CON"
+    assert len(StartupBrakeTestDialog.sanitize_project_name("x" * 80)) == 60
+
+
+def test_startup_brake_archive_number_ignores_legacy_and_uses_highest(tmp_path: Path) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "test_0001").mkdir()
+    (project_dir / "test_0004").mkdir()
+    (project_dir / "test_bad").mkdir()
+    (project_dir / "20260403_144341").mkdir()
+    (project_dir / "test_9999.txt").write_text("", encoding="utf-8")
+
+    assert StartupBrakeTestDialog._next_archive_test_number(project_dir) == 5
+    assert StartupBrakeTestDialog._next_archive_test_number(tmp_path / "other") == 1
+
+
+def test_main_window_persists_startup_brake_archive_settings(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_ui_state_path = main_window_module.UI_STATE_PATH
+    main_window_module.UI_STATE_PATH = tmp_path / "ui_state.json"
+    try:
+        first = ScopeMainWindow()
+        first.startup_brake_dialog.project_name_input.setText("电机项目 A")
+        first.startup_brake_dialog.archive_snapshots_check.setChecked(False)
+        first._save_ui_state()
+        first.close()
+
+        second = ScopeMainWindow()
+        assert second.startup_brake_dialog.project_name_input.text() == "电机项目 A"
+        assert not second.startup_brake_dialog.archive_snapshots_check.isChecked()
+        second.close()
+    finally:
+        main_window_module.UI_STATE_PATH = original_ui_state_path
+
+
+def test_main_window_defaults_startup_brake_archive_to_enabled(tmp_path: Path) -> None:
+    app = QApplication.instance() or QApplication([])
+    original_ui_state_path = main_window_module.UI_STATE_PATH
+    main_window_module.UI_STATE_PATH = tmp_path / "ui_state.json"
+    main_window_module.UI_STATE_PATH.write_text("{}", encoding="utf-8")
+    try:
+        window = ScopeMainWindow()
+        assert window.startup_brake_dialog.current_project_name() == "default"
+        assert window.startup_brake_dialog.archive_snapshots_check.isChecked()
+        window.close()
+    finally:
+        main_window_module.UI_STATE_PATH = original_ui_state_path
+
+
+def test_startup_brake_uses_grouped_aligned_test_layout() -> None:
+    QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        dialog = window.startup_brake_dialog
+        assert dialog.archive_box.title() == "自动归档"
+        assert dialog.brake_box.title() == "刹车判定"
+        assert dialog.action_box.title() == "测试操作"
+
+        expected_positions = {
+            dialog.brake_mode_field: (0, 0),
+            dialog.zero_threshold_field: (0, 1),
+            dialog.flat_threshold_field: (0, 2),
+            dialog.zero_hold_field: (0, 3),
+            dialog.backtrack_field: (1, 0),
+            dialog.backtrack_min_step_field: (1, 1),
+            dialog.backtrack_min_interval_field: (1, 2),
+            dialog.brake_low_hold_field: (1, 3),
+            dialog.brake_min_fall_field: (2, 0),
+            dialog.brake_max_fall_field: (2, 1),
+        }
+        for widget, expected_position in expected_positions.items():
+            item_index = dialog.brake_grid.indexOf(widget)
+            row, column, row_span, column_span = dialog.brake_grid.getItemPosition(item_index)
+            assert (row, column) == expected_position
+            assert (row_span, column_span) == (1, 1)
+
+        assert dialog.primary_action_row.indexOf(dialog.run_button) >= 0
+        assert dialog.primary_action_row.indexOf(dialog.simulate_button) >= 0
+        assert dialog.export_action_row.indexOf(dialog.export_report_button) >= 0
+        assert dialog.auxiliary_action_row.indexOf(dialog.clear_stats_button) >= 0
+    finally:
+        window.close()
+
+
+def test_startup_brake_archive_writes_snapshots_waveforms_and_metadata(tmp_path: Path) -> None:
+    QApplication.instance() or QApplication([])
+    original_archive_dir = startup_brake_dialog_module.STARTUP_BRAKE_SCREENSHOT_DIR
+    startup_brake_dialog_module.STARTUP_BRAKE_SCREENSHOT_DIR = tmp_path / "snapshots"
+    window = ScopeMainWindow()
+    try:
+        dialog = window.startup_brake_dialog
+        dialog.project_name_input.setText("项目 A")
+        waveforms = _build_startup_brake_waveforms()
+        config = StartupBrakeTestConfig(
+            control_channel="CHANnel1",
+            speed_channel="CHANnel2",
+            current_channel="CHANnel3",
+            encoder_a_channel="CHANnel4",
+            speed_target_mode="frequency_hz",
+            speed_target_value=100.0,
+            speed_consecutive_periods=2,
+            zero_current_threshold_a=0.05,
+            brake_mode="current_zero",
+        )
+        result = analyze_startup_brake_test(waveforms, config)
+        dialog._last_analysis_waveforms = waveforms
+        window.sync_waveform_detail_dialog = lambda **kwargs: None
+
+        def export_snapshot(output_path: Path, **kwargs) -> bool:
+            output_path.write_bytes(b"png")
+            return True
+
+        window.waveform_detail_dialog.export_standardized_snapshot = export_snapshot
+        dialog._archive_test_run(result, config, StartupBrakeArchiveSource("simulation_file", "input.csv"))
+
+        archive_dir = tmp_path / "snapshots" / "项目_A" / "test_0001"
+        assert {path.name for path in archive_dir.iterdir()} == {
+            "startup.png",
+            "brake.png",
+            "overview.png",
+            "waveforms.csv",
+            "metadata.json",
+        }
+        metadata = json.loads((archive_dir / "metadata.json").read_text(encoding="utf-8"))
+        assert metadata["project"] == "项目_A"
+        assert metadata["test_number"] == 1
+        assert metadata["source"] == {"kind": "simulation_file", "path": "input.csv"}
+        assert set(metadata["files"]) == {
+            "startup.png",
+            "brake.png",
+            "overview.png",
+            "waveforms.csv",
+            "metadata.json",
+        }
+        assert metadata["errors"] == []
+    finally:
+        window.close()
+        startup_brake_dialog_module.STARTUP_BRAKE_SCREENSHOT_DIR = original_archive_dir
 
 
 def test_main_window_persists_trigger_settings(tmp_path: Path) -> None:

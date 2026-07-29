@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PySide6.QtCharts import QChart, QChartView, QLineSeries, QScatterSeries, QValueAxis
 from PySide6.QtCore import QPoint, QPointF, QRect, QTimer, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -34,19 +34,15 @@ from keysight_scope_app.analysis.waveform import (
     compare_waveform_edges,
 )
 from keysight_scope_app.ui.helpers import display_channel_name
+from keysight_scope_app.ui.waveform_theme import (
+    INSTRUMENT_DARK_THEME,
+    InteractionTool,
+    WaveformTheme,
+)
 from keysight_scope_app.utils import format_engineering_value
 
 
 WAVEFORM_IMAGE_DIR = Path("captures") / "waveform_images"
-WAVEFORM_SERIES_COLORS = ("#2d9cdb", "#eb5757", "#27ae60", "#f2994a")
-CURSOR_A_COLOR = "#c2185b"
-CURSOR_B_COLOR = "#6a1b9a"
-CROSSHAIR_COLOR = "#455a64"
-CROSSHAIR_LABEL_COLOR = "#1f2933"
-LOCK_ANNOTATION_COLOR = "#264653"
-SMART_PREVIEW_COLOR = "#d4a017"
-ENCODER_PHASE_VALID_COLOR = "#2e7d32"
-ENCODER_PHASE_INVALID_COLOR = "#c62828"
 RAW_RENDER_POINT_THRESHOLD = 10000
 WAVEFORM_REDRAW_DEBOUNCE_MS = 40
 
@@ -70,6 +66,9 @@ class InteractiveChartView(QChartView):
         self.drag_move_callback = None
         self.drag_end_callback = None
         self.reset_view_callback = None
+        self.selection_span_callback = None
+        self.interaction_tool = InteractionTool.ZOOM
+        self.theme = INSTRUMENT_DARK_THEME
         self.default_x_range: tuple[float, float] | None = None
         self.default_y_range: tuple[float, float] | None = None
         self._drag_callback_active = False
@@ -82,7 +81,7 @@ class InteractiveChartView(QChartView):
         self.setRubberBand(QChartView.NoRubberBand)
         self._selection_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
 
-        pen = QPen(QColor(CROSSHAIR_COLOR))
+        pen = QPen(QColor(self.theme.crosshair))
         pen.setWidth(1)
         pen.setStyle(Qt.DashLine)
         self.crosshair_x = QGraphicsLineItem()
@@ -90,7 +89,7 @@ class InteractiveChartView(QChartView):
         self.crosshair_y = QGraphicsLineItem()
         self.crosshair_y.setPen(pen)
         self.crosshair_label = QGraphicsSimpleTextItem()
-        self.crosshair_label.setBrush(QColor(CROSSHAIR_LABEL_COLOR))
+        self.crosshair_label.setBrush(QColor(self.theme.primary_text))
         self.crosshair_label.setVisible(False)
         self.chart().scene().addItem(self.crosshair_x)
         self.chart().scene().addItem(self.crosshair_y)
@@ -113,6 +112,10 @@ class InteractiveChartView(QChartView):
                 return
         if self._selection_active:
             self._update_selection_band(event.position())
+            if self.selection_span_callback is not None and self._selection_origin is not None:
+                origin_value = self.chart().mapToValue(self._selection_origin)
+                current_value = self.chart().mapToValue(event.position().toPoint())
+                self.selection_span_callback(abs(current_value.x() - origin_value.x()))
             self._update_crosshair(event.position())
             event.accept()
             return
@@ -148,7 +151,10 @@ class InteractiveChartView(QChartView):
         if event.button() == Qt.LeftButton:
             position = event.position()
             value, inside_plot = self._map_position_to_plot_value(position)
-            if inside_plot and event.modifiers() & Qt.ShiftModifier:
+            if inside_plot and (
+                event.modifiers() & Qt.ShiftModifier
+                or self.interaction_tool is InteractionTool.PAN
+            ):
                 self._pan_active = True
                 self._pan_last_position = QPointF(position)
                 event.accept()
@@ -162,7 +168,7 @@ class InteractiveChartView(QChartView):
                     self._drag_callback_active = True
                     event.accept()
                     return
-            if inside_plot:
+            if inside_plot and self.interaction_tool is InteractionTool.ZOOM:
                 self._selection_origin = position.toPoint()
                 self._selection_active = True
                 self._update_selection_band(position)
@@ -170,6 +176,26 @@ class InteractiveChartView(QChartView):
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def set_interaction_tool(self, tool: InteractionTool) -> None:
+        self.interaction_tool = tool
+        if tool is InteractionTool.PAN:
+            self.setCursor(Qt.OpenHandCursor)
+        elif tool in {InteractionTool.CURSOR_A, InteractionTool.CURSOR_B}:
+            self.setCursor(Qt.CrossCursor)
+        elif tool is InteractionTool.ANNOTATE:
+            self.setCursor(Qt.PointingHandCursor)
+        else:
+            self.setCursor(Qt.CrossCursor)
+
+    def set_theme(self, theme: WaveformTheme) -> None:
+        self.theme = theme
+        pen = QPen(QColor(theme.crosshair))
+        pen.setWidth(1)
+        pen.setStyle(Qt.DashLine)
+        self.crosshair_x.setPen(pen)
+        self.crosshair_y.setPen(pen)
+        self.crosshair_label.setBrush(QColor(theme.primary_text))
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         if event.button() == Qt.RightButton:
@@ -360,6 +386,8 @@ class WaveformAnalysisPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self.compact_mode = compact_mode
+        self.theme = INSTRUMENT_DARK_THEME
+        self.interaction_tool = InteractionTool.ZOOM
         self.current_waveforms: list[WaveformData] = []
         self.current_waveform: WaveformData | None = None
         self.current_stats: WaveformStats | None = None
@@ -367,6 +395,7 @@ class WaveformAnalysisPanel(QWidget):
         self.scope_vertical_layouts: dict[str, dict[str, float]] = {}
         self.waveform_series: QLineSeries | None = None
         self.waveform_series_map: dict[str, QLineSeries] = {}
+        self.reference_series_map: dict[str, QLineSeries] = {}
         self.waveform_source_map: dict[str, tuple[list[float], list[float]]] = {}
         self.waveform_decimated_map: dict[str, tuple[list[float], list[float]]] = {}
         self.encoder_phase_valid_series: QScatterSeries | None = None
@@ -389,6 +418,7 @@ class WaveformAnalysisPanel(QWidget):
         self.cursor_readout_changed = None
         self.view_window_changed = None
         self.channel_comparison_changed = None
+        self.annotation_requested = None
         self.current_edge_comparison: EdgeComparison | None = None
         self.current_edge_comparison_message: str | None = None
         self.current_edge_comparison_mode = "general"
@@ -442,6 +472,7 @@ class WaveformAnalysisPanel(QWidget):
         self.chart.legend().hide()
         self.chart.setTitle(title)
         self.chart_view = InteractiveChartView(self.chart)
+        self.chart_view.set_theme(self.theme)
         self.chart_view.point_click_callback = self._handle_chart_click
         self.chart_view.hover_cursor_callback = self._hover_cursor_shape
         self.chart_view.hover_leave_callback = self._hide_smart_preview
@@ -696,9 +727,9 @@ class WaveformAnalysisPanel(QWidget):
         self.compare_channel_combo.currentIndexChanged.connect(lambda _: self._update_channel_comparison())
         self.compare_edge_combo.currentIndexChanged.connect(lambda _: self._update_channel_comparison())
 
-        cursor_pen_a = QPen(QColor(CURSOR_A_COLOR))
+        cursor_pen_a = QPen(QColor(self.theme.cursor_a))
         cursor_pen_a.setWidth(2)
-        cursor_pen_b = QPen(QColor(CURSOR_B_COLOR))
+        cursor_pen_b = QPen(QColor(self.theme.cursor_b))
         cursor_pen_b.setWidth(2)
         self.cursor_line_items = {
             "a": QGraphicsLineItem(),
@@ -724,10 +755,10 @@ class WaveformAnalysisPanel(QWidget):
             "a": QGraphicsSimpleTextItem(),
             "b": QGraphicsSimpleTextItem(),
         }
-        self.cursor_text_items["a"].setBrush(QColor(CURSOR_A_COLOR))
-        self.cursor_text_items["b"].setBrush(QColor(CURSOR_B_COLOR))
-        self.cursor_mode_items["a"].setBrush(QColor(CURSOR_A_COLOR))
-        self.cursor_mode_items["b"].setBrush(QColor(CURSOR_B_COLOR))
+        self.cursor_text_items["a"].setBrush(QColor(self.theme.cursor_a))
+        self.cursor_text_items["b"].setBrush(QColor(self.theme.cursor_b))
+        self.cursor_mode_items["a"].setBrush(QColor(self.theme.cursor_a))
+        self.cursor_mode_items["b"].setBrush(QColor(self.theme.cursor_b))
         for key in ("a", "b"):
             self.chart.scene().addItem(self.cursor_line_items[key])
             self.chart.scene().addItem(self.cursor_hline_items[key])
@@ -735,23 +766,23 @@ class WaveformAnalysisPanel(QWidget):
             self.chart.scene().addItem(self.cursor_text_items[key])
             self.chart.scene().addItem(self.cursor_mode_items[key])
 
-        annotation_pen = QPen(QColor(LOCK_ANNOTATION_COLOR))
+        annotation_pen = QPen(QColor(self.theme.annotation))
         annotation_pen.setWidth(2)
         self.lock_annotation_line = QGraphicsLineItem()
         self.lock_annotation_line.setPen(annotation_pen)
         self.lock_annotation_text_item = QGraphicsSimpleTextItem()
-        self.lock_annotation_text_item.setBrush(QColor(LOCK_ANNOTATION_COLOR))
+        self.lock_annotation_text_item.setBrush(QColor(self.theme.annotation))
         self.chart.scene().addItem(self.lock_annotation_line)
         self.chart.scene().addItem(self.lock_annotation_text_item)
-        preview_pen = QPen(QColor(SMART_PREVIEW_COLOR))
+        preview_pen = QPen(QColor(self.theme.preview))
         preview_pen.setWidth(2)
         self.smart_preview_item = QGraphicsEllipseItem()
         self.smart_preview_item.setPen(preview_pen)
-        preview_fill = QColor(SMART_PREVIEW_COLOR)
+        preview_fill = QColor(self.theme.preview)
         preview_fill.setAlpha(60)
         self.smart_preview_item.setBrush(preview_fill)
         self.smart_preview_label = QGraphicsSimpleTextItem()
-        self.smart_preview_label.setBrush(QColor(SMART_PREVIEW_COLOR))
+        self.smart_preview_label.setBrush(QColor(self.theme.preview))
         self.chart.scene().addItem(self.smart_preview_item)
         self.chart.scene().addItem(self.smart_preview_label)
         self._clear_cursors()
@@ -827,6 +858,7 @@ class WaveformAnalysisPanel(QWidget):
         self.current_stats = primary_stats or self.current_waveform.analyze()
         self.active_waveform_channel = self.current_waveform.channel
         self.waveform_series_map = {}
+        self.reference_series_map: dict[str, QLineSeries] = {}
         self.waveform_source_map = {}
         self.waveform_decimated_map = {}
         self.visible_channels = {waveform.channel for waveform in waveforms}
@@ -846,6 +878,7 @@ class WaveformAnalysisPanel(QWidget):
         axis_y.setLabelFormat("%.4g")
         self.chart.addAxis(axis_x, Qt.AlignBottom)
         self.chart.addAxis(axis_y, Qt.AlignLeft)
+        self._apply_chart_theme()
         axis_x.rangeChanged.connect(self._handle_axis_range_changed)
 
         all_x_values: list[float] = []
@@ -890,7 +923,9 @@ class WaveformAnalysisPanel(QWidget):
         self.chart_view.reset_view()
         self._axis_updates_suspended = False
         self._render_all_waveform_series()
-        if self.scope_vertical_layouts:
+        if len(waveforms) > 1:
+            self.auto_stack_visible_channels()
+        elif self.scope_vertical_layouts:
             self._apply_scope_vertical_layouts()
         self._update_stats(self.current_stats)
         self._update_view_stats_from_axes()
@@ -946,6 +981,7 @@ class WaveformAnalysisPanel(QWidget):
         self.current_stats = None
         self.waveform_series = None
         self.waveform_series_map = {}
+        self.reference_series_map = {}
         self.waveform_source_map = {}
         self.waveform_decimated_map = {}
         self.encoder_phase_valid_series = None
@@ -996,6 +1032,102 @@ class WaveformAnalysisPanel(QWidget):
 
     def reset_view(self) -> None:
         self._reset_visual_view()
+
+    def set_theme(self, theme: WaveformTheme) -> None:
+        self.theme = theme
+        self.chart_view.set_theme(theme)
+        self._apply_chart_theme()
+        self._refresh_waveform_series_styles()
+        self._refresh_cursor_graphics()
+
+    def set_interaction_tool(self, tool: InteractionTool) -> None:
+        self.interaction_tool = tool
+        self.chart_view.set_interaction_tool(tool)
+        if tool is InteractionTool.CURSOR_A:
+            self.arm_cursor("a")
+        elif tool is InteractionTool.CURSOR_B:
+            self.arm_cursor("b")
+        elif tool in {InteractionTool.ZOOM, InteractionTool.PAN, InteractionTool.ANNOTATE}:
+            self.cancel_active_tool()
+
+    def _apply_chart_theme(self) -> None:
+        theme = self.theme
+        self.chart.setBackgroundBrush(QBrush(QColor(theme.chart_background)))
+        self.chart.setPlotAreaBackgroundBrush(QBrush(QColor(theme.plot_background)))
+        self.chart.setPlotAreaBackgroundVisible(True)
+        self.chart.setTitleBrush(QBrush(QColor(theme.primary_text)))
+        for axis in self.chart.axes():
+            if not isinstance(axis, QValueAxis):
+                continue
+            axis.setLabelsColor(QColor(theme.axis_text))
+            axis.setTitleBrush(QBrush(QColor(theme.axis_text)))
+            grid_pen = QPen(QColor(theme.grid_major))
+            grid_pen.setWidthF(0.8)
+            axis.setGridLinePen(grid_pen)
+            minor_pen = QPen(QColor(theme.grid_minor))
+            minor_pen.setWidthF(0.6)
+            axis.setMinorGridLinePen(minor_pen)
+            axis.setMinorTickCount(4)
+            line_pen = QPen(QColor(theme.border))
+            axis.setLinePen(line_pen)
+
+    def reset_horizontal_view(self) -> None:
+        self.chart_view.reset_horizontal()
+
+    def reset_vertical_view(self) -> None:
+        self.chart_view.reset_vertical()
+
+    def arm_cursor(self, cursor_name: str) -> None:
+        if cursor_name not in {"a", "b"}:
+            raise ValueError(f"不支持的游标: {cursor_name}")
+        self._arm_cursor(cursor_name)
+
+    def cancel_active_tool(self) -> None:
+        self.pending_cursor_target = None
+        self.dragging_cursor_target = None
+        self.dragging_waveform_channel = None
+        self._hide_smart_preview()
+        self.cursor_hint_label.setText(self._default_cursor_hint())
+
+    def pan_horizontal(self, ratio: float) -> None:
+        axis = self._x_axis()
+        if axis is None:
+            return
+        span = axis.max() - axis.min()
+        shift = span * ratio
+        axis.setRange(axis.min() + shift, axis.max() + shift)
+
+    def displayed_point_count(self) -> int:
+        return sum(len(points[0]) for points in self.waveform_decimated_map.values())
+
+    def set_reference_waveforms(self, waveforms: list[WaveformData]) -> None:
+        for series in self.reference_series_map.values():
+            self.chart.removeSeries(series)
+        self.reference_series_map = {}
+        axis_x = self._x_axis()
+        axis_y = self._y_axis()
+        if axis_x is None or axis_y is None:
+            return
+        for waveform in waveforms:
+            x_values, y_values = _decimate_xy_envelope(
+                waveform.x_values,
+                waveform.y_values,
+                max_points=2500,
+            )
+            series = QLineSeries()
+            series.setName(f"REF {display_channel_name(waveform.channel)}")
+            style = self.theme.channel_style(waveform.channel)
+            color = QColor(style.color)
+            color.setAlpha(self.theme.reference_alpha)
+            pen = QPen(color)
+            pen.setWidthF(1.2)
+            pen.setStyle(Qt.DashLine)
+            series.setPen(pen)
+            series.replace([QPointF(x, y) for x, y in zip(x_values, y_values)])
+            self.chart.addSeries(series)
+            series.attachAxis(axis_x)
+            series.attachAxis(axis_y)
+            self.reference_series_map[waveform.channel] = series
 
     def set_smart_cursor_enabled(self, enabled: bool) -> None:
         if self.cursor_placement_mode == "direct":
@@ -1472,17 +1604,20 @@ class WaveformAnalysisPanel(QWidget):
         if self.active_waveform_channel not in self.visible_channels:
             self.active_waveform_channel = next(iter(self.visible_channels), None)
         self._populate_compare_channels()
-        if self.scope_vertical_layouts:
-            self._apply_scope_vertical_layouts()
+        if len(self.visible_channels) > 1:
+            self.auto_stack_visible_channels()
         else:
+            for channel in self.waveform_offsets:
+                self.waveform_offsets[channel] = 0.0
             self._render_all_waveform_series()
+            self._ensure_waveform_offsets_visible()
         self._refresh_cursor_graphics()
 
     def _create_encoder_phase_diagnostic_series(self, axis_x: QValueAxis, axis_y: QValueAxis) -> None:
         self.encoder_phase_valid_series = QScatterSeries()
         self.encoder_phase_valid_series.setName("")
-        self.encoder_phase_valid_series.setColor(QColor(ENCODER_PHASE_VALID_COLOR))
-        self.encoder_phase_valid_series.setBorderColor(QColor(ENCODER_PHASE_VALID_COLOR))
+        self.encoder_phase_valid_series.setColor(QColor(self.theme.success))
+        self.encoder_phase_valid_series.setBorderColor(QColor(self.theme.success))
         self.encoder_phase_valid_series.setMarkerSize(8.0)
         self.chart.addSeries(self.encoder_phase_valid_series)
         self.encoder_phase_valid_series.attachAxis(axis_x)
@@ -1490,8 +1625,8 @@ class WaveformAnalysisPanel(QWidget):
 
         self.encoder_phase_invalid_series = QScatterSeries()
         self.encoder_phase_invalid_series.setName("")
-        self.encoder_phase_invalid_series.setColor(QColor(ENCODER_PHASE_INVALID_COLOR))
-        self.encoder_phase_invalid_series.setBorderColor(QColor(ENCODER_PHASE_INVALID_COLOR))
+        self.encoder_phase_invalid_series.setColor(QColor(self.theme.error))
+        self.encoder_phase_invalid_series.setBorderColor(QColor(self.theme.error))
         self.encoder_phase_invalid_series.setMarkerSize(7.0)
         self.chart.addSeries(self.encoder_phase_invalid_series)
         self.encoder_phase_invalid_series.attachAxis(axis_x)
@@ -1685,6 +1820,16 @@ class WaveformAnalysisPanel(QWidget):
         target_channel = target_waveform.channel if target_waveform is not None else None
         if target_channel is not None:
             self._set_active_waveform_channel(target_channel)
+        if self.interaction_tool is InteractionTool.CURSOR_A:
+            self._place_cursor_at("a", x_value, y_value, target_channel)
+            return True
+        if self.interaction_tool is InteractionTool.CURSOR_B:
+            self._place_cursor_at("b", x_value, y_value, target_channel)
+            return True
+        if self.interaction_tool is InteractionTool.ANNOTATE and self.annotation_requested is not None:
+            point = self._clamp_cursor_point((x_value, y_value), target_channel)
+            self.annotation_requested(point, target_channel)
+            return True
         return False
 
     def _cursor_to_place_or_update(self, x_value: float, y_value: float) -> str:
@@ -1713,20 +1858,32 @@ class WaveformAnalysisPanel(QWidget):
             self._set_active_waveform_channel(target_channel)
 
         menu = QMenu(self)
-        action_a = menu.addAction("设置/更新游标 A")
-        action_b = menu.addAction("设置/更新游标 B")
-        menu.addSeparator()
-        link_action = menu.addAction("游标联动拖动")
+        view_menu = menu.addMenu("视图")
+        reset_action = view_menu.addAction("恢复全图\tF")
+        reset_x_action = view_menu.addAction("仅恢复时间轴")
+        cursor_menu = menu.addMenu("游标")
+        action_a = cursor_menu.addAction("设置/更新游标 A\tA")
+        action_b = cursor_menu.addAction("设置/更新游标 B\tB")
+        cursor_menu.addSeparator()
+        link_action = cursor_menu.addAction("游标联动拖动")
         link_action.setCheckable(True)
         link_action.setChecked(self.cursor_linked)
+        cursor_menu.addSeparator()
+        locate_a = cursor_menu.addAction("定位 A")
+        locate_b = cursor_menu.addAction("定位 B")
+        cursor_menu.addSeparator()
+        clear_action = cursor_menu.addAction("清除游标\tEsc")
+        annotation_menu = menu.addMenu("标注")
+        annotation_action = annotation_menu.addAction("在此处添加标注")
         menu.addSeparator()
-        locate_a = menu.addAction("定位 A")
-        locate_b = menu.addAction("定位 B")
-        menu.addSeparator()
-        clear_action = menu.addAction("清除游标")
+        export_action = menu.addAction("导出当前图像")
 
         selected = menu.exec(self.chart_view.mapToGlobal(position))
-        if selected == action_a:
+        if selected == reset_action:
+            self.reset_view()
+        elif selected == reset_x_action:
+            self.reset_horizontal_view()
+        elif selected == action_a:
             self._place_cursor_at("a", mapped.x(), mapped.y(), target_channel)
         elif selected == action_b:
             self._place_cursor_at("b", mapped.x(), mapped.y(), target_channel)
@@ -1740,6 +1897,13 @@ class WaveformAnalysisPanel(QWidget):
             self._locate_cursor("b")
         elif selected == clear_action:
             self._clear_cursors()
+        elif selected == annotation_action and self.annotation_requested is not None:
+            self.annotation_requested(
+                self._clamp_cursor_point((mapped.x(), mapped.y()), target_channel),
+                target_channel,
+            )
+        elif selected == export_action:
+            self._export_chart_image()
 
     def _place_cursor_at(self, cursor_name: str, x_value: float, y_value: float, channel: str | None) -> None:
         self.cursor_points[cursor_name] = self._clamp_cursor_point((x_value, y_value), channel)
@@ -2173,27 +2337,58 @@ class WaveformAnalysisPanel(QWidget):
         self._update_view_stats_from_axes()
         self._refresh_cursor_graphics()
 
-    def stack_visible_channels_for_export(self) -> None:
+    def auto_stack_visible_channels(self) -> None:
         if not self.current_waveforms:
             return
-        ordered_channels = [waveform.channel for waveform in self.current_waveforms if waveform.channel in self.visible_channels]
+        visible_waveforms = [
+            waveform
+            for waveform in self.current_waveforms
+            if waveform.channel in self.visible_channels and waveform.y_values
+        ]
+        visible_waveforms.sort(
+            key=lambda waveform: (
+                int(waveform.channel.removeprefix("CHANnel"))
+                if waveform.channel.startswith("CHANnel")
+                and waveform.channel.removeprefix("CHANnel").isdigit()
+                else 10_000,
+                waveform.channel,
+            )
+        )
+        ordered_channels = [waveform.channel for waveform in visible_waveforms]
         if len(ordered_channels) <= 1:
             return
-        max_pp = 0.0
-        for waveform in self.current_waveforms:
-            if waveform.channel not in ordered_channels:
-                continue
-            try:
-                max_pp = max(max_pp, waveform.analyze().voltage_pp)
-            except Exception:
-                continue
-        gap = max(max_pp * 1.6, 1.0)
-        center_index = (len(ordered_channels) - 1) / 2.0
-        for index, channel in enumerate(ordered_channels):
-            self.waveform_offsets[channel] = (center_index - index) * gap
+
+        bounds = [
+            (min(waveform.y_values), max(waveform.y_values))
+            for waveform in visible_waveforms
+        ]
+        spans = [max(high - low, 1e-9) for low, high in bounds]
+        typical_span = max(spans)
+        gap = max(typical_span * 0.22, 1e-9)
+        total_height = sum(spans) + gap * (len(spans) - 1)
+        cursor_top = total_height / 2.0
+        for waveform, (low, high), span in zip(visible_waveforms, bounds, spans):
+            target_center = cursor_top - span / 2.0
+            source_center = (low + high) / 2.0
+            self.waveform_offsets[waveform.channel] = target_center - source_center
+            cursor_top -= span + gap
         self._render_all_waveform_series()
-        self._ensure_waveform_offsets_visible()
+        axis_y = self._y_axis()
+        display_bounds = self._waveform_display_bounds()
+        if axis_y is not None and display_bounds is not None:
+            display_min, display_max = display_bounds
+            padding = max((display_max - display_min) * 0.06, 1e-9)
+            axis_y.setRange(display_min - padding, display_max + padding)
+            axis_x = self._x_axis()
+            if axis_x is not None:
+                self.chart_view.set_default_ranges(
+                    (axis_x.min(), axis_x.max()),
+                    (axis_y.min(), axis_y.max()),
+                )
         self._refresh_cursor_graphics()
+
+    def stack_visible_channels_for_export(self) -> None:
+        self.auto_stack_visible_channels()
 
     def focus_on_point(self, point: tuple[float, float], *, annotation_text: str | None = None) -> None:
         self.focus_on_channel_point(point, channel=None, annotation_text=annotation_text)
@@ -2559,6 +2754,12 @@ class WaveformAnalysisPanel(QWidget):
         return "V"
 
     def _hover_cursor_shape(self, position) -> Qt.CursorShape:
+        if self.interaction_tool is InteractionTool.PAN:
+            return Qt.OpenHandCursor
+        if self.interaction_tool in {InteractionTool.CURSOR_A, InteractionTool.CURSOR_B}:
+            return Qt.CrossCursor
+        if self.interaction_tool is InteractionTool.ANNOTATE:
+            return Qt.PointingHandCursor
         if self.dragging_waveform_channel is None:
             hover_channel = self._waveform_drag_target_at(position)
             if hover_channel is not None and hover_channel != self.hover_waveform_channel:
@@ -2643,7 +2844,7 @@ class WaveformAnalysisPanel(QWidget):
         self.smart_preview_label.setVisible(False)
 
     def _cursor_pen(self, key: str, axis: str, active_mode: str | None) -> QPen:
-        color = QColor(CURSOR_A_COLOR if key == "a" else CURSOR_B_COLOR)
+        color = QColor(self.theme.cursor_a if key == "a" else self.theme.cursor_b)
         pen = QPen(color)
         pen.setWidth(4 if active_mode in {axis, "xy"} else 2)
         if active_mode in {axis, "xy"}:
@@ -2651,7 +2852,7 @@ class WaveformAnalysisPanel(QWidget):
         return pen
 
     def _cursor_brush(self, key: str, active_mode: str | None):
-        color = QColor(CURSOR_A_COLOR if key == "a" else CURSOR_B_COLOR)
+        color = QColor(self.theme.cursor_a if key == "a" else self.theme.cursor_b)
         fill = QColor(color)
         fill.setAlpha(220 if active_mode == "xy" else 150)
         return fill
@@ -2678,17 +2879,21 @@ class WaveformAnalysisPanel(QWidget):
             self.cursor_hint_label.setText("叠加通道显示偏移已重置。")
 
     def _waveform_series_pen(self, channel: str) -> QPen:
-        channels = [waveform.channel for waveform in self.current_waveforms]
-        color_index = channels.index(channel) if channel in channels else 0
-        color = QColor(WAVEFORM_SERIES_COLORS[color_index % len(WAVEFORM_SERIES_COLORS)])
+        style = self.theme.channel_style(channel)
+        color = QColor(style.color)
         pen = QPen(color)
         is_hovered = channel == self.dragging_waveform_channel or channel == self.hover_waveform_channel
         is_active = channel == self.active_waveform_channel
-        pen.setWidth(5 if is_hovered else (4 if is_active else 2))
+        pen.setWidthF(4.5 if is_hovered else (3.5 if is_active else style.width))
+        pen.setStyle(style.pen_style)
         if is_hovered:
             pen.setColor(color.lighter(115))
         elif is_active:
             pen.setColor(color.lighter(108))
+        else:
+            muted = QColor(color)
+            muted.setAlpha(185)
+            pen.setColor(muted)
         return pen
 
     def _export_chart_image(self) -> None:

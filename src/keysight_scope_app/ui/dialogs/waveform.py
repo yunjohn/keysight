@@ -4,20 +4,31 @@ from datetime import datetime
 import json
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, Qt
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPoint, QSettings, QTimer, Qt
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QInputDialog,
+    QListWidget,
+    QMenu,
     QPushButton,
+    QSizePolicy,
+    QStyle,
     QTabWidget,
+    QToolBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -28,9 +39,22 @@ from keysight_scope_app.ui.helpers import (
     apply_responsive_window_geometry,
     create_scroll_area,
     display_channel_name,
+    set_equal_button_widths,
+    set_uniform_control_height,
 )
 from keysight_scope_app.ui.panels.waveform import WaveformAnalysisPanel
+from keysight_scope_app.ui.waveform_theme import INSTRUMENT_DARK_THEME, InteractionTool
+from keysight_scope_app.ui.waveform_navigator import WaveformNavigator
 from keysight_scope_app.utils import format_engineering_value
+from keysight_scope_app.services.quality import inspect_waveforms
+from keysight_scope_app.services.comparison import compare_to_baseline
+from keysight_scope_app.services.waveform_workspace import (
+    ViewHistory,
+    WaveformAnnotation,
+    WaveformViewState,
+    detect_quick_events,
+    save_workspace_metadata,
+)
 
 
 WAVEFORM_CONFIG_DIR = Path("captures") / "waveforms"
@@ -57,16 +81,12 @@ WAVEFORM_MEASUREMENT_ORDER = [
     "低电平估计",
 ]
 WAVEFORM_DEFAULT_MEASUREMENTS = {"频率", "峰峰值", "均方根"}
-WAVEFORM_CHANNEL_COLORS = {
-    "CHANnel1": "#2d9cdb",
-    "CHANnel2": "#eb5757",
-    "CHANnel3": "#27ae60",
-    "CHANnel4": "#f2994a",
-}
 OVERLAY_TITLE_POINT_SIZE = 10
 OVERLAY_BODY_POINT_SIZE = 9
 OVERLAY_TITLE_HTML_PX = 14
 OVERLAY_BODY_HTML_PX = 12
+WAVEFORM_SIDEBAR_WIDTH = 400
+WAVEFORM_SIDEBAR_TAB_HEIGHT = 36
 CURRENT_LIKE_MEASUREMENTS = {
     "峰峰值",
     "均方根",
@@ -77,6 +97,44 @@ CURRENT_LIKE_MEASUREMENTS = {
     "高电平估计",
     "低电平估计",
 }
+
+
+def _waveform_workspace_stylesheet() -> str:
+    theme = INSTRUMENT_DARK_THEME
+    return f"""
+        QDialog, QWidget {{ background: {theme.window_background}; color: {theme.primary_text}; }}
+        QGroupBox, QFrame#sidebarCard {{
+            background: {theme.panel_background};
+            border: 1px solid {theme.border};
+            border-radius: 7px;
+            margin-top: 7px;
+        }}
+        QGroupBox::title {{ subcontrol-origin: margin; left: 9px; padding: 0 4px; }}
+        QPushButton, QToolButton, QComboBox {{
+            background: {theme.grid_minor};
+            color: {theme.primary_text};
+            border: 1px solid {theme.border};
+            border-radius: 5px;
+            padding: 5px 9px;
+        }}
+        QPushButton:hover, QToolButton:hover {{ background: {theme.grid_major}; border-color: {theme.crosshair}; }}
+        QPushButton:checked, QToolButton:checked {{ background: {theme.border}; border-color: {theme.channels["CHANnel3"].color}; }}
+        QPushButton:disabled, QToolButton:disabled {{ color: {theme.border}; background: {theme.panel_background}; }}
+        QToolBox::tab {{
+            background: {theme.grid_minor};
+            color: {theme.secondary_text};
+            border: 1px solid {theme.border};
+            border-radius: 4px;
+            padding: 5px 9px;
+            min-height: 24px;
+            font-weight: 600;
+        }}
+        QToolBox::tab:selected {{ background: {theme.border}; color: {theme.primary_text}; }}
+        QListWidget {{ background: {theme.plot_background}; border: 1px solid {theme.border}; border-radius: 4px; }}
+        QListWidget::item:selected {{ background: {theme.grid_major}; }}
+        QMenu {{ background: {theme.panel_background}; color: {theme.primary_text}; border: 1px solid {theme.border}; }}
+        QMenu::item:selected {{ background: {theme.grid_major}; }}
+    """
 
 
 def _period_from_stats(stats: WaveformStats) -> float | None:
@@ -239,6 +297,9 @@ class WaveformMeasurementSettingsDialog(QDialog):
 class WaveformDetailDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.theme = INSTRUMENT_DARK_THEME
+        self.interaction_tool = InteractionTool.ZOOM
+        self.setStyleSheet(_waveform_workspace_stylesheet())
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle("独立波形显示")
@@ -263,21 +324,53 @@ class WaveformDetailDialog(QDialog):
         self._link_scope_channels = False
         self._measurement_frozen = False
         self._applying_saved_phase_interval = False
+        self._view_history = ViewHistory()
+        self._bookmarks: dict[str, WaveformViewState] = {}
+        self._annotations: list[WaveformAnnotation] = []
+        self._settings = QSettings("KeysightScopeApp", "WaveformDetail")
+        self._restoring_view = False
+        self._view_history_timer = QTimer(self)
+        self._view_history_timer.setSingleShot(True)
+        self._view_history_timer.setInterval(180)
+        self._view_history_timer.timeout.connect(self._record_current_view)
         self._load_measurement_config()
         self._load_phase_settings()
 
-        toolbar = QGridLayout()
-        toolbar.setHorizontalSpacing(8)
-        toolbar.setVerticalSpacing(6)
-        self.refresh_waveform_button = QPushButton("抓取波形")
+        toolbar_container = QWidget(content)
+        toolbar = QVBoxLayout(toolbar_container)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(8)
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(8)
+        self.refresh_waveform_button = QPushButton("抓取")
+        self.refresh_waveform_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        self.refresh_waveform_button.setToolTip("从示波器单次抓取波形")
         self.refresh_waveform_button.clicked.connect(self._request_waveform_refresh)
-        self.reset_waveform_button = QPushButton("重置波形")
+        self.reset_waveform_button = QPushButton("全图")
+        self.reset_waveform_button.setIcon(self.style().standardIcon(QStyle.SP_DialogResetButton))
+        self.reset_waveform_button.setToolTip("恢复完整波形视图（F，双击图表）")
         self.reset_waveform_button.clicked.connect(self._reset_waveform_view)
+        self.undo_view_button = QPushButton("后退")
+        self.undo_view_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowBack))
+        self.undo_view_button.setToolTip("返回上一个视图（Ctrl+Z）")
+        self.undo_view_button.clicked.connect(self._undo_view)
+        self.redo_view_button = QPushButton("前进")
+        self.redo_view_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowForward))
+        self.redo_view_button.setToolTip("前进到下一个视图（Ctrl+Y）")
+        self.redo_view_button.clicked.connect(self._redo_view)
+        self.sidebar_toggle_button = QPushButton("隐藏侧栏")
+        self.sidebar_toggle_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.sidebar_toggle_button.setToolTip("显示或隐藏分析侧栏")
+        self.sidebar_toggle_button.setCheckable(True)
+        self.sidebar_toggle_button.toggled.connect(self._toggle_sidebar)
         self.export_current_view_button = QPushButton("导出当前视图")
         self.export_current_view_button.clicked.connect(self._export_current_view_bundle)
         self.export_cursor_ab_button = QPushButton("导出游标A-B")
         self.export_cursor_ab_button.clicked.connect(self._export_cursor_ab_bundle)
-        self.capture_current_view_button = QPushButton("截图当前视图")
+        self.capture_current_view_button = QPushButton("截图")
+        self.capture_current_view_button.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.capture_current_view_button.setToolTip("导出当前主题下的波形截图")
         self.capture_current_view_button.clicked.connect(self._capture_current_view_image)
         self.freeze_measurements_button = QPushButton("冻结测量")
         self.freeze_measurements_button.setCheckable(True)
@@ -289,25 +382,60 @@ class WaveformDetailDialog(QDialog):
         self.measurement_scope_combo.currentIndexChanged.connect(self._refresh_measurement_footer)
         self.measurement_settings_button = QPushButton("测量项设置")
         self.measurement_settings_button.clicked.connect(self._show_measurement_settings)
-        toolbar.addWidget(self.refresh_waveform_button, 0, 0)
-        toolbar.addWidget(self.reset_waveform_button, 0, 1)
-        toolbar.addWidget(self.export_current_view_button, 0, 2)
-        toolbar.addWidget(self.export_cursor_ab_button, 0, 3)
-        toolbar.addWidget(self.capture_current_view_button, 0, 4)
-        toolbar.addWidget(self.freeze_measurements_button, 0, 5)
-        toolbar.addWidget(self.measurement_settings_button, 0, 6)
-        toolbar.addWidget(QLabel("相位差通道"), 1, 0)
+        self.tool_button_group = QButtonGroup(self)
+        self.tool_button_group.setExclusive(True)
+        self.tool_buttons: dict[InteractionTool, QPushButton] = {}
+        for tool, text, tooltip in (
+            (InteractionTool.ZOOM, "缩放", "左键框选缩放；Shift 临时平移"),
+            (InteractionTool.PAN, "平移", "左键拖动时间轴"),
+            (InteractionTool.CURSOR_A, "游标 A", "在图表中放置游标 A（A）"),
+            (InteractionTool.CURSOR_B, "游标 B", "在图表中放置游标 B（B）"),
+            (InteractionTool.ANNOTATE, "标注", "使用游标 A 的位置添加标注"),
+        ):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setToolTip(tooltip)
+            button.clicked.connect(
+                lambda checked=False, selected=tool: self._set_interaction_tool(selected)
+            )
+            self.tool_button_group.addButton(button)
+            self.tool_buttons[tool] = button
+        self.tool_buttons[InteractionTool.ZOOM].setChecked(True)
+        self.more_button = QToolButton(self)
+        self.more_button.setText("更多")
+        self.more_button.setPopupMode(QToolButton.InstantPopup)
+        self.more_menu = QMenu(self.more_button)
+        for text, callback in (
+            ("导出当前视图区间", self._export_current_view_bundle),
+            ("导出游标 A-B 区间", self._export_cursor_ab_bundle),
+            ("导出相位诊断", self._export_phase_diagnostics),
+        ):
+            action = QAction(text, self.more_menu)
+            action.triggered.connect(callback)
+            self.more_menu.addAction(action)
+        self.more_button.setMenu(self.more_menu)
+        for button in (
+            self.refresh_waveform_button,
+            self.reset_waveform_button,
+            self.undo_view_button,
+            self.redo_view_button,
+            self.capture_current_view_button,
+            self.sidebar_toggle_button,
+        ):
+            action_row.addWidget(button)
+        action_row.addSpacing(8)
+        for tool in InteractionTool:
+            action_row.addWidget(self.tool_buttons[tool])
+        action_row.addWidget(self.more_button)
+        action_row.addStretch(1)
+
         self.phase_channel_combo = QComboBox()
         self.phase_channel_combo.addItem("关闭", "")
         self.phase_channel_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_channel_combo, 1, 1)
-        toolbar.addWidget(QLabel("模式"), 1, 2)
         self.phase_mode_combo = QComboBox()
         self.phase_mode_combo.addItem("通用", "general")
         self.phase_mode_combo.addItem("编码器AB", "encoder_ab")
         self.phase_mode_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_mode_combo, 1, 3)
-        toolbar.addWidget(QLabel("最小间隔"), 1, 4)
         self.phase_interval_combo = QComboBox()
         self.phase_interval_combo.addItem("自动", None)
         self.phase_interval_combo.addItem("10 us", 10e-6)
@@ -315,63 +443,201 @@ class WaveformDetailDialog(QDialog):
         self.phase_interval_combo.addItem("50 us", 50e-6)
         self.phase_interval_combo.addItem("100 us", 100e-6)
         self.phase_interval_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_interval_combo, 1, 5)
         self.export_phase_diagnostics_button = QPushButton("导出相位差诊断")
         self.export_phase_diagnostics_button.clicked.connect(self._export_phase_diagnostics)
-        toolbar.addWidget(self.export_phase_diagnostics_button, 1, 6)
-        toolbar.addWidget(QLabel("边沿"), 2, 0)
         self.phase_edge_combo = QComboBox()
         self.phase_edge_combo.addItem("上升沿", "rising")
         self.phase_edge_combo.addItem("下降沿", "falling")
         self.phase_edge_combo.currentIndexChanged.connect(self._sync_phase_compare_controls_to_panel)
-        toolbar.addWidget(self.phase_edge_combo, 2, 1)
-        toolbar.addWidget(QLabel("测量范围"), 2, 2)
-        toolbar.addWidget(self.measurement_scope_combo, 2, 3)
-        toolbar.setColumnStretch(7, 1)
-        layout.addLayout(toolbar)
+        toolbar.addLayout(action_row)
+        layout.addWidget(toolbar_container)
+        set_uniform_control_height(toolbar_container)
+        set_equal_button_widths(
+            self.refresh_waveform_button,
+            self.reset_waveform_button,
+        )
+        set_equal_button_widths(
+            self.export_current_view_button,
+            self.export_cursor_ab_button,
+            self.capture_current_view_button,
+        )
 
-        self.operation_hint_label = QLabel(
+        self._default_operation_hint_text = (
             "左键框选放大时间轴，Shift+左键拖动平移，滚轮双轴缩放，Shift+滚轮缩放时间轴，Ctrl+滚轮缩放幅值，右键管理游标。"
         )
+        self.operation_hint_label = QLabel(self._default_operation_hint_text)
         self.operation_hint_label.setWordWrap(True)
-        self.operation_hint_label.setStyleSheet("color: #5f6b76;")
+        self.operation_hint_label.setStyleSheet(f"color: {self.theme.secondary_text};")
         hint_font = self.operation_hint_label.font()
         hint_font.setPointSize(max(hint_font.pointSize() - 1, 9))
         self.operation_hint_label.setFont(hint_font)
         layout.addWidget(self.operation_hint_label)
 
         self.analysis_panel = WaveformAnalysisPanel(self, compact_mode=False)
+        self.analysis_panel.set_theme(self.theme)
         self.analysis_panel.channel_unit_resolver = self._channel_unit
         self.analysis_panel.cursor_readout_changed = self._handle_cursor_measurements_changed
-        self.analysis_panel.view_window_changed = self._refresh_measurement_footer
+        self.analysis_panel.view_window_changed = self._on_view_window_changed
         self.analysis_panel.channel_comparison_changed = self._refresh_phase_compare_toolbar
+        self.analysis_panel.annotation_requested = self._request_annotation_at_point
+        self.analysis_panel.chart_view.selection_span_callback = self._show_selection_span
         self.analysis_panel.set_waveform_only_mode(True)
-        layout.addWidget(self.analysis_panel)
+        self.workspace_row = QWidget(content)
+        workspace_layout = QHBoxLayout(self.workspace_row)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(8)
+        workspace_layout.addWidget(self.analysis_panel, 1)
+        self.advanced_controls_widget = QGroupBox("分析侧栏", self.workspace_row)
+        advanced_layout = QVBoxLayout(self.advanced_controls_widget)
+        self.sidebar_toolbox = QToolBox(self.advanced_controls_widget)
+
+        measurement_page = QWidget(self.sidebar_toolbox)
+        measurement_layout = QFormLayout(measurement_page)
+        measurement_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        measurement_layout.addRow("范围", self.measurement_scope_combo)
+        measurement_layout.addRow(self.freeze_measurements_button)
+        measurement_layout.addRow(self.measurement_settings_button)
+        for button in (
+            self.freeze_measurements_button,
+            self.measurement_settings_button,
+        ):
+            button.setMinimumWidth(0)
+            button.setMaximumWidth(16_777_215)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.measurement_detail_label = QLabel("尚未加载波形")
+        self.measurement_detail_label.setWordWrap(True)
+        self.measurement_detail_label.setTextFormat(Qt.RichText)
+        self.measurement_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        measurement_layout.addRow(self.measurement_detail_label)
+        self.sidebar_toolbox.addItem(measurement_page, "测量")
+
+        phase_page = QWidget(self.sidebar_toolbox)
+        phase_layout = QFormLayout(phase_page)
+        phase_layout.addRow("对比通道", self.phase_channel_combo)
+        phase_layout.addRow("模式", self.phase_mode_combo)
+        phase_layout.addRow("边沿", self.phase_edge_combo)
+        phase_layout.addRow("最小间隔", self.phase_interval_combo)
+        phase_layout.addRow(self.export_phase_diagnostics_button)
+        self.sidebar_toolbox.addItem(phase_page, "相位")
+
+        self.event_list = QListWidget(self.advanced_controls_widget)
+        self.event_list.setToolTip("双击事件定位到对应时间。")
+        self.event_list.itemClicked.connect(self._preview_selected_event)
+        self.event_list.itemDoubleClicked.connect(self._focus_selected_event)
+        event_page = QWidget(self.sidebar_toolbox)
+        event_layout = QVBoxLayout(event_page)
+        event_layout.addWidget(self.event_list)
+        self.sidebar_toolbox.addItem(event_page, "事件")
+
+        self.add_annotation_button = QPushButton("在游标 A 添加标注")
+        self.add_annotation_button.clicked.connect(self._add_annotation_at_cursor)
+        annotation_page = QWidget(self.sidebar_toolbox)
+        annotation_layout = QVBoxLayout(annotation_page)
+        self.cursor_detail_label = QLabel("尚未放置游标")
+        self.cursor_detail_label.setWordWrap(True)
+        self.cursor_detail_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        annotation_layout.addWidget(self.cursor_detail_label)
+        annotation_layout.addWidget(self.add_annotation_button)
+        annotation_layout.addStretch(1)
+        self.sidebar_toolbox.addItem(annotation_page, "游标与标注")
+
+        self.bookmark_combo = QComboBox(self.advanced_controls_widget)
+        self.bookmark_combo.addItem("视图书签")
+        self.bookmark_combo.activated.connect(self._restore_selected_bookmark)
+        self.add_bookmark_button = QPushButton("保存当前视图书签")
+        self.add_bookmark_button.clicked.connect(self._add_view_bookmark)
+        self.load_reference_button = QPushButton("加载参考波形")
+        self.load_reference_button.clicked.connect(self._load_reference_waveforms)
+        self.reference_result_label = QLabel("参考对比：未加载")
+        self.reference_result_label.setWordWrap(True)
+        reference_page = QWidget(self.sidebar_toolbox)
+        reference_layout = QVBoxLayout(reference_page)
+        reference_layout.addWidget(self.load_reference_button)
+        reference_layout.addWidget(self.reference_result_label)
+        reference_layout.addWidget(self.bookmark_combo)
+        reference_layout.addWidget(self.add_bookmark_button)
+        reference_layout.addStretch(1)
+        self.sidebar_toolbox.addItem(reference_page, "参考与书签")
+
+        display_page = QWidget(self.sidebar_toolbox)
+        display_layout = QVBoxLayout(display_page)
+        self.measurement_overlay_check = QCheckBox("显示核心测量浮层")
+        self.measurement_overlay_check.setChecked(True)
+        self.cursor_overlay_check = QCheckBox("显示游标浮层")
+        self.cursor_overlay_check.setChecked(True)
+        display_layout.addWidget(self.measurement_overlay_check)
+        display_layout.addWidget(self.cursor_overlay_check)
+        display_layout.addStretch(1)
+        self.sidebar_toolbox.addItem(display_page, "显示设置")
+        self.sidebar_toolbox.currentChanged.connect(self._sidebar_section_changed)
+        advanced_layout.addWidget(self.sidebar_toolbox, 1)
+        self.advanced_controls_widget.setFixedWidth(WAVEFORM_SIDEBAR_WIDTH)
+        workspace_layout.addWidget(self.advanced_controls_widget)
+        layout.addWidget(self.workspace_row, 1)
+        overview_row = QHBoxLayout()
+        overview_row.addWidget(QLabel("全局导航"))
+        self.overview_navigator = WaveformNavigator(content, theme=self.theme)
+        self.overview_navigator.setToolTip("拖动高亮区域平移；拖动左右手柄调整时间窗口。")
+        self.overview_navigator.rangeChanged.connect(self._overview_range_changed)
+        overview_row.addWidget(self.overview_navigator, 1)
+        layout.addLayout(overview_row)
 
         self.channel_toggle_container = QWidget(self.analysis_panel)
         self.channel_toggle_layout = QHBoxLayout(self.channel_toggle_container)
         self.channel_toggle_layout.setContentsMargins(0, 0, 0, 0)
         self.channel_toggle_layout.setSpacing(8)
-        self.analysis_panel.layout().insertWidget(2, self.channel_toggle_container)
+        channel_page = QWidget(self.sidebar_toolbox)
+        channel_layout = QVBoxLayout(channel_page)
+        channel_layout.addWidget(self.channel_toggle_container)
+        channel_layout.addStretch(1)
+        self.sidebar_toolbox.insertItem(0, channel_page, "通道")
+        for tab_button in self.sidebar_toolbox.findChildren(
+            QAbstractButton,
+            "qt_toolbox_toolboxbutton",
+        ):
+            tab_button.setMinimumHeight(WAVEFORM_SIDEBAR_TAB_HEIGHT)
+        for sidebar_button in (
+            self.freeze_measurements_button,
+            self.measurement_settings_button,
+            self.export_phase_diagnostics_button,
+            self.add_annotation_button,
+            self.load_reference_button,
+            self.add_bookmark_button,
+        ):
+            sidebar_button.setMinimumWidth(0)
+            sidebar_button.setMaximumWidth(16_777_215)
+            sidebar_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.measurement_overlay = QFrame(self.analysis_panel.chart_view)
         self.measurement_overlay.setObjectName("measurementOverlay")
-        self.measurement_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.measurement_overlay.setFrameShape(QFrame.StyledPanel)
         self.measurement_overlay.setStyleSheet(
-            "#measurementOverlay { background-color: transparent; border: 0; }"
-            "#measurementCard { background-color: transparent; border: 0; }"
+            f"#measurementOverlay {{ background-color: {self.theme.overlay_background}; "
+            f"border: 1px solid {self.theme.border}; border-radius: 8px; }}"
         )
         overlay_layout = QVBoxLayout(self.measurement_overlay)
         overlay_layout.setContentsMargins(6, 4, 6, 4)
         overlay_layout.setSpacing(3)
+        measurement_header = QHBoxLayout()
+        measurement_header.setContentsMargins(0, 0, 0, 0)
         self.measurement_overlay_hint = QLabel("波形测量数据会显示在这里。")
         self.measurement_overlay_hint.setWordWrap(True)
         hint_font = self.measurement_overlay_hint.font()
         hint_font.setPointSize(OVERLAY_TITLE_POINT_SIZE)
         self.measurement_overlay_hint.setFont(hint_font)
-        self.measurement_overlay_hint.setStyleSheet("color: rgba(40, 40, 40, 180);")
-        overlay_layout.addWidget(self.measurement_overlay_hint)
+        self.measurement_overlay_hint.setStyleSheet(f"color: {self.theme.secondary_text};")
+        measurement_header.addWidget(self.measurement_overlay_hint, 1)
+        self.measurement_overlay_collapse_button = QToolButton(self.measurement_overlay)
+        self.measurement_overlay_collapse_button.setText("−")
+        self.measurement_overlay_collapse_button.setToolTip("折叠当前测量范围")
+        self.measurement_overlay_collapse_button.clicked.connect(
+            lambda: self._set_overlay_collapsed(
+                "measurement",
+                not self.measurement_text_label.isHidden(),
+            )
+        )
+        measurement_header.addWidget(self.measurement_overlay_collapse_button)
+        overlay_layout.addLayout(measurement_header)
 
         self.measurement_text_label = QLabel(self.measurement_overlay)
         self.measurement_text_label.setWordWrap(True)
@@ -381,40 +647,375 @@ class WaveformDetailDialog(QDialog):
         text_font.setPointSize(OVERLAY_BODY_POINT_SIZE)
         self.measurement_text_label.setFont(text_font)
         overlay_layout.addWidget(self.measurement_text_label)
-        overlay_layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
+        # The overlay geometry is managed manually. A minimum-size layout
+        # constraint would keep the expanded height after its content is hidden.
+        overlay_layout.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         self.measurement_overlay.hide()
 
         self.cursor_overlay = QFrame(self.analysis_panel.chart_view)
         self.cursor_overlay.setObjectName("cursorOverlay")
-        self.cursor_overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.cursor_overlay.setFrameShape(QFrame.StyledPanel)
-        self.cursor_overlay.setStyleSheet("#cursorOverlay { background-color: transparent; border: 0; }")
+        self.cursor_overlay.setStyleSheet(
+            f"#cursorOverlay {{ background-color: {self.theme.overlay_background}; "
+            f"border: 1px solid {self.theme.border}; border-radius: 8px; }}"
+        )
         cursor_layout = QVBoxLayout(self.cursor_overlay)
         cursor_layout.setContentsMargins(4, 3, 4, 3)
         cursor_layout.setSpacing(3)
+        cursor_header = QHBoxLayout()
+        cursor_header.setContentsMargins(0, 0, 0, 0)
         self.cursor_overlay_hint = QLabel("■ 游标测量")
         cursor_hint_font = self.cursor_overlay_hint.font()
         cursor_hint_font.setPointSize(OVERLAY_TITLE_POINT_SIZE)
         cursor_hint_font.setBold(True)
         self.cursor_overlay_hint.setFont(cursor_hint_font)
-        self.cursor_overlay_hint.setStyleSheet("color: #404040; letter-spacing: 0.4px;")
-        cursor_layout.addWidget(self.cursor_overlay_hint)
+        self.cursor_overlay_hint.setStyleSheet(
+            f"color: {self.theme.axis_text}; letter-spacing: 0.4px;"
+        )
+        cursor_header.addWidget(self.cursor_overlay_hint, 1)
+        self.cursor_overlay_collapse_button = QToolButton(self.cursor_overlay)
+        self.cursor_overlay_collapse_button.setText("−")
+        self.cursor_overlay_collapse_button.setToolTip("折叠游标测量")
+        self.cursor_overlay_collapse_button.clicked.connect(
+            lambda: self._set_overlay_collapsed(
+                "cursor",
+                not self.cursor_text_label.isHidden(),
+            )
+        )
+        cursor_header.addWidget(self.cursor_overlay_collapse_button)
+        cursor_layout.addLayout(cursor_header)
         self.cursor_text_label = QLabel(self.cursor_overlay)
         self.cursor_text_label.setWordWrap(True)
         self.cursor_text_label.setTextFormat(Qt.RichText)
         self.cursor_text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.cursor_text_label.setFont(text_font)
         cursor_layout.addWidget(self.cursor_text_label)
-        cursor_layout.setSizeConstraint(QVBoxLayout.SetMinimumSize)
+        cursor_layout.setSizeConstraint(QVBoxLayout.SetNoConstraint)
         self.cursor_overlay.hide()
+        self.measurement_overlay_check.toggled.connect(self._refresh_measurement_footer)
+        self.cursor_overlay_check.toggled.connect(self._refresh_measurement_footer)
+        self.tool_capsule = QLabel("缩放", self.analysis_panel.chart_view)
+        self.tool_capsule.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.tool_capsule.setStyleSheet(
+            f"background: {self.theme.overlay_background}; color: {self.theme.primary_text}; "
+            f"border: 1px solid {self.theme.border}; border-radius: 9px; padding: 3px 9px;"
+        )
+        self.tool_capsule.adjustSize()
+        self.tool_capsule.move(18, 18)
+        self.tool_capsule.raise_()
         self.analysis_panel.chart_view.installEventFilter(self)
         self.phase_result_label = QLabel("相位差: --")
         self.phase_result_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         layout.addWidget(self.phase_result_label)
         self.phase_metrics_label = QLabel("")
         self.phase_metrics_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.phase_metrics_label.setStyleSheet("color: #5f6b76;")
+        self.phase_metrics_label.setStyleSheet(f"color: {self.theme.secondary_text};")
         layout.addWidget(self.phase_metrics_label)
+        self.workspace_status_label = QLabel("模式：离线/单次　尚未加载波形")
+        self.workspace_status_label.setStyleSheet(
+            f"color: {self.theme.secondary_text}; padding: 3px 6px;"
+        )
+        self.quality_badge_label = QLabel("正常")
+        self.quality_badge_label.setAlignment(Qt.AlignCenter)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.workspace_status_label, 1)
+        status_row.addWidget(self.quality_badge_label)
+        layout.addLayout(status_row)
+        self._install_workspace_shortcuts()
+        self._restore_workspace_settings()
+        self._set_workspace_actions_enabled(False)
+        self.undo_view_button.setEnabled(False)
+        self.redo_view_button.setEnabled(False)
+
+    def _set_workspace_actions_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.reset_waveform_button,
+            self.capture_current_view_button,
+            self.more_button,
+            self.add_annotation_button,
+            self.add_bookmark_button,
+            self.load_reference_button,
+        ):
+            widget.setEnabled(enabled)
+        for tool, button in self.tool_buttons.items():
+            button.setEnabled(enabled or tool is InteractionTool.ZOOM)
+        reason = "" if enabled else "请先抓取或加载波形。"
+        for widget in (
+            self.reset_waveform_button,
+            self.capture_current_view_button,
+            self.more_button,
+        ):
+            if not enabled:
+                widget.setToolTip(reason)
+
+    def set_loading(self, message: str) -> None:
+        self.operation_hint_label.setText(message)
+        self.refresh_waveform_button.setText("抓取中...")
+        self.refresh_waveform_button.setEnabled(False)
+
+    def clear_loading(self) -> None:
+        self.operation_hint_label.setText(self._default_operation_hint_text)
+        self.refresh_waveform_button.setText("抓取")
+        self.refresh_waveform_button.setEnabled(True)
+
+    def set_loading_failed(self, message: str) -> None:
+        self.operation_hint_label.setText(message)
+        self.refresh_waveform_button.setText("抓取")
+        self.refresh_waveform_button.setEnabled(True)
+
+    def _install_workspace_shortcuts(self) -> None:
+        shortcuts = (
+            ("F", self.analysis_panel.reset_view),
+            ("Ctrl+Z", self._undo_view),
+            ("Ctrl+Y", self._redo_view),
+            ("A", lambda: self._set_interaction_tool(InteractionTool.CURSOR_A)),
+            ("B", lambda: self._set_interaction_tool(InteractionTool.CURSOR_B)),
+            ("Escape", lambda: self._set_interaction_tool(InteractionTool.ZOOM)),
+            ("Left", lambda: self.analysis_panel.pan_horizontal(-0.1)),
+            ("Right", lambda: self.analysis_panel.pan_horizontal(0.1)),
+        )
+        self._workspace_shortcuts: list[QShortcut] = []
+        for sequence, callback in shortcuts:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+            self._workspace_shortcuts.append(shortcut)
+
+    def _set_interaction_tool(self, tool: InteractionTool) -> None:
+        self.interaction_tool = tool
+        self.analysis_panel.set_interaction_tool(tool)
+        for candidate, button in self.tool_buttons.items():
+            button.setChecked(candidate is tool)
+        labels = {
+            InteractionTool.ZOOM: "缩放",
+            InteractionTool.PAN: "平移",
+            InteractionTool.CURSOR_A: "游标 A",
+            InteractionTool.CURSOR_B: "游标 B",
+            InteractionTool.ANNOTATE: "标注",
+        }
+        self.tool_capsule.setText(labels[tool])
+        self.tool_capsule.adjustSize()
+        self._show_status_message(f"当前工具：{labels[tool]}")
+
+    def _show_selection_span(self, span_s: float) -> None:
+        self._show_status_message(f"框选跨度：{format_engineering_value(span_s, 's')}")
+
+    def _show_status_message(self, message: str, duration_ms: int = 1800) -> None:
+        self.operation_hint_label.setText(message)
+        QTimer.singleShot(
+            duration_ms,
+            lambda: self.operation_hint_label.setText(self._default_operation_hint_text),
+        )
+
+    def _sidebar_section_changed(self, index: int) -> None:
+        if index >= 0:
+            self._settings.setValue("sidebar_section", self.sidebar_toolbox.itemText(index))
+
+    def _preview_selected_event(self, item) -> None:
+        index = self.event_list.row(item)
+        if index < 0 or index >= len(getattr(self, "_quick_events", ())):
+            return
+        event = self._quick_events[index]
+        self._show_status_message(
+            f"{display_channel_name(event.channel)} · {event.description} · "
+            f"{format_engineering_value(event.time_s, 's')}"
+        )
+
+    def _toggle_sidebar(self, hidden: bool) -> None:
+        self.advanced_controls_widget.setVisible(not hidden)
+        self.sidebar_toggle_button.setText("显示侧栏" if hidden else "隐藏侧栏")
+
+    def _set_overlay_collapsed(self, overlay: str, collapsed: bool) -> None:
+        if overlay == "measurement":
+            content = self.measurement_text_label
+            button = self.measurement_overlay_collapse_button
+            title = "展开当前测量范围" if collapsed else "折叠当前测量范围"
+        else:
+            content = self.cursor_text_label
+            button = self.cursor_overlay_collapse_button
+            title = "展开游标测量" if collapsed else "折叠游标测量"
+        content.setVisible(not collapsed)
+        button.setText("+" if collapsed else "−")
+        button.setToolTip(title)
+        self._reposition_measurement_overlay()
+
+    def _restore_workspace_settings(self) -> None:
+        geometry = self._settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        self.sidebar_toggle_button.setChecked(
+            self._settings.value("sidebar_hidden", False, type=bool)
+        )
+        self.measurement_overlay_check.setChecked(
+            self._settings.value("measurement_overlay_visible", True, type=bool)
+        )
+        self.cursor_overlay_check.setChecked(
+            self._settings.value("cursor_overlay_visible", True, type=bool)
+        )
+        self._set_overlay_collapsed(
+            "measurement",
+            self._settings.value("measurement_overlay_collapsed", False, type=bool),
+        )
+        self._set_overlay_collapsed(
+            "cursor",
+            self._settings.value("cursor_overlay_collapsed", False, type=bool),
+        )
+        saved_section = str(self._settings.value("sidebar_section", "测量"))
+        for index in range(self.sidebar_toolbox.count()):
+            if self.sidebar_toolbox.itemText(index) == saved_section:
+                self.sidebar_toolbox.setCurrentIndex(index)
+                break
+        try:
+            saved_tool = InteractionTool(str(self._settings.value("active_tool", InteractionTool.ZOOM.value)))
+        except ValueError:
+            saved_tool = InteractionTool.ZOOM
+        self._set_interaction_tool(saved_tool)
+
+    def _save_workspace_settings(self) -> None:
+        self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.setValue("sidebar_hidden", self.sidebar_toggle_button.isChecked())
+        self._settings.setValue("active_tool", self.interaction_tool.value)
+        self._settings.setValue(
+            "measurement_overlay_visible",
+            self.measurement_overlay_check.isChecked(),
+        )
+        self._settings.setValue(
+            "cursor_overlay_visible",
+            self.cursor_overlay_check.isChecked(),
+        )
+        self._settings.setValue(
+            "measurement_overlay_collapsed",
+            self.measurement_text_label.isHidden(),
+        )
+        self._settings.setValue(
+            "cursor_overlay_collapsed",
+            self.cursor_text_label.isHidden(),
+        )
+        self._settings.setValue(
+            "visible_channels",
+            sorted(
+                channel
+                for channel, checkbox in self.channel_visibility_checks.items()
+                if checkbox.isChecked()
+            ),
+        )
+
+    def _on_view_window_changed(self) -> None:
+        self._refresh_measurement_footer()
+        if not self._restoring_view:
+            self._view_history_timer.start()
+        self._update_workspace_status()
+        self._sync_overview_position()
+
+    def _sync_overview_position(self) -> None:
+        state = self.analysis_panel.capture_view_state()
+        if not state or not self.current_waveforms:
+            return
+        populated = [waveform for waveform in self.current_waveforms if waveform.x_values]
+        if not populated:
+            return
+        full_left = min(waveform.x_values[0] for waveform in populated)
+        full_right = max(waveform.x_values[-1] for waveform in populated)
+        x_range = state.get("x_range")
+        if not isinstance(x_range, tuple) or full_right <= full_left:
+            return
+        self.overview_navigator.set_ranges(
+            (full_left, full_right),
+            (float(x_range[0]), float(x_range[1])),
+        )
+
+    def _overview_range_changed(self, left: float, right: float) -> None:
+        axis = self.analysis_panel._x_axis()
+        if axis is not None:
+            axis.setRange(left, right)
+
+    def _current_typed_view_state(self) -> WaveformViewState | None:
+        state = self.analysis_panel.capture_view_state()
+        if not state:
+            return None
+        x_range = state.get("x_range")
+        y_range = state.get("y_range")
+        if not isinstance(x_range, tuple) or not isinstance(y_range, tuple):
+            return None
+        return WaveformViewState(
+            x_range=(float(x_range[0]), float(x_range[1])),
+            y_range=(float(y_range[0]), float(y_range[1])),
+            visible_channels=tuple(sorted(self.analysis_panel.visible_channels)),
+            waveform_offsets=dict(self.analysis_panel.waveform_offsets),
+            cursor_points=dict(self.analysis_panel.cursor_points),
+            active_tool=self.interaction_tool.value,
+            sidebar_section=self.sidebar_toolbox.itemText(self.sidebar_toolbox.currentIndex()),
+            measurement_overlay_visible=self.measurement_overlay_check.isChecked(),
+            cursor_overlay_visible=self.cursor_overlay_check.isChecked(),
+            theme_name=self.theme.name,
+        )
+
+    def _record_current_view(self) -> None:
+        state = self._current_typed_view_state()
+        if state is not None:
+            self._view_history.push(state)
+        self.undo_view_button.setEnabled(self._view_history.can_undo)
+        self.redo_view_button.setEnabled(self._view_history.can_redo)
+
+    def _restore_typed_view_state(self, state: WaveformViewState | None) -> None:
+        if state is None:
+            return
+        self._restoring_view = True
+        try:
+            self.analysis_panel.restore_view_state(
+                {
+                    "visible_channels": set(state.visible_channels),
+                    "waveform_offsets": state.waveform_offsets,
+                    "x_range": state.x_range,
+                    "y_range": state.y_range,
+                }
+            )
+            self.analysis_panel.cursor_points = dict(state.cursor_points)
+            self.analysis_panel._refresh_cursor_graphics()
+            try:
+                self._set_interaction_tool(InteractionTool(state.active_tool))
+            except ValueError:
+                self._set_interaction_tool(InteractionTool.ZOOM)
+            self.measurement_overlay_check.setChecked(state.measurement_overlay_visible)
+            self.cursor_overlay_check.setChecked(state.cursor_overlay_visible)
+        finally:
+            self._restoring_view = False
+        self.undo_view_button.setEnabled(self._view_history.can_undo)
+        self.redo_view_button.setEnabled(self._view_history.can_redo)
+        self._refresh_measurement_footer()
+
+    def _undo_view(self) -> None:
+        self._restore_typed_view_state(self._view_history.undo())
+
+    def _redo_view(self) -> None:
+        self._restore_typed_view_state(self._view_history.redo())
+
+    def _update_workspace_status(self) -> None:
+        raw_points = sum(len(waveform.x_values) for waveform in self.current_waveforms)
+        displayed_points = self.analysis_panel.displayed_point_count()
+        view_state = self.analysis_panel.capture_view_state()
+        range_text = "--"
+        if view_state and isinstance(view_state.get("x_range"), tuple):
+            left, right = view_state["x_range"]
+            range_text = f"{float(left):.4g}…{float(right):.4g} s"
+        issues = inspect_waveforms(self.current_waveforms)
+        issue_text = "正常" if not issues else f"{len(issues)} 项警告"
+        badge_color = self.theme.success
+        if any(issue.severity == "error" for issue in issues):
+            badge_color = self.theme.error
+        elif issues:
+            badge_color = self.theme.warning
+        self.quality_badge_label.setText(issue_text)
+        self.quality_badge_label.setStyleSheet(
+            f"color: {badge_color}; border: 1px solid {badge_color}; "
+            "border-radius: 8px; padding: 2px 8px;"
+        )
+        self.workspace_status_label.setText(
+            f"模式：离线/单次　原始点：{raw_points:,}　显示点：{displayed_points:,}　"
+            f"范围：{range_text}"
+        )
+        issue_details = "\n".join(issue.message for issue in issues)
+        self.workspace_status_label.setToolTip(issue_details)
+        self.quality_badge_label.setToolTip(issue_details)
 
     def set_waveform(self, waveform: WaveformData, stats: WaveformStats) -> None:
         self.current_waveforms = [waveform]
@@ -423,6 +1024,7 @@ class WaveformDetailDialog(QDialog):
         self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks([waveform])
+        self._frame_received()
 
     def set_waveforms(self, waveforms: list[WaveformData], primary_stats: WaveformStats | None = None) -> None:
         self.current_waveforms = list(waveforms)
@@ -431,6 +1033,125 @@ class WaveformDetailDialog(QDialog):
         self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks(waveforms)
+        self._frame_received()
+
+    def _frame_received(self) -> None:
+        self._set_workspace_actions_enabled(bool(self.current_waveforms))
+        self._refresh_event_list()
+        self._record_current_view()
+        self._update_workspace_status()
+
+    def _refresh_event_list(self) -> None:
+        self._quick_events = detect_quick_events(self.current_waveforms)
+        self.event_list.clear()
+        for event in self._quick_events[:500]:
+            symbol = {"rising": "↗", "falling": "↘", "maximum": "▲", "minimum": "▼"}.get(
+                event.event_type,
+                "•",
+            )
+            item_text = (
+                f"{symbol} {display_channel_name(event.channel)}  {event.description}  "
+                f"{event.time_s:.6g}s  {event.value:.6g}"
+            )
+            self.event_list.addItem(item_text)
+            item = self.event_list.item(self.event_list.count() - 1)
+            item.setForeground(QBrush(QColor(self.theme.channel_style(event.channel).color)))
+
+    def _focus_selected_event(self, item) -> None:
+        index = self.event_list.row(item)
+        if index < 0 or index >= len(getattr(self, "_quick_events", ())):
+            return
+        event = self._quick_events[index]
+        self.analysis_panel.focus_on_channel_point(
+            (event.time_s, event.value),
+            channel=event.channel,
+            annotation_text=event.description,
+        )
+
+    def _add_annotation_at_cursor(self) -> None:
+        point = self.analysis_panel.cursor_points.get("a")
+        if point is None:
+            self._log_message("请先放置游标 A。")
+            return
+        self._request_annotation_at_point(point, self.analysis_panel.cursor_channels.get("a"))
+
+    def _request_annotation_at_point(
+        self,
+        point: tuple[float, float],
+        channel: str | None,
+    ) -> None:
+        text, accepted = QInputDialog.getText(self, "添加标注", "标注内容")
+        if not accepted or not text.strip():
+            return
+        annotation = WaveformAnnotation(
+            annotation_id=f"annotation-{len(self._annotations) + 1}",
+            text=text.strip(),
+            start_time_s=point[0],
+        )
+        self._annotations.append(annotation)
+        self.analysis_panel.focus_on_channel_point(
+            point,
+            channel=channel,
+            annotation_text=annotation.text,
+        )
+        self._show_status_message("标注已添加")
+        self._set_interaction_tool(InteractionTool.ZOOM)
+
+    def _add_view_bookmark(self) -> None:
+        state = self._current_typed_view_state()
+        if state is None:
+            self._log_message("当前没有可保存的视图。")
+            return
+        name, accepted = QInputDialog.getText(self, "保存视图书签", "书签名称")
+        if not accepted or not name.strip():
+            return
+        name = name.strip()
+        self._bookmarks[name] = state
+        if self.bookmark_combo.findText(name) < 0:
+            self.bookmark_combo.addItem(name)
+        self.bookmark_combo.setCurrentText(name)
+
+    def _restore_selected_bookmark(self, index: int) -> None:
+        if index <= 0:
+            return
+        self._restore_typed_view_state(
+            self._bookmarks.get(self.bookmark_combo.itemText(index))
+        )
+
+    def _load_reference_waveforms(self) -> None:
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "加载参考波形",
+            str(WAVEFORM_CONFIG_DIR),
+            "CSV Files (*.csv)",
+        )
+        if not file_paths:
+            return
+        reference_waveforms: list[WaveformData] = []
+        try:
+            for file_path in file_paths:
+                reference_waveforms.extend(WaveformData.load_csv_bundle(Path(file_path)))
+        except (OSError, ValueError) as exc:
+            self._log_message(f"参考波形加载失败: {exc}")
+            return
+        self.analysis_panel.set_reference_waveforms(reference_waveforms)
+        current_by_channel = {waveform.channel: waveform for waveform in self.current_waveforms}
+        metrics: list[str] = []
+        for reference in reference_waveforms:
+            candidate = current_by_channel.get(reference.channel)
+            if candidate is None:
+                continue
+            try:
+                comparison = compare_to_baseline(reference, candidate)
+            except ValueError:
+                continue
+            metrics.append(
+                f"{display_channel_name(reference.channel)} RMS={comparison.rms_error:.4g}, "
+                f"Max={comparison.maximum_absolute_error:.4g}"
+            )
+        self.reference_result_label.setText(
+            "参考对比：" + ("；".join(metrics) if metrics else "没有同通道重叠数据")
+        )
 
     def set_timebase_scale(self, seconds_per_div: float, *, divisions: int = 10) -> None:
         self.analysis_panel.set_timebase_scale(seconds_per_div, divisions=divisions)
@@ -462,6 +1183,8 @@ class WaveformDetailDialog(QDialog):
         self._sync_phase_compare_toolbar_from_panel()
         self._refresh_measurement_footer()
         self._rebuild_channel_visibility_checks([])
+        self._set_workspace_actions_enabled(False)
+        self._update_workspace_status()
 
     def set_cursor_points(
         self,
@@ -512,6 +1235,7 @@ class WaveformDetailDialog(QDialog):
             QApplication.processEvents()
             QApplication.processEvents()
             image = self.analysis_panel.render_chart_image()
+            self._decorate_export_image(image)
             return image.save(str(output_path), "PNG")
         finally:
             self.analysis_panel.restore_view_state(saved_view_state)
@@ -530,6 +1254,9 @@ class WaveformDetailDialog(QDialog):
             channel: checkbox.isChecked()
             for channel, checkbox in self.channel_visibility_checks.items()
         }
+        saved_visible = self._settings.value("visible_channels", [])
+        if isinstance(saved_visible, str):
+            saved_visible = [saved_visible]
         while self.channel_toggle_layout.count():
             item = self.channel_toggle_layout.takeAt(0)
             widget = item.widget()
@@ -547,7 +1274,14 @@ class WaveformDetailDialog(QDialog):
         active_waveform_channels = {waveform.channel for waveform in waveforms}
         for channel in SUPPORTED_CHANNELS:
             checkbox = QCheckBox(display_channel_name(channel))
-            checked = previous_states.get(channel, channel in active_waveform_channels)
+            checkbox.setStyleSheet(
+                f"color: {self.theme.channel_style(channel).color}; font-weight: 600;"
+            )
+            default_checked = (
+                channel in active_waveform_channels
+                and (not saved_visible or channel in saved_visible)
+            )
+            checked = previous_states.get(channel, default_checked)
             checkbox.setChecked(checked)
             checkbox.toggled.connect(
                 lambda checked=False, target_channel=channel: self._handle_channel_checkbox_toggled(target_channel, checked)
@@ -684,6 +1418,11 @@ class WaveformDetailDialog(QDialog):
             point_b = self.analysis_panel.cursor_points.get("b")
             if point_a is not None and point_b is not None:
                 self._write_marker_sidecar(output_path, point_a, point_b, "Cursor Window")
+        save_workspace_metadata(
+            output_path.with_suffix(".workspace.json"),
+            bookmarks=self._bookmarks,
+            annotations=self._annotations,
+        )
         self._log_message(f"波形局部已导出: {output_path}")
 
     def _capture_current_view_image(self) -> None:
@@ -707,6 +1446,7 @@ class WaveformDetailDialog(QDialog):
         QApplication.processEvents()
         QApplication.processEvents()
         image = self._render_current_view_image(scale=2.0)
+        self._decorate_export_image(image)
         if image.save(str(output_path), "PNG"):
             self._log_message(f"当前视图截图已保存: {output_path}")
         else:
@@ -821,7 +1561,7 @@ class WaveformDetailDialog(QDialog):
         target_width = max(int(base_size.width() * scale), 1)
         target_height = max(int(base_size.height() * scale), 1)
         pixmap = QPixmap(target_width, target_height)
-        pixmap.fill(Qt.white)
+        pixmap.fill(QColor(self.theme.window_background))
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
@@ -829,6 +1569,39 @@ class WaveformDetailDialog(QDialog):
         container.render(painter, QPoint())
         painter.end()
         return pixmap
+
+    def _decorate_export_image(self, pixmap: QPixmap) -> None:
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        footer_height = 34
+        footer_rect = pixmap.rect()
+        footer_rect.setTop(max(footer_rect.bottom() - footer_height, 0))
+        background = QColor(self.theme.panel_background)
+        background.setAlpha(230)
+        painter.fillRect(footer_rect, background)
+        x_position = 14
+        baseline = footer_rect.top() + 22
+        for waveform in self.current_waveforms:
+            if waveform.channel not in self.analysis_panel.visible_channels:
+                continue
+            painter.setPen(QColor(self.theme.channel_style(waveform.channel).color))
+            label = display_channel_name(waveform.channel)
+            painter.drawText(x_position, baseline, label)
+            x_position += painter.fontMetrics().horizontalAdvance(label) + 18
+        painter.setPen(QColor(self.theme.secondary_text))
+        state = self.analysis_panel.capture_view_state()
+        range_text = ""
+        if state and isinstance(state.get("x_range"), tuple):
+            left, right = state["x_range"]
+            range_text = f"{float(left):.5g}…{float(right):.5g} s"
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        footer_text = f"{range_text}   {stamp}".strip()
+        painter.drawText(
+            max(pixmap.width() - painter.fontMetrics().horizontalAdvance(footer_text) - 14, x_position),
+            baseline,
+            footer_text,
+        )
+        painter.end()
 
     def _clip_waveform_to_time_range(
         self,
@@ -895,6 +1668,11 @@ class WaveformDetailDialog(QDialog):
 
     def _handle_cursor_measurements_changed(self, measurements: dict[str, str]) -> None:
         self.cursor_measurements = measurements
+        self.cursor_detail_label.setText(
+            "\n".join(f"{name}: {value}" for name, value in measurements.items())
+            if measurements
+            else "尚未放置游标"
+        )
         self._refresh_measurement_footer()
 
     def _toggle_measurement_freeze(self, checked: bool) -> None:
@@ -1002,11 +1780,17 @@ class WaveformDetailDialog(QDialog):
             return
 
         channel_sections: list[str] = []
+        all_channel_sections: list[str] = []
         measurement_scope = self._selected_measurement_scope()
         for waveform in self.current_waveforms:
             section_html = self._build_measurement_section_html(waveform, measurement_scope)
             if section_html:
-                channel_sections.append(section_html)
+                all_channel_sections.append(section_html)
+                if waveform.channel == self.analysis_panel.active_waveform_channel:
+                    channel_sections.append(section_html)
+        if not channel_sections and all_channel_sections:
+            channel_sections.append(all_channel_sections[0])
+        self.measurement_detail_label.setText("<br>".join(all_channel_sections))
 
         cursor_section = self._build_cursor_measurement_section_html()
 
@@ -1030,19 +1814,19 @@ class WaveformDetailDialog(QDialog):
             if channel_sections:
                 self.measurement_overlay_hint.setText(hint_text)
                 self.measurement_text_label.setText(self._build_measurement_overlay_html(channel_sections))
-                self.measurement_overlay.show()
+                self.measurement_overlay.setVisible(self.measurement_overlay_check.isChecked())
             else:
                 self.measurement_text_label.clear()
                 if hint_text:
                     self.measurement_overlay_hint.setText(hint_text)
-                    self.measurement_overlay.show()
+                    self.measurement_overlay.setVisible(self.measurement_overlay_check.isChecked())
                 else:
                     self.measurement_overlay.hide()
 
             if cursor_section:
                 self.cursor_overlay_hint.setText("游标测量")
                 self.cursor_text_label.setText(cursor_section)
-                self.cursor_overlay.show()
+                self.cursor_overlay.setVisible(self.cursor_overlay_check.isChecked())
             else:
                 self.cursor_text_label.clear()
                 self.cursor_overlay.hide()
@@ -1194,11 +1978,11 @@ class WaveformDetailDialog(QDialog):
             unit = _measurement_unit(channel_unit, measurement_name)
             formatted_value = _format_measurement_display(raw_value, unit)
             metric_items.append(
-                f"<span style='color:{WAVEFORM_CHANNEL_COLORS.get(waveform.channel, '#222222')};'>"
+                f"<span style='color:{self.theme.channel_style(waveform.channel).color};'>"
                 f"{measurement_name}"
                 "</span>"
-                f"<span style='color:{WAVEFORM_CHANNEL_COLORS.get(waveform.channel, '#222222')};'>: </span>"
-                f"<span style='font-weight:600; color:{WAVEFORM_CHANNEL_COLORS.get(waveform.channel, '#222222')};'>"
+                f"<span style='color:{self.theme.channel_style(waveform.channel).color};'>: </span>"
+                f"<span style='font-weight:600; color:{self.theme.channel_style(waveform.channel).color};'>"
                 f"{formatted_value}"
                 "</span>"
             )
@@ -1207,7 +1991,7 @@ class WaveformDetailDialog(QDialog):
             return ""
 
         title = display_channel_name(waveform.channel)
-        title_color = WAVEFORM_CHANNEL_COLORS.get(waveform.channel, "#222222")
+        title_color = self.theme.channel_style(waveform.channel).color
         rows: list[str] = []
         items_per_column = 4
         column_count = max((len(metric_items) + items_per_column - 1) // items_per_column, 1)
@@ -1254,14 +2038,16 @@ class WaveformDetailDialog(QDialog):
         )
 
     def _build_cursor_measurement_section_html(self) -> str:
+        core_labels = {"游标 A", "游标 B", "Δt", "ΔV/ΔI"}
         visible_items = [
             (label, value)
             for label, value in self.cursor_measurements.items()
-            if value and value != "-"
+            if label in core_labels and value and value != "-"
         ]
         target_channel, edge_type, comparison_mode, minimum_edge_interval_s, comparison, message = self.analysis_panel.channel_comparison_state()
         reference_channel = self.analysis_panel.active_waveform_channel
-        if target_channel:
+        include_phase_in_overlay = False
+        if include_phase_in_overlay and target_channel:
             relation_label = (
                 f"{display_channel_name(target_channel)} 相对 {display_channel_name(reference_channel)}"
                 if reference_channel
@@ -1303,8 +2089,8 @@ class WaveformDetailDialog(QDialog):
             rows.append(
                 "<tr>"
                 f"<td style='padding:0 0 10px 0; vertical-align:top; white-space:nowrap; line-height:1.62; font-size:{OVERLAY_BODY_HTML_PX}px;'>"
-                f"<span style='color:rgba(45,45,45,0.72);'>{label}</span>"
-                f"<br><span style='font-weight:600; color:#1f1f1f;'>{value}</span>"
+                f"<span style='color:{self.theme.secondary_text};'>{label}</span>"
+                f"<br><span style='font-weight:600; color:{self.theme.primary_text};'>{value}</span>"
                 "</td>"
                 "</tr>"
             )
@@ -1318,19 +2104,26 @@ class WaveformDetailDialog(QDialog):
         chart_rect = self.analysis_panel.chart_view.rect()
         if self.measurement_overlay.isVisible():
             overlay_width = min(
-                max(int(chart_rect.width() * 0.82), 420),
-                max(chart_rect.width() - 44, 260),
+                max(int(chart_rect.width() * 0.28), 300),
+                min(max(chart_rect.width() - 44, 260), 440),
             )
             self.measurement_overlay.setMinimumWidth(260)
             self.measurement_overlay.setMaximumWidth(max(overlay_width, 260))
             self.measurement_text_label.setMinimumWidth(220)
             self.measurement_text_label.setMaximumWidth(max(overlay_width - 16, 220))
             self.measurement_text_label.adjustSize()
-            content_height = self.measurement_text_label.sizeHint().height()
-            hint_height = self.measurement_overlay_hint.sizeHint().height()
+            content_height = (
+                0
+                if self.measurement_text_label.isHidden()
+                else self.measurement_text_label.sizeHint().height()
+            )
+            hint_height = max(
+                self.measurement_overlay_hint.sizeHint().height(),
+                self.measurement_overlay_collapse_button.sizeHint().height(),
+            )
             overlay_height = hint_height + content_height + 18
-            x_pos = max((chart_rect.width() - overlay_width) // 2 + 80, 12)
-            y_pos = max(chart_rect.height() - 260, 12)
+            x_pos = 24
+            y_pos = max(chart_rect.height() - overlay_height - 28, 48)
             self.measurement_overlay.setGeometry(x_pos, y_pos, overlay_width, overlay_height)
             self.measurement_overlay.raise_()
 
@@ -1341,8 +2134,15 @@ class WaveformDetailDialog(QDialog):
             self.cursor_text_label.setMinimumWidth(140)
             self.cursor_text_label.setMaximumWidth(max(cursor_width - 10, 140))
             self.cursor_text_label.adjustSize()
-            cursor_content_height = self.cursor_text_label.sizeHint().height()
-            cursor_hint_height = self.cursor_overlay_hint.sizeHint().height()
+            cursor_content_height = (
+                0
+                if self.cursor_text_label.isHidden()
+                else self.cursor_text_label.sizeHint().height()
+            )
+            cursor_hint_height = max(
+                self.cursor_overlay_hint.sizeHint().height(),
+                self.cursor_overlay_collapse_button.sizeHint().height(),
+            )
             cursor_height = cursor_hint_height + cursor_content_height + 12
             cursor_x = max(chart_rect.width() - cursor_width - 18, 12)
             cursor_y = 24
@@ -1352,6 +2152,10 @@ class WaveformDetailDialog(QDialog):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._reposition_measurement_overlay()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._save_workspace_settings()
+        super().closeEvent(event)
 
     def eventFilter(self, watched, event) -> bool:
         if watched is self.analysis_panel.chart_view and event.type() in {QEvent.Resize, QEvent.Show}:

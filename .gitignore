@@ -2,6 +2,7 @@
 .idea/
 __pycache__/
 .pytest_cache/
+.pytest_cache_current/
 *.pyc
 build/
 captures/

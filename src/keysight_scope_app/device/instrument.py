@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-import threading
 from typing import Callable
 
 import pyvisa
@@ -13,7 +14,6 @@ from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestResult,
     analyze_startup_brake_test,
 )
-from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
 from keysight_scope_app.analysis.waveform import (
     EdgeComparison,
     LockRecommendation,
@@ -30,7 +30,10 @@ from keysight_scope_app.analysis.waveform import (
     compare_encoder_ab_edges,
     compare_waveform_edges,
 )
-
+from keysight_scope_app.device.errors import ScopeSessionError, WaveformIntegrityError
+from keysight_scope_app.device.models import CaptureRequest, CaptureResult, InstrumentCapabilities
+from keysight_scope_app.device.transport import ScopeTransport, VisaScopeTransport
+from keysight_scope_app.utils import format_engineering_value, strip_ieee4882_block
 
 QueryBuilder = Callable[[str], str]
 StatsValueGetter = Callable[[WaveformStats], float | None]
@@ -117,20 +120,30 @@ def list_visa_resources(backend: str | None = None) -> tuple[str, ...]:
 
 
 class KeysightOscilloscope:
-    def __init__(self, resource_name: str, backend: str | None = None, timeout_ms: int = 10000) -> None:
+    def __init__(
+        self,
+        resource_name: str,
+        backend: str | None = None,
+        timeout_ms: int = 10000,
+        *,
+        transport: ScopeTransport | None = None,
+    ) -> None:
         self.resource_name = resource_name
         self.backend = backend or None
         self.timeout_ms = timeout_ms
         self._resource_manager: pyvisa.ResourceManager | None = None
         self._instrument = None
+        self._transport = transport
         self._lock = threading.RLock()
 
     @property
     def is_connected(self) -> bool:
-        return self._instrument is not None
+        return (self._transport is not None and self._transport.is_open) or self._instrument is not None
 
     def connect(self) -> str:
         with self._lock:
+            if self._transport is not None:
+                return self.query("*IDN?")
             if self._instrument is not None:
                 return self.query("*IDN?")
 
@@ -147,16 +160,22 @@ class KeysightOscilloscope:
                 pass
             instrument.write("*CLS")
             self._instrument = instrument
+            self._transport = VisaScopeTransport(self._resource_manager, instrument, resource_name)
             self.resource_name = resource_name
             return self.query("*IDN?")
 
     def disconnect(self) -> None:
         with self._lock:
+            transport = self._transport
             instrument = self._instrument
             resource_manager = self._resource_manager
+            self._transport = None
             self._instrument = None
             self._resource_manager = None
 
+            if transport is not None:
+                transport.close()
+                return
             if instrument is not None:
                 instrument.close()
             if resource_manager is not None:
@@ -165,6 +184,8 @@ class KeysightOscilloscope:
     def query(self, command: str) -> str:
         with self._lock:
             self._ensure_connected()
+            if self._transport is not None:
+                return self._transport.query(command)
             try:
                 return str(self._instrument.query(command)).strip()
             except InvalidSession as exc:
@@ -174,6 +195,9 @@ class KeysightOscilloscope:
     def write(self, command: str) -> None:
         with self._lock:
             self._ensure_connected()
+            if self._transport is not None:
+                self._transport.write(command)
+                return
             try:
                 self._instrument.write(command)
             except InvalidSession as exc:
@@ -303,10 +327,16 @@ class KeysightOscilloscope:
 
         with self._lock:
             self._ensure_connected()
-            self._instrument.write(f":WAVeform:SOURce {channel}")
-            self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
-            self._instrument.write(f":WAVeform:POINts {probe_points}")
-            response = self._instrument.query(":WAVeform:POINts?")
+            if self._transport is not None:
+                self._transport.write(f":WAVeform:SOURce {channel}")
+                self._transport.write(f":WAVeform:POINts:MODE {points_mode}")
+                self._transport.write(f":WAVeform:POINts {probe_points}")
+                response = self._transport.query(":WAVeform:POINts?")
+            else:
+                self._instrument.write(f":WAVeform:SOURce {channel}")
+                self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
+                self._instrument.write(f":WAVeform:POINts {probe_points}")
+                response = self._instrument.query(":WAVeform:POINts?")
         try:
             return int(float(str(response).strip()))
         except Exception:
@@ -366,6 +396,11 @@ class KeysightOscilloscope:
 
         with self._lock:
             self._ensure_connected()
+            if self._transport is not None:
+                self._transport.write(":HARDcopy:INKSaver OFF")
+                payload = self._transport.query_binary(":DISPlay:DATA? PNG, COLor")
+                target_path.write_bytes(payload)
+                return target_path
             self._instrument.write(":HARDcopy:INKSaver OFF")
             try:
                 payload = bytes(
@@ -400,27 +435,37 @@ class KeysightOscilloscope:
 
         with self._lock:
             self._ensure_connected()
-            self._instrument.write(f":WAVeform:SOURce {channel}")
-            self._instrument.write(":WAVeform:FORMat BYTE")
-            self._instrument.write(":WAVeform:UNSigned ON")
-            self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
-            self._instrument.write(f":WAVeform:POINts {points}")
-            preamble_values = self._instrument.query_ascii_values(":WAVeform:PREamble?")
-            try:
-                payload = list(
-                    self._instrument.query_binary_values(
-                        ":WAVeform:DATA?",
-                        datatype="B",
-                        container=list,
-                        header_fmt="ieee",
-                        expect_termination=False,
+            if self._transport is not None:
+                self._transport.write(f":WAVeform:SOURce {channel}")
+                self._transport.write(":WAVeform:FORMat BYTE")
+                self._transport.write(":WAVeform:UNSigned ON")
+                self._transport.write(f":WAVeform:POINts:MODE {points_mode}")
+                self._transport.write(f":WAVeform:POINts {points}")
+                preamble_values = self._transport.query_ascii(":WAVeform:PREamble?")
+                payload = list(self._transport.query_binary(":WAVeform:DATA?"))
+            else:
+                self._instrument.write(f":WAVeform:SOURce {channel}")
+                self._instrument.write(":WAVeform:FORMat BYTE")
+                self._instrument.write(":WAVeform:UNSigned ON")
+                self._instrument.write(f":WAVeform:POINts:MODE {points_mode}")
+                self._instrument.write(f":WAVeform:POINts {points}")
+                preamble_values = self._instrument.query_ascii_values(":WAVeform:PREamble?")
+                try:
+                    payload = list(
+                        self._instrument.query_binary_values(
+                            ":WAVeform:DATA?",
+                            datatype="B",
+                            container=list,
+                            header_fmt="ieee",
+                            expect_termination=False,
+                        )
                     )
-                )
-            except Exception:
-                self._instrument.write(":WAVeform:DATA?")
-                payload = list(strip_ieee4882_block(self._instrument.read_raw()))
+                except Exception:
+                    self._instrument.write(":WAVeform:DATA?")
+                    payload = list(strip_ieee4882_block(self._instrument.read_raw()))
 
         preamble = _parse_preamble(preamble_values)
+        _validate_waveform_payload(preamble, payload)
         x_values = [
             ((index - preamble.x_reference) * preamble.x_increment) + preamble.x_origin
             for index in range(len(payload))
@@ -437,6 +482,40 @@ class KeysightOscilloscope:
             y_values=y_values,
         )
 
+    def capture(self, request: CaptureRequest) -> CaptureResult:
+        started = time.perf_counter()
+        waveforms = tuple(
+            self.fetch_waveform(channel, points_mode=request.points_mode, points=request.points)
+            for channel in request.channels
+        )
+        units = self.get_channel_units(list(request.channels))
+        layouts = self.get_channel_vertical_layouts(list(request.channels))
+        return CaptureResult(
+            request=request,
+            waveforms=waveforms,
+            channel_units=units,
+            vertical_layouts=layouts,
+            elapsed_s=time.perf_counter() - started,
+        )
+
+    def get_capabilities(self) -> InstrumentCapabilities:
+        identity = self.assert_keysight_vendor()
+        modes: list[str] = []
+        warnings: list[str] = []
+        for mode in SUPPORTED_WAVEFORM_POINTS_MODES:
+            try:
+                if self.probe_waveform_available("CHANnel1", points_mode=mode):
+                    modes.append(mode)
+            except (VisaIOError, ScopeSessionError):
+                raise
+            except Exception as exc:
+                warnings.append(f"{mode}: {exc}")
+        return InstrumentCapabilities(
+            identity=identity,
+            waveform_points_modes=tuple(modes) or ("NORMal",),
+            warnings=tuple(warnings),
+        )
+
     def probe_waveform_available(
         self,
         channel: str,
@@ -451,6 +530,18 @@ class KeysightOscilloscope:
 
         with self._lock:
             self._ensure_connected()
+            if self._transport is not None:
+                try:
+                    self._transport.write(f":WAVeform:SOURce {channel}")
+                    self._transport.write(":WAVeform:FORMat BYTE")
+                    self._transport.write(":WAVeform:UNSigned ON")
+                    self._transport.write(f":WAVeform:POINts:MODE {points_mode}")
+                    self._transport.query_ascii(":WAVeform:PREamble?")
+                    return True
+                except ScopeSessionError:
+                    raise
+                except Exception:
+                    return False
             previous_timeout = self._instrument.timeout
             try:
                 self._instrument.timeout = timeout_ms
@@ -476,14 +567,19 @@ class KeysightOscilloscope:
         return idn
 
     def _ensure_connected(self) -> None:
-        if self._instrument is None:
-            raise RuntimeError("示波器尚未连接。")
+        if self._transport is None and self._instrument is None:
+            raise ScopeSessionError("示波器尚未连接。")
 
     def _invalidate_session(self) -> None:
+        transport = self._transport
         instrument = self._instrument
         resource_manager = self._resource_manager
+        self._transport = None
         self._instrument = None
         self._resource_manager = None
+        if transport is not None:
+            transport.close()
+            return
         if instrument is not None:
             try:
                 instrument.close()
@@ -613,3 +709,18 @@ def _parse_preamble(values: list[float]) -> WaveformPreamble:
         y_origin=float(values[8]),
         y_reference=int(values[9]),
     )
+
+
+def _validate_waveform_payload(preamble: WaveformPreamble, payload: list[int]) -> None:
+    if not payload:
+        raise WaveformIntegrityError("示波器返回了空波形，请确认通道已开启且已完成采集。")
+    if preamble.points <= 0:
+        raise WaveformIntegrityError("波形前导信息中的点数无效。")
+    if preamble.x_increment <= 0:
+        raise WaveformIntegrityError("波形采样间隔无效，无法建立单调时间轴。")
+    if preamble.y_increment == 0:
+        raise WaveformIntegrityError("波形垂直增量为零，无法换算采样值。")
+    if len(payload) > preamble.points:
+        raise WaveformIntegrityError(
+            f"波形数据点数 {len(payload)} 超过前导声明的 {preamble.points}。"
+        )

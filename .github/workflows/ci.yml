@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: ["master", "main"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+      - name: Lint new architecture modules
+        run: python -m ruff check src/keysight_scope_app/device src/keysight_scope_app/infra src/keysight_scope_app/services tests/device tests/infra tests/services
+      - name: Type check
+        run: python -m mypy
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - name: Build executable
+        run: python -m PyInstaller --noconfirm --clean KeysightScopeApp-OneFile.spec

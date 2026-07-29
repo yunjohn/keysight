@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keysight-scope-app"
+version = "1.0.1"
+description = "Keysight oscilloscope capture and validation desktop application"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "Pillow>=10.0,<12.0",
+  "PySide6>=6.7,<7.0",
+  "pyvisa>=1.14,<2.0",
+  "pyvisa-py>=0.7,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11,<2.0",
+  "pyinstaller>=6.0,<7.0",
+  "pytest>=8.0,<9.0",
+  "ruff>=0.6,<1.0",
+]
+
+[project.scripts]
+keysight-scope-app = "keysight_scope_app.ui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+cache_dir = ".pytest_cache_current"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/keysight_scope_app/device/__init__.py" = ["F401"]
+"src/keysight_scope_app/device/instrument.py" = ["F401"]
+"src/keysight_scope_app/infra/__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+files = [
+  "src/keysight_scope_app/device/errors.py",
+  "src/keysight_scope_app/device/models.py",
+  "src/keysight_scope_app/device/transport.py",
+  "src/keysight_scope_app/infra/task_runner.py",
+  "src/keysight_scope_app/services",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+check_untyped_defs = true
+warn_unused_ignores = true
+disable_error_code = ["misc"]

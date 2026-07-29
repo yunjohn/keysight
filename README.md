@@ -129,6 +129,9 @@ git push origin v1.0.0
 - 不会自动弹出波形窗口
 - 只有点击结果点 `定位` 或手动应用游标时，才会弹出独立波形窗口
 - 测试记录支持本地持久化与 CSV 导出
+- 自动归档默认开启，可在启动刹车窗口设置并记忆项目名称。每次成功测试按
+  `captures/startup_brake_tests/snapshots/<项目名>/test_NNNN/` 独立保存标准截图、
+  完整波形 `waveforms.csv` 和测试追溯信息 `metadata.json`；留空项目名归入 `default`。
 
 ## 目录说明
 
@@ -138,6 +141,22 @@ git push origin v1.0.0
 - `captures/`：运行期抓图、波形、测试记录
 
 ## 测试
+
+推荐使用统一项目入口安装开发依赖：
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[dev]"
+```
+
+完整质量检查：
+
+```powershell
+.venv\Scripts\python -m ruff check src/keysight_scope_app/device src/keysight_scope_app/infra src/keysight_scope_app/services tests/device tests/infra tests/services
+.venv\Scripts\python -m mypy
+.venv\Scripts\python -m pytest -q
+```
+
+设备层支持注入 `ScriptedScopeTransport`，因此连接、采集、截图和故障场景可以在没有真实示波器时回归测试。验证服务层提供版本化测试方案、三态判定（`PASS / FAIL / INCONCLUSIVE`）、批量运行、数据质量检查、基准波形对比以及 HTML/CSV 报告。
 
 语法检查：
 

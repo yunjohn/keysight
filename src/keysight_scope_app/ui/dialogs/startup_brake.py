@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtGui import QFont, QFontMetrics, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QSizePolicy,
@@ -30,7 +31,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from keysight_scope_app.device.instrument import SUPPORTED_CHANNELS
 from keysight_scope_app.analysis.startup_brake import (
     StartupBrakeTestConfig,
     StartupBrakeTestResult,
@@ -38,11 +38,14 @@ from keysight_scope_app.analysis.startup_brake import (
     diagnose_startup_brake_failure,
 )
 from keysight_scope_app.analysis.waveform import SignalPeak, SpeedTargetMatch, WaveformData, ZeroStableWindow
+from keysight_scope_app.device.instrument import SUPPORTED_CHANNELS
 from keysight_scope_app.ui.helpers import (
     apply_responsive_window_geometry,
     create_scroll_area,
     display_channel_name,
     normalize_channel_name,
+    set_equal_button_widths,
+    set_uniform_control_height,
 )
 
 if TYPE_CHECKING:
@@ -62,6 +65,12 @@ class StartupBrakeHistoryEntry:
     result: StartupBrakeTestResult
     timestamp: str
     config: StartupBrakeTestConfig
+
+
+@dataclass(frozen=True)
+class StartupBrakeArchiveSource:
+    kind: str
+    path: str | None = None
 
 
 class StartupBrakeTestDialog(QDialog):
@@ -84,7 +93,7 @@ class StartupBrakeTestDialog(QDialog):
         self._summary_full_text = self.DEFAULT_SUMMARY_TEXT
         self._failure_diagnostics_full_text = "当前无失败诊断。"
 
-        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowTitle("启动刹车性能测试")
         apply_responsive_window_geometry(
@@ -122,6 +131,7 @@ class StartupBrakeTestDialog(QDialog):
         self.clear_stats_button.clicked.connect(self.clear_history)
 
         self._stabilize_push_buttons(self)
+        self._normalize_button_widths()
         self._normalize_label_alignment(self)
         self.clear_results()
         self._load_history()
@@ -288,9 +298,41 @@ class StartupBrakeTestDialog(QDialog):
         test_mode_row.addStretch(1)
         layout.addLayout(test_mode_row)
 
-        brake_title = QLabel("刹车判定")
-        brake_title.setFont(QFont(brake_title.font().family(), brake_title.font().pointSize(), QFont.Bold))
-        layout.addWidget(brake_title)
+        self.archive_box = self._group_box("自动归档")
+        archive_layout = QVBoxLayout(self.archive_box)
+        archive_layout.setContentsMargins(12, 10, 12, 10)
+        archive_layout.setSpacing(8)
+        self.project_name_input = QLineEdit("default")
+        self.project_name_input.setPlaceholderText("项目名称，留空时使用 default")
+        self.project_name_input.setClearButtonEnabled(True)
+        self.project_name_input.setMinimumWidth(220)
+        self.project_name_input.setMaximumWidth(300)
+        self.archive_snapshots_check = QCheckBox("自动截图归档")
+        self.archive_snapshots_check.setChecked(True)
+        self.archive_snapshots_check.setToolTip(
+            "开启后，每次成功测试会按项目和顺序编号归档标准化截图、完整波形和元数据。"
+        )
+        self.archive_path_hint = QLabel()
+        self.archive_path_hint.setWordWrap(True)
+        self.archive_path_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.archive_path_hint.setForegroundRole(QPalette.PlaceholderText)
+        self.archive_path_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        archive_row = QHBoxLayout()
+        archive_row.setSpacing(16)
+        archive_row.addWidget(self._inline_form_field("项目名称", self.project_name_input))
+        archive_row.addWidget(self.archive_snapshots_check)
+        archive_row.addStretch(1)
+        archive_layout.addLayout(archive_row)
+        archive_layout.addWidget(self.archive_path_hint)
+        layout.addWidget(self.archive_box)
+        self.project_name_input.textChanged.connect(self._on_archive_settings_changed)
+        self.archive_snapshots_check.toggled.connect(self._on_archive_settings_changed)
+        self._update_archive_path_hint()
+
+        self.brake_box = self._group_box("刹车判定")
+        brake_box_layout = QVBoxLayout(self.brake_box)
+        brake_box_layout.setContentsMargins(12, 10, 12, 10)
+        brake_box_layout.setSpacing(8)
 
         self.brake_mode_combo = QComboBox()
         self.brake_mode_combo.addItem("电流归零", "current_zero")
@@ -356,27 +398,39 @@ class StartupBrakeTestDialog(QDialog):
             self.brake_max_fall_ms_input,
         )
         brake_grid = QGridLayout()
-        brake_grid.setHorizontalSpacing(12)
-        brake_grid.setVerticalSpacing(6)
+        self.brake_grid = brake_grid
+        brake_grid.setHorizontalSpacing(16)
+        brake_grid.setVerticalSpacing(8)
         brake_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        brake_grid.addWidget(self._inline_form_field("刹车模式", self.brake_mode_combo), 0, 0)
-        brake_grid.addWidget(self._inline_form_field("零电流阈值", self.zero_threshold_input), 0, 1)
-        brake_grid.addWidget(self._inline_form_field("水平线波动", self.flat_threshold_input), 0, 2)
-        brake_grid.addWidget(self._inline_form_field("零流保持时间", self.hold_ms_input), 0, 3)
-        brake_grid.addWidget(self._inline_form_field("低电平保持时间", self.brake_low_hold_ms_input), 1, 3)
+        self.brake_mode_field = self._inline_form_field("刹车模式", self.brake_mode_combo)
+        self.zero_threshold_field = self._inline_form_field("零电流阈值", self.zero_threshold_input)
+        self.flat_threshold_field = self._inline_form_field("水平线波动", self.flat_threshold_input)
+        self.zero_hold_field = self._inline_form_field("零流保持时间", self.hold_ms_input)
+        self.brake_low_hold_field = self._inline_form_field("低电平保持时间", self.brake_low_hold_ms_input)
         self.backtrack_field = self._inline_form_field("回溯脉冲数", self.backtrack_pulses_input)
         self.backtrack_min_step_field = self._inline_form_field("回溯最小跳变", self.backtrack_min_step_input)
         self.backtrack_min_interval_field = self._inline_form_field("回溯最小间隔", self.backtrack_min_interval_ms_input)
+        self.brake_min_fall_field = self._inline_form_field("最小下降时间", self.brake_min_fall_ms_input)
+        self.brake_max_fall_field = self._inline_form_field("最大下降时间", self.brake_max_fall_ms_input)
+        brake_grid.addWidget(self.brake_mode_field, 0, 0)
+        brake_grid.addWidget(self.zero_threshold_field, 0, 1)
+        brake_grid.addWidget(self.flat_threshold_field, 0, 2)
+        brake_grid.addWidget(self.zero_hold_field, 0, 3)
         brake_grid.addWidget(self.backtrack_field, 1, 0)
         brake_grid.addWidget(self.backtrack_min_step_field, 1, 1)
         brake_grid.addWidget(self.backtrack_min_interval_field, 1, 2)
-        brake_grid.addWidget(self._inline_form_field("最小下降时间", self.brake_min_fall_ms_input), 2, 0)
-        brake_grid.addWidget(self._inline_form_field("最大下降时间", self.brake_max_fall_ms_input), 2, 1)
-        layout.addLayout(brake_grid)
+        brake_grid.addWidget(self.brake_low_hold_field, 1, 3)
+        brake_grid.addWidget(self.brake_min_fall_field, 2, 0)
+        brake_grid.addWidget(self.brake_max_fall_field, 2, 1)
+        for column in range(4):
+            brake_grid.setColumnMinimumWidth(column, 244)
+        brake_box_layout.addLayout(brake_grid)
+        layout.addWidget(self.brake_box)
 
-        button_row = QGridLayout()
-        button_row.setHorizontalSpacing(8)
-        button_row.setVerticalSpacing(6)
+        self.action_box = self._group_box("测试操作")
+        action_layout = QVBoxLayout(self.action_box)
+        action_layout.setContentsMargins(12, 10, 12, 10)
+        action_layout.setSpacing(8)
         self.run_button = QPushButton("执行测试")
         self.simulate_button = QPushButton("加载波形模拟测试")
         self.export_startup_waveform_button = QPushButton("导出启动段波形")
@@ -391,21 +445,32 @@ class StartupBrakeTestDialog(QDialog):
         self.export_startup_waveform_button.setEnabled(False)
         self.export_brake_waveform_button.setEnabled(False)
         self.export_report_button.setEnabled(False)
-        self.archive_snapshots_check = QCheckBox("自动截图归档")
-        self.archive_snapshots_check.setChecked(False)
-        self.archive_snapshots_check.setToolTip("开启后，测试完成会自动导出启动段/刹车段/全流程标准化截图。关闭可减少执行测试耗时。")
-        button_row.addWidget(self.run_button, 0, 0)
-        button_row.addWidget(self.simulate_button, 0, 1)
-        button_row.addWidget(self.archive_snapshots_check, 0, 2)
-        button_row.addWidget(self.export_startup_waveform_button, 1, 0)
-        button_row.addWidget(self.export_brake_waveform_button, 1, 1)
-        button_row.addWidget(self.export_report_button, 1, 2)
-        button_row.addWidget(self.apply_startup_cursor_button, 2, 0)
-        button_row.addWidget(self.apply_brake_cursor_button, 2, 1)
-        button_row.addWidget(self.export_stats_button, 2, 2)
-        button_row.addWidget(self.clear_stats_button, 2, 3)
-        button_row.setColumnStretch(3, 1)
-        layout.addLayout(button_row)
+        primary_font = self.run_button.font()
+        primary_font.setBold(True)
+        self.run_button.setFont(primary_font)
+        self.simulate_button.setFont(primary_font)
+        self.run_button.setMinimumHeight(34)
+        self.simulate_button.setMinimumHeight(34)
+
+        primary_action_row = self._left_aligned_button_row(self.run_button, self.simulate_button)
+        export_action_row = self._left_aligned_button_row(
+            self.export_startup_waveform_button,
+            self.export_brake_waveform_button,
+            self.export_report_button,
+        )
+        auxiliary_action_row = self._left_aligned_button_row(
+            self.apply_startup_cursor_button,
+            self.apply_brake_cursor_button,
+            self.export_stats_button,
+            self.clear_stats_button,
+        )
+        self.primary_action_row = primary_action_row
+        self.export_action_row = export_action_row
+        self.auxiliary_action_row = auxiliary_action_row
+        action_layout.addLayout(primary_action_row)
+        action_layout.addLayout(export_action_row)
+        action_layout.addLayout(auxiliary_action_row)
+        layout.addWidget(self.action_box)
 
         result_stats_row = QHBoxLayout()
         result_stats_row.setSpacing(12)
@@ -549,6 +614,16 @@ class StartupBrakeTestDialog(QDialog):
         row.addWidget(widget)
         row.addStretch(1)
         return container
+
+    def _left_aligned_button_row(self, *buttons: QPushButton) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        for button in buttons:
+            button.setMaximumWidth(176)
+            row.addWidget(button)
+        row.addStretch(1)
+        return row
 
     def _metric_card(self, title: str, value_label: QLabel) -> QWidget:
         card = QFrame()
@@ -722,10 +797,20 @@ class StartupBrakeTestDialog(QDialog):
             card.setEnabled(key not in muted_keys)
 
     def _stabilize_push_buttons(self, container: QWidget) -> None:
-        for button in container.findChildren(QPushButton):
-            button.setAutoDefault(False)
-            button.setDefault(False)
-            button.setMinimumHeight(max(button.minimumHeight(), 30))
+        set_uniform_control_height(container)
+
+    def _normalize_button_widths(self) -> None:
+        set_equal_button_widths(
+            self.run_button,
+            self.simulate_button,
+            self.export_startup_waveform_button,
+            self.export_brake_waveform_button,
+            self.export_report_button,
+            self.apply_startup_cursor_button,
+            self.apply_brake_cursor_button,
+            self.export_stats_button,
+            self.clear_stats_button,
+        )
 
     def _normalize_label_alignment(self, container: QWidget) -> None:
         for label in container.findChildren(QLabel):
@@ -813,7 +898,11 @@ class StartupBrakeTestDialog(QDialog):
             self._summary_full_text = "示波器未连接，已使用当前已加载波形执行测试。"
             self._update_footer_texts()
             self._set_test_running(True)
-            self._start_background_analysis(self.main_window.last_waveform_bundle, config)
+            self._start_background_analysis(
+                self.main_window.last_waveform_bundle,
+                config,
+                StartupBrakeArchiveSource("loaded_waveforms"),
+            )
             return
 
         self.main_window._show_warning("未连接示波器，且当前已加载波形缺少测试所需通道。请先连接示波器或加载完整波形文件。")
@@ -884,7 +973,11 @@ class StartupBrakeTestDialog(QDialog):
         self._summary_full_text = "正在分析模拟启动刹车波形..."
         self._update_footer_texts()
         self.main_window.log(f"启动刹车模拟测试波形加载完成: {source_path}")
-        self._start_background_analysis(waveforms, config)
+        self._start_background_analysis(
+            waveforms,
+            config,
+            StartupBrakeArchiveSource("simulation_file", str(source_path)),
+        )
 
     def _on_waveforms_ready(
         self,
@@ -900,17 +993,22 @@ class StartupBrakeTestDialog(QDialog):
         )
         self._summary_full_text = "正在分析启动刹车波形..."
         self._update_footer_texts()
-        self._start_background_analysis(waveforms, config)
+        self._start_background_analysis(waveforms, config, StartupBrakeArchiveSource("instrument"))
 
     def _start_background_analysis(
         self,
         waveforms: list[WaveformData],
         config: StartupBrakeTestConfig,
+        archive_source: StartupBrakeArchiveSource,
     ) -> None:
         self._last_analysis_waveforms = list(waveforms)
         self.main_window.task_runner.run(
             lambda: analyze_startup_brake_test(waveforms, config),
-            on_success=lambda result, captured_config=config: self._complete_test(result, captured_config),
+            on_success=lambda result, captured_config=config, captured_source=archive_source: self._complete_test(
+                result,
+                captured_config,
+                captured_source,
+            ),
             on_error=self._handle_test_error,
             on_finally=lambda: self._set_test_running(False),
         )
@@ -919,6 +1017,7 @@ class StartupBrakeTestDialog(QDialog):
         self,
         result: StartupBrakeTestResult,
         config: StartupBrakeTestConfig,
+        archive_source: StartupBrakeArchiveSource,
     ) -> None:
         self.last_result = result
         self.last_config = config
@@ -942,7 +1041,7 @@ class StartupBrakeTestDialog(QDialog):
             f"命中频率 {self._format_optional_frequency(result.speed_match.frequency_hz if result.speed_match is not None else None)}"
         )
         if self.archive_snapshots_check.isChecked():
-            self._archive_result_snapshots(result, config, entry.timestamp)
+            self._archive_test_run(result, config, archive_source)
 
     def _handle_test_error(self, exc: Exception) -> None:
         self._set_test_running(False)
@@ -977,16 +1076,35 @@ class StartupBrakeTestDialog(QDialog):
             self.main_window.log(f"失败波形导出失败: {export_exc}")
             return None
 
-    def _archive_result_snapshots(
+    def _archive_test_run(
         self,
         result: StartupBrakeTestResult,
         config: StartupBrakeTestConfig,
-        timestamp_text: str,
+        source: StartupBrakeArchiveSource,
     ) -> None:
         if not self._last_analysis_waveforms:
             return
+        archived_at = datetime.now()
+        project_name = self.current_project_name()
+        test_number = self._next_archive_test_number(STARTUP_BRAKE_SCREENSHOT_DIR / project_name)
+        test_name = f"test_{test_number:04d}"
+        archive_dir = STARTUP_BRAKE_SCREENSHOT_DIR / project_name / test_name
+        created_files: list[str] = []
+        errors: list[str] = []
         try:
-            screenshot_dir = STARTUP_BRAKE_SCREENSHOT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_dir.mkdir(parents=True, exist_ok=False)
+        except Exception as exc:
+            self.main_window.log(f"启动刹车归档目录创建失败: {exc}")
+            return
+
+        try:
+            waveform_path = archive_dir / "waveforms.csv"
+            WaveformData.export_csv_bundle(self._last_analysis_waveforms, waveform_path)
+            created_files.append(waveform_path.name)
+        except Exception as exc:
+            errors.append(f"完整波形导出失败: {exc}")
+
+        try:
             self.main_window.sync_waveform_detail_dialog(show_window=False, activate_window=False)
             dialog = self.main_window.waveform_detail_dialog
             relevant_channels = [
@@ -1034,9 +1152,8 @@ class StartupBrakeTestDialog(QDialog):
                     )
                 )
 
-            exported_paths: list[Path] = []
             for name, channels, point_a, point_b, annotation in exports:
-                output_path = screenshot_dir / f"{name}.png"
+                output_path = archive_dir / f"{name}.png"
                 if dialog.export_standardized_snapshot(
                     output_path,
                     visible_channels=[channel for channel in channels if channel],
@@ -1045,13 +1162,68 @@ class StartupBrakeTestDialog(QDialog):
                     annotation_text=annotation,
                     padding_ratio=0.18,
                 ):
-                    exported_paths.append(output_path)
-            if exported_paths:
-                self.main_window.log(
-                    f"启动刹车结果截图已归档({timestamp_text}): " + ", ".join(str(path) for path in exported_paths)
-                )
+                    created_files.append(output_path.name)
+                else:
+                    errors.append(f"结果截图导出失败: {output_path.name}")
         except Exception as exc:
-            self.main_window.log(f"启动刹车结果截图归档失败: {exc}")
+            errors.append(f"结果截图导出失败: {exc}")
+
+        metadata_path = archive_dir / "metadata.json"
+        metadata = {
+            "project": project_name,
+            "test_number": test_number,
+            "test_name": test_name,
+            "archived_at": archived_at.isoformat(timespec="seconds"),
+            "source": asdict(source),
+            "config": asdict(config),
+            "result": asdict(result),
+            "files": [*created_files, metadata_path.name],
+            "errors": errors,
+        }
+        try:
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+            created_files.append(metadata_path.name)
+        except Exception as exc:
+            errors.append(f"元数据写入失败: {exc}")
+
+        if errors:
+            self.main_window.log(f"启动刹车归档不完整: {archive_dir}；" + "；".join(errors))
+        else:
+            self.main_window.log(f"启动刹车测试已归档: {archive_dir}")
+
+    @staticmethod
+    def sanitize_project_name(raw_text: str) -> str:
+        sanitized = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in raw_text.strip())
+        sanitized = "_".join(part for part in sanitized.replace("\t", " ").split() if part)
+        sanitized = sanitized.rstrip(". ")
+        sanitized = sanitized[:60] or "default"
+        reserved_names = {"CON", "PRN", "AUX", "NUL", *(f"COM{index}" for index in range(1, 10)), *(f"LPT{index}" for index in range(1, 10))}
+        if sanitized.upper() in reserved_names:
+            sanitized = f"_{sanitized}"
+        return sanitized
+
+    def current_project_name(self) -> str:
+        return self.sanitize_project_name(self.project_name_input.text())
+
+    @staticmethod
+    def _next_archive_test_number(project_dir: Path) -> int:
+        highest = 0
+        if project_dir.exists():
+            for child in project_dir.iterdir():
+                if not child.is_dir() or not child.name.startswith("test_"):
+                    continue
+                suffix = child.name.removeprefix("test_")
+                if suffix.isdigit():
+                    highest = max(highest, int(suffix))
+        return highest + 1
+
+    def _on_archive_settings_changed(self) -> None:
+        self._update_archive_path_hint()
+        self.main_window._save_ui_state()
+
+    def _update_archive_path_hint(self) -> None:
+        project_dir = STARTUP_BRAKE_SCREENSHOT_DIR / self.current_project_name()
+        self.archive_path_hint.setText(f"归档目录：{project_dir / 'test_NNNN'}")
 
     def _set_test_running(self, running: bool) -> None:
         self._test_running = running
