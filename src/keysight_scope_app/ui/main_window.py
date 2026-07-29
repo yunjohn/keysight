@@ -173,6 +173,7 @@ class ScopeMainWindow(QMainWindow):
         self._current_timebase_mode = "UNKNOWN"
         self._trigger_status_poll_inflight = False
         self._full_idn_text = "-"
+        self.hidden_resource_names: set[str] = set()
         self.recent_waveform_paths: list[str] = []
         self.last_capture_path: Path | None = None
         self.last_waveform_bundle: list[WaveformData] = []
@@ -227,7 +228,9 @@ class ScopeMainWindow(QMainWindow):
         self.resource_combo.lineEdit().setPlaceholderText("例如 USB0::0x2A8D::0x1766::MYxxxx::0::INSTR")
 
         self.delete_resource_button = QPushButton("删除")
-        self.delete_resource_button.setToolTip("删除当前资源地址")
+        self.delete_resource_button.setToolTip("隐藏当前资源地址，刷新后仍不显示")
+        self.restore_resources_button = QPushButton("恢复删除")
+        self.restore_resources_button.setToolTip("恢复所有已删除的资源地址并重新扫描")
         self.refresh_button = QPushButton("刷新资源")
         self.connect_button = QPushButton("连接设备")
         self.disconnect_button = QPushButton("断开连接")
@@ -236,15 +239,16 @@ class ScopeMainWindow(QMainWindow):
         connection_layout.addWidget(QLabel("资源地址"), 0, 0)
         connection_layout.addWidget(self.resource_combo, 0, 1)
         connection_layout.addWidget(self.delete_resource_button, 0, 2)
-        connection_layout.addWidget(self.refresh_button, 0, 3)
-        connection_layout.addWidget(self.connect_button, 0, 4)
-        connection_layout.addWidget(self.disconnect_button, 0, 5)
-        connection_layout.addWidget(self.error_button, 0, 6)
+        connection_layout.addWidget(self.restore_resources_button, 0, 3)
+        connection_layout.addWidget(self.refresh_button, 0, 4)
+        connection_layout.addWidget(self.connect_button, 0, 5)
+        connection_layout.addWidget(self.disconnect_button, 0, 6)
+        connection_layout.addWidget(self.error_button, 0, 7)
         connection_layout.setColumnStretch(1, 1)
 
         self.resource_hint = QLabel("提示：优先选择带真实序列号的资源地址。")
         self.resource_hint.setWordWrap(True)
-        connection_layout.addWidget(self.resource_hint, 1, 1, 1, 6)
+        connection_layout.addWidget(self.resource_hint, 1, 1, 1, 7)
         workbench_panel.addWidget(connection_box)
 
         quick_box = self._group_box("常用操作")
@@ -566,6 +570,7 @@ class ScopeMainWindow(QMainWindow):
 
         self.refresh_button.clicked.connect(self.refresh_resources)
         self.delete_resource_button.clicked.connect(self._delete_current_resource)
+        self.restore_resources_button.clicked.connect(self._restore_deleted_resources)
         self.connect_button.clicked.connect(self.connect_scope)
         self.disconnect_button.clicked.connect(self.disconnect_scope)
         self.error_button.clicked.connect(self.query_system_error)
@@ -623,6 +628,7 @@ class ScopeMainWindow(QMainWindow):
                 "enabled": self.startup_brake_dialog.archive_snapshots_check.isChecked(),
             },
             "recent_waveforms": list(self.recent_waveform_paths),
+            "hidden_resources": sorted(self.hidden_resource_names),
             "trigger": {
                 "source": str(self.trigger_source_combo.currentData()),
                 "slope": str(self.trigger_slope_combo.currentData()),
@@ -678,6 +684,14 @@ class ScopeMainWindow(QMainWindow):
                 if isinstance(item, str) and item.strip()
             ][:MAX_RECENT_WAVEFORMS]
             self._refresh_recent_waveform_menu()
+
+        hidden_resources = payload.get("hidden_resources")
+        if isinstance(hidden_resources, list):
+            self.hidden_resource_names = {
+                item.strip()
+                for item in hidden_resources
+                if isinstance(item, str) and item.strip()
+            }
 
         trigger_payload = payload.get("trigger")
         if isinstance(trigger_payload, dict):
@@ -926,6 +940,8 @@ class ScopeMainWindow(QMainWindow):
 
     def _normalize_button_widths(self) -> None:
         set_equal_button_widths(
+            self.delete_resource_button,
+            self.restore_resources_button,
             self.refresh_button,
             self.connect_button,
             self.disconnect_button,
@@ -980,20 +996,40 @@ class ScopeMainWindow(QMainWindow):
         )
 
     def _on_resources_loaded(self, resources: tuple[str, ...]) -> None:
+        connected_resource = ""
+        if self.scope is not None and self.scope.is_connected:
+            connected_resource = self.scope.resource_name
+        visible_resources = tuple(
+            resource
+            for resource in resources
+            if resource not in self.hidden_resource_names or resource == connected_resource
+        )
         current_text = self.resource_combo.currentText()
         self.resource_combo.blockSignals(True)
         self.resource_combo.clear()
-        for resource in resources:
+        for resource in visible_resources:
             self.resource_combo.addItem(resource)
         self.resource_combo.blockSignals(False)
-        if resources:
-            self.resource_combo.setCurrentText(resources[0])
+        if visible_resources:
+            preferred_resource = (
+                connected_resource
+                if connected_resource in visible_resources
+                else visible_resources[0]
+            )
+            self.resource_combo.setCurrentText(preferred_resource)
             self.resource_hint.setText("提示：优先使用当前已选中的真实序列号地址。")
-            self.log(f"发现 {len(resources)} 个资源，已优先选中可直接连接的地址。")
+            hidden_count = len(resources) - len(visible_resources)
+            hidden_message = f"，已隐藏 {hidden_count} 个删除地址" if hidden_count else ""
+            self.log(f"发现 {len(visible_resources)} 个可用资源{hidden_message}。")
         else:
-            self.resource_combo.setCurrentText(current_text)
-            self.resource_hint.setText("未发现资源。请检查 Keysight IO Libraries Suite / NI-VISA 与 USB 连接。")
-            self.log("未发现任何 VISA 资源。")
+            self.resource_combo.setCurrentText("")
+            if resources:
+                self.resource_hint.setText("扫描到的地址均已删除；可点击“恢复删除”找回。")
+                self.log("扫描到的 VISA 地址均已隐藏，可使用“恢复删除”。")
+            else:
+                self.resource_combo.setCurrentText(current_text)
+                self.resource_hint.setText("未发现资源。请检查 Keysight IO Libraries Suite / NI-VISA 与 USB 连接。")
+                self.log("未发现任何 VISA 资源。")
 
     def connect_scope(self) -> None:
         resource_name = self.resource_combo.currentText().strip()
@@ -2253,14 +2289,23 @@ class ScopeMainWindow(QMainWindow):
         if not current_text:
             return
 
+        self.hidden_resource_names.add(current_text)
         index = self.resource_combo.findText(current_text)
         if index >= 0:
             self.resource_combo.removeItem(index)
-            self.log(f"已从当前列表删除资源地址: {current_text}")
         else:
             self.resource_combo.setCurrentText("")
-            self.log(f"已清空资源地址: {current_text}")
-        self.resource_hint.setText("地址已从当前列表删除；点击“刷新资源”可重新扫描设备。")
+        self._save_ui_state()
+        self.log(f"已删除资源地址: {current_text}")
+        self.resource_hint.setText("该地址已隐藏，刷新后不会出现；误删可点击“恢复删除”。")
+
+    def _restore_deleted_resources(self) -> None:
+        restored_count = len(self.hidden_resource_names)
+        self.hidden_resource_names.clear()
+        self._save_ui_state()
+        self.log(f"已恢复 {restored_count} 个删除的资源地址，正在重新扫描。")
+        self.resource_hint.setText("已恢复删除记录，正在重新扫描 VISA 资源。")
+        self.refresh_resources()
 
     def _run_task(self, task, on_success=None, success_message: str | None = None, ui_guard=None, on_error=None, on_finally=None) -> None:
         def handle_success(result) -> None:

@@ -443,6 +443,7 @@ def test_main_window_delete_current_resource_removes_selected_address() -> None:
 
         assert window.resource_combo.findText("USB::FIRST::INSTR") == -1
         assert window.resource_combo.findText("USB::SECOND::INSTR") >= 0
+        assert "USB::FIRST::INSTR" in window.hidden_resource_names
     finally:
         window.close()
 
@@ -458,24 +459,60 @@ def test_main_window_delete_current_resource_clears_typed_address() -> None:
 
         assert window.resource_combo.currentText() == ""
         assert window.resource_combo.findText("USB::KNOWN::INSTR") >= 0
+        assert "TCPIP0::192.0.2.10::INSTR" in window.hidden_resource_names
     finally:
         window.close()
 
 
-def test_main_window_refresh_restores_deleted_resource() -> None:
+def test_main_window_refresh_keeps_deleted_offline_resource_hidden() -> None:
     app = QApplication.instance() or QApplication([])
     window = ScopeMainWindow()
     try:
-        window.resource_combo.addItem("USB::CONNECTED::INSTR")
-        window.resource_combo.setCurrentText("USB::CONNECTED::INSTR")
+        window.resource_combo.addItem("USB::OFFLINE::INSTR")
+        window.resource_combo.setCurrentText("USB::OFFLINE::INSTR")
         window._delete_current_resource()
 
-        assert window.resource_combo.findText("USB::CONNECTED::INSTR") == -1
+        window._on_resources_loaded(("USB::OFFLINE::INSTR",))
+
+        assert window.resource_combo.findText("USB::OFFLINE::INSTR") == -1
+        assert window.resource_combo.currentText() == ""
+    finally:
+        window.close()
+
+
+def test_main_window_refresh_keeps_connected_resource_visible() -> None:
+    class ConnectedScope:
+        is_connected = True
+        resource_name = "USB::CONNECTED::INSTR"
+
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    try:
+        window.hidden_resource_names.add("USB::CONNECTED::INSTR")
+        window.scope = ConnectedScope()  # type: ignore[assignment]
 
         window._on_resources_loaded(("USB::CONNECTED::INSTR",))
 
         assert window.resource_combo.findText("USB::CONNECTED::INSTR") >= 0
         assert window.resource_combo.currentText() == "USB::CONNECTED::INSTR"
+    finally:
+        window.close()
+
+
+def test_main_window_restore_deleted_resources_rescans() -> None:
+    app = QApplication.instance() or QApplication([])
+    window = ScopeMainWindow()
+    refresh_calls: list[bool] = []
+    try:
+        window.hidden_resource_names.update(
+            {"USB::FIRST::INSTR", "USB::SECOND::INSTR"}
+        )
+        window.refresh_resources = lambda: refresh_calls.append(True)  # type: ignore[method-assign]
+
+        window._restore_deleted_resources()
+
+        assert window.hidden_resource_names == set()
+        assert refresh_calls == [True]
     finally:
         window.close()
 
